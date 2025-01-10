@@ -73,7 +73,7 @@ def main():
             row2 = sub_t2.loc[i] if i < len(sub_t2) else None
 
             b1 = build_block1(row1, row2, is_many_to_many)
-            b2 = build_block2(row1, row2)  # updated for explicit column order
+            b2 = build_block2(row1, row2)  # updated for column order
             b3 = build_block3(row2, block3_cols)
 
             # Combine for the "Comparison" sheet

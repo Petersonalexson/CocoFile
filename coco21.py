@@ -9,7 +9,7 @@
 #   Key updates from previous version:
 #     - If one side is missing and the other is present => also apply ORANGE border
 #       (in addition to red fill).
-#     - In BLOC 2, Table1_ and Table2_ columns are explicitly in the user-specified order.
+#     - In BLOC 2, Table1_ and Table2_ columns are in order.
 #
 # Usage:
 #   1) Adjust path to Compare.xlsx

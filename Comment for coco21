@@ -1,0 +1,39 @@
+"""
+for base_name, idxs in pairs.items():
+        idx_t1 = idxs["t1"]
+        idx_t2 = idxs["t2"]
+        if idx_t1 and idx_t2:
+            for r in range(2, row_count+1):
+                cell_t1 = ws.cell(row=r, column=idx_t1)
+                cell_t2 = ws.cell(row=r, column=idx_t2)
+                v1 = cell_t1.value
+                v2 = cell_t2.value
+
+                # If both missing => red fill, NO border
+                if pd.isna(v1) and pd.isna(v2):
+                    cell_t1.fill = red_fill
+                    cell_t2.fill = red_fill
+                    continue
+
+                # If one side missing => fill that side red,
+                # but do NOT add any border
+                if pd.isna(v1) and pd.notna(v2):
+                    cell_t1.fill = red_fill
+                    continue
+                elif pd.isna(v2) and pd.notna(v1):
+                    cell_t2.fill = red_fill
+                    continue
+
+                # Otherwise both exist => check if match
+                s1 = str(v1).strip()
+                s2 = str(v2).strip()
+                if s1 == s2:
+                    # match => purple border
+                    set_border(cell_t1, purple_side)
+                    set_border(cell_t2, purple_side)
+                else:
+                    # mismatch => orange border
+                    set_border(cell_t1, orange_side)
+                    set_border(cell_t2, orange_side)
+
+"""

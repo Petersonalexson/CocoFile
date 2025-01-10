@@ -1,22 +1,70 @@
-"""
-for base_name, idxs in pairs.items():
-        idx_t1 = idxs["t1"]
-        idx_t2 = idxs["t2"]
-        if idx_t1 and idx_t2:
+# Find Table1_Status / Table2_Status columns
+    col_t1_status = None
+    col_t2_status = None
+    for i, col_name in enumerate(headers, start=1):
+        if col_name=="Table1_Status":
+            col_t1_status = i
+        elif col_name=="Table2_Status":
+            col_t2_status = i
+
+    # Base fill
+    for r in range(1, row_count+1):
+        for c in range(1, col_count+1):
+            cell = ws.cell(row=r, column=c)
+            if r==1:
+                cell.font = Font(bold=True)
+                continue
+            col_header = headers[c-1] if c<=len(headers) else ""
+            if col_header in ["BLOC 1", "BLOC 2", "BLOC 3"]:
+                cell.fill = dark_fill
+                cell.font = Font(color="FFFFFF", bold=True)
+                continue
+            if col_header.startswith("Table1_"):
+                cell.fill = green_fill
+            elif col_header.startswith("Table2_"):
+                cell.fill = blue_fill
+            elif ("Comment" in col_header or 
+                  "Status" in col_header or 
+                  "Missing_in_Table" in col_header):
+                cell.fill = white_fill
+            else:
+                cell.fill = white_fill
+
+    # Pair up columns for orange/purple
+    pairs = defaultdict(lambda: {"t1": None, "t2": None})
+    for i, h in enumerate(headers, start=1):
+        if h.startswith("Table1_"):
+            base = h.replace("Table1_","")
+            pairs[base]["t1"] = i
+        elif h.startswith("Table2_"):
+            base = h.replace("Table2_","")
+            pairs[base]["t2"] = i
+
+    for base_name, idxs in pairs.items():
+        t1_idx = idxs["t1"]
+        t2_idx = idxs["t2"]
+        if t1_idx and t2_idx:
             for r in range(2, row_count+1):
-                cell_t1 = ws.cell(row=r, column=idx_t1)
-                cell_t2 = ws.cell(row=r, column=idx_t2)
+                cell_t1 = ws.cell(row=r, column=t1_idx)
+                cell_t2 = ws.cell(row=r, column=t2_idx)
                 v1 = cell_t1.value
                 v2 = cell_t2.value
 
-                # If both missing => red fill, NO border
+                # read statuses
+                status_t1 = None
+                status_t2 = None
+                if col_t1_status:
+                    status_t1 = ws.cell(row=r, column=col_t1_status).value
+                if col_t2_status:
+                    status_t2 = ws.cell(row=r, column=col_t2_status).value
+
+                # both missing => red fill, no border
                 if pd.isna(v1) and pd.isna(v2):
                     cell_t1.fill = red_fill
                     cell_t2.fill = red_fill
                     continue
 
-                # If one side missing => fill that side red,
-                # but do NOT add any border
+                # one missing => fill that side red, no border
                 if pd.isna(v1) and pd.notna(v2):
                     cell_t1.fill = red_fill
                     continue
@@ -24,16 +72,16 @@ for base_name, idxs in pairs.items():
                     cell_t2.fill = red_fill
                     continue
 
-                # Otherwise both exist => check if match
-                s1 = str(v1).strip()
-                s2 = str(v2).strip()
-                if s1 == s2:
-                    # match => purple border
-                    set_border(cell_t1, purple_side)
-                    set_border(cell_t2, purple_side)
+                # both exist => only do border if both T1 & T2 are Active
+                if status_t1=="Active" and status_t2=="Active":
+                    s1 = str(v1).strip()
+                    s2 = str(v2).strip()
+                    if s1 == s2:
+                        set_border(cell_t1, purple_side)
+                        set_border(cell_t2, purple_side)
+                    else:
+                        set_border(cell_t1, orange_side)
+                        set_border(cell_t2, orange_side)
                 else:
-                    # mismatch => orange border
-                    set_border(cell_t1, orange_side)
-                    set_border(cell_t2, orange_side)
-
-"""
+                    # skip border if either side inactive
+                    pass

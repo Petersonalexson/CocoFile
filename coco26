@@ -647,3 +647,48 @@ def find_best_match(row, df_candidates, paired_indices):
 
 if __name__ == "__main__":
     main()
+
+
+
+"""
+for noel_first in all_noels:
+    sub_t1 = df_t1[df_t1["NoelFirst"] == noel_first].reset_index(drop=True)
+    sub_t2 = df_t2[df_t2["NoelFirst"] == noel_first].reset_index(drop=True)
+
+    # For each row in Table1, pair with every row in Table2
+    if not sub_t1.empty and not sub_t2.empty:
+        for _, row_t1 in sub_t1.iterrows():
+            for _, row_t2 in sub_t2.iterrows():
+                b1 = build_block1(row_t1, row_t2, total_exp=len(sub_t2), active_exp=sum(sub_t2["Status"]=="Active"))
+                b2 = build_block2(row_t1, row_t2)
+                b3 = build_block3(row_t2, block3_cols)
+                merged = {**b1, **b2, **b3}
+                comparison_rows.append(merged)
+                block1_rows.append(b1)
+                block2_rows.append(b2)
+                block3_rows.append(b3)
+    # Optionally, if one side is empty, output the unmatched rows:
+    elif not sub_t1.empty:
+        for _, row_t1 in sub_t1.iterrows():
+            b1 = build_block1(row_t1, None, total_exp=len(sub_t2), active_exp=sum(sub_t2["Status"]=="Active"))
+            b2 = build_block2(row_t1, None)
+            b3 = build_block3(None, block3_cols)
+            merged = {**b1, **b2, **b3}
+            comparison_rows.append(merged)
+            block1_rows.append(b1)
+            block2_rows.append(b2)
+            block3_rows.append(b3)
+    elif not sub_t2.empty:
+        for _, row_t2 in sub_t2.iterrows():
+            b1 = build_block1(None, row_t2, total_exp=len(sub_t2), active_exp=sum(sub_t2["Status"]=="Active"))
+            b2 = build_block2(None, row_t2)
+            b3 = build_block3(row_t2, block3_cols)
+            merged = {**b1, **b2, **b3}
+            comparison_rows.append(merged)
+            block1_rows.append(b1)
+            block2_rows.append(b2)
+            block3_rows.append(b3)
+
+
+
+"""

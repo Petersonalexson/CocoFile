@@ -18,7 +18,7 @@ FILE_PATHS = {
 
 # Sheet names used in the files
 SHEET_NAMES = {
-    'master': 'Main',          # Alfa sheet; header row is row 6 (so data starts at row 7)
+    'alfa': 'Main',          # Alfa sheet; header row is row 6 (so data starts at row 7)
     'xtreisp_sheets': [
         'xtreisp_Atlanta_1',
         'xtreisp_Libra',
@@ -93,23 +93,23 @@ def handle_canary_power_of_ten(value: str) -> str:
     except ValueError:
         return value
 
-def read_master_file(file_path: str, sheet_name: str, valid_dimensions: list) -> pd.DataFrame:
+def read_alfa_file(file_path: str, sheet_name: str, valid_dimensions: list) -> pd.DataFrame:
     """
-    Reads Alfa (master) file using specific columns.
-    - Columns: E:F,I,K (corresponding to DIM, V Master, Desc, End Date)
+    Reads Alfa (alfa) file using specific columns.
+    - Columns: E:F,I,K (corresponding to DIM, V alfa, Desc, End Date)
     - Data starts at row 7 (header at row 6)
     - Uses dtype=str so that raw values (like "00000") are preserved.
     - Filters rows so that only dimensions that appear in xtreisp (valid_dimensions) are kept.
     - Applies manual replacement for Canary 
     """
-    logging.info(f"Reading master file from {file_path}, sheet: {sheet_name}")
+    logging.info(f"Reading alfa file from {file_path}, sheet: {sheet_name}")
     df = pd.read_excel(file_path, sheet_name=sheet_name, usecols="E:F,I,K", header=5, dtype=str)
-    df.columns = ['DIM', 'V Master', 'Desc', 'End Date']
+    df.columns = ['DIM', 'V alfa', 'Desc', 'End Date']
     df.dropna(how='all', inplace=True)
     
     # For 'Canary', apply manual replacement on the value.
     mask_canary = df['DIM'] == 'Canary'
-    df.loc[mask_canary, 'V Master'] = df.loc[mask_canary, 'V Master'].apply(handle_canary_power_of_ten)
+    df.loc[mask_canary, 'V alfa'] = df.loc[mask_canary, 'V alfa'].apply(handle_canary_power_of_ten)
     
     try:
         df["End Date"] = pd.to_datetime(df["End Date"], errors='coerce')
@@ -117,7 +117,7 @@ def read_master_file(file_path: str, sheet_name: str, valid_dimensions: list) ->
         logging.error(f"Error converting 'End Date': {e}")
     
     filtered_df = df[df['DIM'].isin(valid_dimensions)]
-    logging.info(f"Master file contains {len(filtered_df)} relevant records after filtering.")
+    logging.info(f"alfa file contains {len(filtered_df)} relevant records after filtering.")
     return filtered_df
 
 def read_xtreisp_file(file_path: str, sheet_names: list, sheet_mapping: dict) -> pd.DataFrame:
@@ -153,19 +153,19 @@ def read_xtreisp_file(file_path: str, sheet_names: list, sheet_mapping: dict) ->
         logging.error("No valid sheets found in xtreisp file.")
         return pd.DataFrame(columns=['DIM xtreisp', 'V xtreisp'])
 
-def compare_data(df_master: pd.DataFrame, df_xtreisp: pd.DataFrame) -> pd.DataFrame:
+def compare_data(df_alfa: pd.DataFrame, df_xtreisp: pd.DataFrame) -> pd.DataFrame:
     """
     Compares Alfa and xtreisp data by creating keys from:
-      - Alfa key: DIM + "|" + V Master
+      - Alfa key: DIM + "|" + V alfa
       - xtreisp key: DIM xtreisp + "|" + V xtreisp
     Merges using an outer join and adds a Status column.
     Also creates an empty Flag column.
     """
     logging.info("Comparing Alfa and xtreisp data.")
-    df_master['Key_Alfa'] = df_master['DIM'].astype(str) + '|' + df_master['V Master'].astype(str)
+    df_alfa['Key_Alfa'] = df_alfa['DIM'].astype(str) + '|' + df_alfa['V alfa'].astype(str)
     df_xtreisp['Key_xtreisp'] = df_xtreisp['DIM xtreisp'].astype(str) + '|' + df_xtreisp['V xtreisp'].astype(str)
     
-    merged = pd.merge(df_master, df_xtreisp, left_on='Key_Alfa', right_on='Key_xtreisp', how='outer', indicator=True)
+    merged = pd.merge(df_alfa, df_xtreisp, left_on='Key_Alfa', right_on='Key_xtreisp', how='outer', indicator=True)
     merged['Status'] = merged['_merge'].map({
         "both": "Match",
         "left_only": "Missing in xtreisp",
@@ -197,14 +197,14 @@ def apply_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame) -> pd.DataFrame:
     """
     Populates the 'Comment' column based on keys from exceptions.
     Uses:
-      - Alfa key: DIM + V Master
+      - Alfa key: DIM + V alfa
       - xtreisp key: DIM xtreisp + V xtreisp
     """
     logging.info("Populating comments based on exceptions.")
     if 'Comment' not in df.columns:
         df['Comment'] = ""
     
-    df['Key_Alfa'] = df['DIM'].astype(str) + df['V Master'].astype(str)
+    df['Key_Alfa'] = df['DIM'].astype(str) + df['V alfa'].astype(str)
     df['Key_xtreisp'] = df['DIM xtreisp'].astype(str) + df['V xtreisp'].astype(str)
     
     exc_dict = df_exc.set_index('Key')['Comment'].to_dict()
@@ -235,12 +235,12 @@ def write_to_excel(df: pd.DataFrame, output_path: str, sheet_name: str) -> None:
 
     # Arrange columns as needed:
     # Alfa Dimension, Alfa Name, xtreisp Dimension, xtreisp Name, End Date Alfa, Status, Comment, Flag
-    desired_columns = ['DIM', 'V Master', 'DIM xtreisp', 'V xtreisp', 'End Date', 'Status', 'Comment', 'Flag']
+    desired_columns = ['DIM', 'V alfa', 'DIM xtreisp', 'V xtreisp', 'End Date', 'Status', 'Comment', 'Flag']
     df_out = df.copy()
     df_out = df_out[desired_columns]
     df_out.rename(columns={
         'DIM': 'Alfa Dimension',
-        'V Master': 'Alfa Name',
+        'V alfa': 'Alfa Name',
         'DIM xtreisp': 'xtreisp Dimension',
         'V xtreisp': 'xtreisp Name',
         'End Date': 'End Date Alfa'
@@ -315,11 +315,11 @@ if __name__ == "__main__":
         unique_xtreisp_dims = df_xtreisp['DIM xtreisp'].unique().tolist()
         logging.info(f"Unique dimensions in xtreisp: {unique_xtreisp_dims}")
         
-        # Read Alfa (master) file and filter to keep only those with dimensions in xtreisp.
-        df_master = read_master_file(FILE_PATHS['master'], SHEET_NAMES['master'], unique_xtreisp_dims)
+        # Read Alfa (alfa) file and filter to keep only those with dimensions in xtreisp.
+        df_alfa = read_alfa_file(FILE_PATHS['alfa'], SHEET_NAMES['alfa'], unique_xtreisp_dims)
         
         # Compare Alfa and xtreisp data.
-        df_comparison = compare_data(df_master, df_xtreisp)
+        df_comparison = compare_data(df_alfa, df_xtreisp)
         
         # Process exceptions if needed.
         df_exceptions = read_exceptions(FILE_PATHS['exceptions'], SHEET_NAMES['exceptions'])
@@ -351,7 +351,7 @@ FILE_PATHS = {
 
 # Sheet names used in the files
 SHEET_NAMES = {
-    'master': 'Main',          # Alfa sheet; header row is row 6 (so data starts at row 7)
+    'alfa': 'Main',          # Alfa sheet; header row is row 6 (so data starts at row 7)
     'xtreisp_sheets': [
         'xtreisp_Atlanta_1',
         'xtreisp_Libra',
@@ -426,23 +426,23 @@ def handle_canary_power_of_ten(value: str) -> str:
     except ValueError:
         return value
 
-def read_master_file(file_path: str, sheet_name: str, valid_dimensions: list) -> pd.DataFrame:
+def read_alfa_file(file_path: str, sheet_name: str, valid_dimensions: list) -> pd.DataFrame:
     """
-    Reads Alfa (master) file using specific columns.
-    - Columns: E:F,I,K (corresponding to DIM, V Master, Desc, End Date)
+    Reads Alfa (alfa) file using specific columns.
+    - Columns: E:F,I,K (corresponding to DIM, V alfa, Desc, End Date)
     - Data starts at row 7 (header at row 6)
     - Uses dtype=str so that raw values (like "00000") are preserved.
     - Filters rows so that only dimensions that appear in xtreisp (valid_dimensions) are kept.
     - Applies manual replacement for Canary 
     """
-    logging.info(f"Reading master file from {file_path}, sheet: {sheet_name}")
+    logging.info(f"Reading alfa file from {file_path}, sheet: {sheet_name}")
     df = pd.read_excel(file_path, sheet_name=sheet_name, usecols="E:F,I,K", header=5, dtype=str)
-    df.columns = ['DIM', 'V Master', 'Desc', 'End Date']
+    df.columns = ['DIM', 'V alfa', 'Desc', 'End Date']
     df.dropna(how='all', inplace=True)
     
     # For 'Canary', apply manual replacement on the value.
     mask_canary = df['DIM'] == 'Canary'
-    df.loc[mask_canary, 'V Master'] = df.loc[mask_canary, 'V Master'].apply(handle_canary_power_of_ten)
+    df.loc[mask_canary, 'V alfa'] = df.loc[mask_canary, 'V alfa'].apply(handle_canary_power_of_ten)
     
     try:
         df["End Date"] = pd.to_datetime(df["End Date"], errors='coerce')
@@ -450,7 +450,7 @@ def read_master_file(file_path: str, sheet_name: str, valid_dimensions: list) ->
         logging.error(f"Error converting 'End Date': {e}")
     
     filtered_df = df[df['DIM'].isin(valid_dimensions)]
-    logging.info(f"Master file contains {len(filtered_df)} relevant records after filtering.")
+    logging.info(f"alfa file contains {len(filtered_df)} relevant records after filtering.")
     return filtered_df
 
 def read_xtreisp_file(file_path: str, sheet_names: list, sheet_mapping: dict) -> pd.DataFrame:
@@ -486,19 +486,19 @@ def read_xtreisp_file(file_path: str, sheet_names: list, sheet_mapping: dict) ->
         logging.error("No valid sheets found in xtreisp file.")
         return pd.DataFrame(columns=['DIM xtreisp', 'V xtreisp'])
 
-def compare_data(df_master: pd.DataFrame, df_xtreisp: pd.DataFrame) -> pd.DataFrame:
+def compare_data(df_alfa: pd.DataFrame, df_xtreisp: pd.DataFrame) -> pd.DataFrame:
     """
     Compares Alfa and xtreisp data by creating keys from:
-      - Alfa key: DIM + "|" + V Master
+      - Alfa key: DIM + "|" + V alfa
       - xtreisp key: DIM xtreisp + "|" + V xtreisp
     Merges using an outer join and adds a Status column.
     Also creates an empty Flag column.
     """
     logging.info("Comparing Alfa and xtreisp data.")
-    df_master['Key_Alfa'] = df_master['DIM'].astype(str) + '|' + df_master['V Master'].astype(str)
+    df_alfa['Key_Alfa'] = df_alfa['DIM'].astype(str) + '|' + df_alfa['V alfa'].astype(str)
     df_xtreisp['Key_xtreisp'] = df_xtreisp['DIM xtreisp'].astype(str) + '|' + df_xtreisp['V xtreisp'].astype(str)
     
-    merged = pd.merge(df_master, df_xtreisp, left_on='Key_Alfa', right_on='Key_xtreisp', how='outer', indicator=True)
+    merged = pd.merge(df_alfa, df_xtreisp, left_on='Key_Alfa', right_on='Key_xtreisp', how='outer', indicator=True)
     merged['Status'] = merged['_merge'].map({
         "both": "Match",
         "left_only": "Missing in xtreisp",
@@ -530,14 +530,14 @@ def apply_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame) -> pd.DataFrame:
     """
     Populates the 'Comment' column based on keys from exceptions.
     Uses:
-      - Alfa key: DIM + V Master
+      - Alfa key: DIM + V alfa
       - xtreisp key: DIM xtreisp + V xtreisp
     """
     logging.info("Populating comments based on exceptions.")
     if 'Comment' not in df.columns:
         df['Comment'] = ""
     
-    df['Key_Alfa'] = df['DIM'].astype(str) + df['V Master'].astype(str)
+    df['Key_Alfa'] = df['DIM'].astype(str) + df['V alfa'].astype(str)
     df['Key_xtreisp'] = df['DIM xtreisp'].astype(str) + df['V xtreisp'].astype(str)
     
     exc_dict = df_exc.set_index('Key')['Comment'].to_dict()
@@ -568,12 +568,12 @@ def write_to_excel(df: pd.DataFrame, output_path: str, sheet_name: str) -> None:
 
     # Arrange columns as needed:
     # Alfa Dimension, Alfa Name, xtreisp Dimension, xtreisp Name, End Date Alfa, Status, Comment, Flag
-    desired_columns = ['DIM', 'V Master', 'DIM xtreisp', 'V xtreisp', 'End Date', 'Status', 'Comment', 'Flag']
+    desired_columns = ['DIM', 'V alfa', 'DIM xtreisp', 'V xtreisp', 'End Date', 'Status', 'Comment', 'Flag']
     df_out = df.copy()
     df_out = df_out[desired_columns]
     df_out.rename(columns={
         'DIM': 'Alfa Dimension',
-        'V Master': 'Alfa Name',
+        'V alfa': 'Alfa Name',
         'DIM xtreisp': 'xtreisp Dimension',
         'V xtreisp': 'xtreisp Name',
         'End Date': 'End Date Alfa'
@@ -648,11 +648,11 @@ if __name__ == "__main__":
         unique_xtreisp_dims = df_xtreisp['DIM xtreisp'].unique().tolist()
         logging.info(f"Unique dimensions in xtreisp: {unique_xtreisp_dims}")
         
-        # Read Alfa (master) file and filter to keep only those with dimensions in xtreisp.
-        df_master = read_master_file(FILE_PATHS['master'], SHEET_NAMES['master'], unique_xtreisp_dims)
+        # Read Alfa (alfa) file and filter to keep only those with dimensions in xtreisp.
+        df_alfa = read_alfa_file(FILE_PATHS['alfa'], SHEET_NAMES['alfa'], unique_xtreisp_dims)
         
         # Compare Alfa and xtreisp data.
-        df_comparison = compare_data(df_master, df_xtreisp)
+        df_comparison = compare_data(df_alfa, df_xtreisp)
         
         # Process exceptions if needed.
         df_exceptions = read_exceptions(FILE_PATHS['exceptions'], SHEET_NAMES['exceptions'])

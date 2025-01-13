@@ -652,14 +652,26 @@ if __name__ == "__main__":
 
 """
 for noel_first in all_noels:
+    # Get all rows for this NoelFirst in each table.
     sub_t1 = df_t1[df_t1["NoelFirst"] == noel_first].reset_index(drop=True)
     sub_t2 = df_t2[df_t2["NoelFirst"] == noel_first].reset_index(drop=True)
 
-    # For each row in Table1, pair with every row in Table2
-    if not sub_t1.empty and not sub_t2.empty:
-        for _, row_t1 in sub_t1.iterrows():
-            for _, row_t2 in sub_t2.iterrows():
-                b1 = build_block1(row_t1, row_t2, total_exp=len(sub_t2), active_exp=sum(sub_t2["Status"]=="Active"))
+    # For comment logic: count how many rows exist in Table2
+    total_exp = len(sub_t2)
+    active_exp = sub_t2["Status"].eq("Active").sum()
+
+    # Check what statuses exist in each group:
+    t1_active = sub_t1[sub_t1["Status"]=="Active"]
+    t2_active = sub_t2[sub_t2["Status"]=="Active"]
+    t1_inactive = sub_t1[sub_t1["Status"]!="Active"]
+    t2_inactive = sub_t2[sub_t2["Status"]!="Active"]
+
+    # Case 1: Both sides have at least one active row.
+    if (not t1_active.empty) and (not t2_active.empty):
+        # Pair all active rows from Table1 with all active rows from Table2.
+        for _, row_t1 in t1_active.iterrows():
+            for _, row_t2 in t2_active.iterrows():
+                b1 = build_block1(row_t1, row_t2, total_exp, active_exp)
                 b2 = build_block2(row_t1, row_t2)
                 b3 = build_block3(row_t2, block3_cols)
                 merged = {**b1, **b2, **b3}
@@ -667,10 +679,66 @@ for noel_first in all_noels:
                 block1_rows.append(b1)
                 block2_rows.append(b2)
                 block3_rows.append(b3)
-    # Optionally, if one side is empty, output the unmatched rows:
-    elif not sub_t1.empty:
+        # Remove these active rows from further matching.
+        sub_t1 = sub_t1.drop(t1_active.index)
+        sub_t2 = sub_t2.drop(t2_active.index)
+
+    # Case 2: Now, for the remaining rows (which might be both inactive or mixed):
+    # We will perform pairing based on Daytona similarity.
+    #
+    # Combine the remaining rows in each table (they might be active or inactive).
+    # (At this point if one table had active rows they have been removed already.)
+    if (not sub_t1.empty) and (not sub_t2.empty):
+        # First, sort Table1's remaining rows by Daytona similarity against sub_t2.
+        sub_t1_sorted = sort_by_daytona_similarity(sub_t1, sub_t2)
+        # And sort Table2's remaining rows by similarity against sub_t1.
+        sub_t2_sorted = sort_by_daytona_similarity(sub_t2, sub_t1)
+        paired_t1 = set()
+        paired_t2 = set()
+        # Pair one-to-one based on highest similarity.
+        for idx1, row1 in sub_t1_sorted.iterrows():
+            best_match_idx, shared_words = find_best_match(row1, sub_t2_sorted, paired_t2)
+            if best_match_idx is not None:
+                row2 = sub_t2_sorted.loc[best_match_idx]
+                paired_t1.add(idx1)
+                paired_t2.add(best_match_idx)
+                b1 = build_block1(row1, row2, total_exp, active_exp)
+                b2 = build_block2(row1, row2)
+                b3 = build_block3(row2, block3_cols)
+                merged = {**b1, **b2, **b3}
+                # Optionally, add a comment indicating this row was matched using Daytona similarity.
+                extra = ""
+                # Distinguish if mixed status:
+                if row1.get("Status") != row2.get("Status"):
+                    extra = " | Mixed Active/Inactive based on Daytona"
+                else:
+                    extra = " | Inactive match based on Daytona"
+                b1["Comment2_B1"] = b1.get("Comment2_B1", "") + extra
+                comparison_rows.append(merged)
+                block1_rows.append(b1)
+                block2_rows.append(b2)
+                block3_rows.append(b3)
+        # Now pair any remaining unmatched rows (one-to-many)
+        remaining_t1 = sub_t1_sorted[~sub_t1_sorted.index.isin(paired_t1)]
+        remaining_t2 = sub_t2_sorted[~sub_t2_sorted.index.isin(paired_t2)]
+        # For remaining Table1 rows, pair with every remaining Table2 row.
+        for _, row_t1 in remaining_t1.iterrows():
+            for _, row_t2 in remaining_t2.iterrows():
+                b1 = build_block1(row_t1, row_t2, total_exp, active_exp)
+                b2 = build_block2(row_t1, row_t2)
+                b3 = build_block3(row_t2, block3_cols)
+                merged = {**b1, **b2, **b3}
+                # Mark these as unmatched one-to-many (using Daytona similarity).
+                b1["Comment2_B1"] = b1.get("Comment2_B1", "") + " | Unmatched pair based on Daytona"
+                comparison_rows.append(merged)
+                block1_rows.append(b1)
+                block2_rows.append(b2)
+                block3_rows.append(b3)
+    # If one side remains unmatched at all:
+    if not sub_t1.empty and sub_t2.empty:
+        # Unmatched Table1 rows:
         for _, row_t1 in sub_t1.iterrows():
-            b1 = build_block1(row_t1, None, total_exp=len(sub_t2), active_exp=sum(sub_t2["Status"]=="Active"))
+            b1 = build_block1(row_t1, None, total_exp, active_exp)
             b2 = build_block2(row_t1, None)
             b3 = build_block3(None, block3_cols)
             merged = {**b1, **b2, **b3}
@@ -678,9 +746,9 @@ for noel_first in all_noels:
             block1_rows.append(b1)
             block2_rows.append(b2)
             block3_rows.append(b3)
-    elif not sub_t2.empty:
+    elif not sub_t2.empty and sub_t1.empty:
         for _, row_t2 in sub_t2.iterrows():
-            b1 = build_block1(None, row_t2, total_exp=len(sub_t2), active_exp=sum(sub_t2["Status"]=="Active"))
+            b1 = build_block1(None, row_t2, total_exp, active_exp)
             b2 = build_block2(None, row_t2)
             b3 = build_block3(row_t2, block3_cols)
             merged = {**b1, **b2, **b3}

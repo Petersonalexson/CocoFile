@@ -216,7 +216,7 @@ def main():
         include_filters=[("Department", ["Sales"])],
         exclude_filters=[("Type", ["External"])]
     )
-    gamma_zip_path = Path("your_zip_file.zip")
+    gamma_zip_path = Path(" _zip_file.zip")
     df_gamma = transform_gamma_with_flexible_exclusion(
         zip_file_path=gamma_zip_path,
         exclude_attrs_from_melt=["IgnoreColumn1"],

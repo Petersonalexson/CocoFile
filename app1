@@ -1,0 +1,75 @@
+import os
+import zipfile
+import pandas as pd
+
+def compute_app_key(filename, remove_substring="_ceaster.txt"):
+    """
+    Given a filename, remove substring
+    and replace underscores with a space.
+    """
+    base = os.path.basename(filename)
+    if remove_substring in base:
+        base = base.replace(remove_substring, "")
+    else:
+        base, _ = os.path.splitext(base)
+    # Replace underscores with spaces
+    return base.replace("_", " ")
+
+def transform_dataframe(df, app_key):
+    """
+    Transform the DataFrame into pivot format with the following columns:
+      - Key: composite value in the form ""
+      - A: the processed name from the file
+      - Attribute: the o
+      - Value: the cell value
+    """
+    # Reset the index in case it is not continuous
+    df_reset = df.reset_index(drop=True)
+    # Melt the DataFrame to pivot 
+    melted = df_reset.melt(var_name="Attribute", value_name="Value")
+    
+    # Set the App column (all rows get the same app name)
+    melted.insert(0, "App", app_key)
+    
+    # Create the Key column: ""
+    melted["Key"] = melted.apply(
+        lambda row: f"{row['App']} | {row['Attribute']} | {row['Value']}", axis=1
+    )
+    
+    # Reorder columns so Key comes first
+    melted = melted[["Key", "App", "Attribute", "Value"]]
+    return melted
+
+def main():
+    # Path to ZIP file containing the .txt (CSV) files
+    zip_file_path = r
+    # Output Excel file path
+    output_excel_path = r
+    
+    with zipfile.ZipFile(zip_file_path, 'r') as z:
+        # List files ending with ".txt" 
+        txt_files = [f for f in z.namelist() if f.endswith('.txt')]
+        
+        # Create an ExcelWriter for multiple sheets in one workbook.
+        with pd.ExcelWriter(output_excel_path, engine="openpyxl") as writer:
+            for txt_file in txt_files:
+                # Process the filename to determine the App name
+                app_key = compute_app_key(txt_file)
+                # Use app_key as the base for the sheet name (limited to 1000 characters)
+                sheet_name = app_key[:1000]
+                
+                # Read the CSV content from the .txt file inside the zip.
+                with z.open(txt_file) as f:
+                    # Adjust parameters to read_csv() if the CSV format needs them.
+                    df = pd.read_csv(f)
+                
+                # Transform the DataFrame pivoted table
+                transformed_df = transform_dataframe(df, app_key)
+                
+                # Write the transformed DataFrame to its own sheet.
+                transformed_df.to_excel(writer, sheet_name=sheet_name, index=False)
+    
+    print(f"Excel workbook created: {output_excel_path}")
+
+if __name__ == "__main__":
+    main()

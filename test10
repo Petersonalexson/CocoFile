@@ -47,7 +47,7 @@ def transform_dataframe(df: pd.DataFrame, app_key: str) -> pd.DataFrame:
 
 def main():
 
-    zip_file_path = Path("your_zip_file.zip")
+    zip_file_path = Path(" _zip_file.zip")
 
     output_excel_path = Path("output_workbook.xlsx")
 

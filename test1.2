@@ -1,0 +1,55 @@
+import pandas as pd
+from pathlib import Path
+
+def transform_alo_sheet(
+    file_path: Path,
+    output_path: Path,
+    sheet_name: str = "Sheet1",
+    skip_rows: int = 3,
+    app_rename_dict: dict = None,
+    attribute_rename_dict: dict = None
+) -> None:
+    df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=skip_rows)
+    df.rename(columns={
+        df.columns[2]: "App",
+        df.columns[3]: "First"
+    }, inplace=True)
+    if app_rename_dict:
+        df["App"] = df["App"].replace(app_rename_dict)
+    df_melted = df.melt(
+        id_vars=["App", "First"],
+        var_name="Attribute",
+        value_name="Value"
+    )
+    if attribute_rename_dict:
+        df_melted["Attribute"] = df_melted["Attribute"].replace(attribute_rename_dict)
+    df_melted["Key"] = df_melted.apply(
+        lambda row: f"{row['App']} | {row['First']} | {row['Attribute']} | {row['Value']}",
+        axis=1
+    )
+    df_melted = df_melted[["Key", "App", "First", "Attribute", "Value"]]
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        df_melted.to_excel(writer, sheet_name=sheet_name, index=False)
+    print(f"Data from '{file_path}' was transformed and saved to '{output_path}' (Sheet: '{sheet_name}').")
+
+def main():
+    input_file = Path("ALO.xlsx")
+    output_file = Path("ALO_output.xlsx")
+    app_name_map = {
+        "OldAppName": "NewAppName",
+    }
+    attribute_name_map = {
+        "Attr1": "Attribute One",
+        "Attr2": "Attribute Two",
+    }
+    transform_alo_sheet(
+        file_path=input_file,
+        output_path=output_file,
+        sheet_name="Sheet1",
+        skip_rows=3,
+        app_rename_dict=app_name_map,
+        attribute_rename_dict=attribute_name_map
+    )
+
+if __name__ == "__main__":
+    main()

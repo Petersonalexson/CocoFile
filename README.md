@@ -15,4 +15,3 @@ The script handles:
   - **Green** cells for Table1.
   - **Blue** cells for Table2.
   - **Red** fill for missing data.
-  - Etc. (adjust the details here to match your script's logic).

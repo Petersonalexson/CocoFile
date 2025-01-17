@@ -1,1 +1,236 @@
-""" wwip fix loop """
+import os
+import zipfile
+import pandas as pd
+from pathlib import Path
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+
+def transform_alfa_with_flexible_exclusion(
+    file_path: Path,
+    sheet_name: str = "Sheet1",
+    skip_rows: int = 3,
+    app_rename_dict: dict = None,
+    attribute_rename_dict: dict = None,
+    exclude_attrs_from_melt: list = None,
+    exclude_attrs_from_final: list = None,
+    include_filters: list = None,
+    exclude_filters: list = None
+) -> pd.DataFrame:
+    df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=skip_rows)
+    df.rename(columns={df.columns[2]: "App", df.columns[3]: "First"}, inplace=True)
+    if app_rename_dict:
+        df["App"] = df["App"].replace(app_rename_dict)
+    df["row_id"] = df.index
+    if exclude_attrs_from_melt:
+        to_drop = [c for c in df.columns if c in exclude_attrs_from_melt and c not in ("App", "row_id")]
+        df.drop(columns=to_drop, inplace=True, errors="ignore")
+    id_vars = ["App", "row_id"]
+    value_vars = [c for c in df.columns if c not in id_vars]
+    df_melt = df.melt(id_vars=id_vars, value_vars=value_vars, var_name="Attribute", value_name="Value")
+    rowid_to_first = df.set_index("row_id")["First"].to_dict()
+    df_melt["First"] = df_melt["row_id"].map(rowid_to_first)
+    if attribute_rename_dict:
+        df_melt["Attribute"] = df_melt["Attribute"].replace(attribute_rename_dict)
+
+    def find_row_ids_for_filter_list(dfa, filter_list):
+        if not filter_list:
+            return set()
+        matched = set()
+        for (f_attr, f_vals) in filter_list:
+            mask = (dfa["Attribute"] == f_attr) & (dfa["Value"].isin(f_vals))
+            rowids = dfa.loc[mask, "row_id"].unique()
+            matched.update(rowids)
+        return matched
+
+    all_ids = set(df_melt["row_id"].unique())
+    if include_filters:
+        inc_ids = find_row_ids_for_filter_list(df_melt, include_filters)
+        all_ids = all_ids.intersection(inc_ids)
+    if exclude_filters:
+        exc_ids = find_row_ids_for_filter_list(df_melt, exclude_filters)
+        all_ids = all_ids.difference(exc_ids)
+    df_melt = df_melt[df_melt["row_id"].isin(all_ids)]
+    if exclude_attrs_from_final:
+        df_melt = df_melt[~df_melt["Attribute"].isin(exclude_attrs_from_final)]
+    df_melt["Key"] = df_melt.apply(
+        lambda row: f"{row['App']} | {row['First']} | {row['Attribute']} | {row['Value']}",
+        axis=1
+    )
+    df_melt.drop(columns=["row_id"], inplace=True)
+    df_melt = df_melt[["Key", "App", "First", "Attribute", "Value"]]
+    df_melt.drop_duplicates(subset=["Key"], inplace=True)
+    return df_melt
+
+def compute_app_key(filename: str, remove_substring: str = "_ceaster.txt") -> str:
+    base = os.path.basename(filename)
+    if remove_substring in base:
+        base = base.replace(remove_substring, "")
+    else:
+        base, _ = os.path.splitext(base)
+    return base.replace("_", " ")
+
+def transform_gamma_with_flexible_exclusion(
+    zip_file_path: Path,
+    exclude_attrs_from_melt: list = None,
+    exclude_attrs_from_final: list = None,
+    app_rename_dict: dict = None,
+    attribute_rename_dict: dict = None,
+    include_filters: list = None,
+    exclude_filters: list = None,
+    delimiter: str = ","
+) -> pd.DataFrame:
+    if not zip_file_path.is_file():
+        raise FileNotFoundError(f"ZIP not found: {zip_file_path}")
+
+    def pivot_one_df(df_in: pd.DataFrame, app_key: str) -> pd.DataFrame:
+        df = df_in.copy()
+        first_col = df.columns[0]
+        df["First"] = df[first_col]
+        df["row_id"] = df.index
+        if exclude_attrs_from_melt:
+            to_drop = [c for c in df.columns if c in exclude_attrs_from_melt and c not in ("row_id", "First")]
+            df.drop(columns=to_drop, inplace=True, errors="ignore")
+        id_vars = ["row_id", "First"]
+        value_vars = [c for c in df.columns if c not in id_vars]
+        df_melted = df.melt(id_vars=id_vars, value_vars=value_vars, var_name="Attribute", value_name="Value")
+        df_melted.insert(0, "App", app_key)
+        if app_rename_dict:
+            df_melted["App"] = df_melted["App"].replace(app_rename_dict)
+        if attribute_rename_dict:
+            df_melted["Attribute"] = df_melted["Attribute"].replace(attribute_rename_dict)
+        return df_melted
+
+    all_dfs = []
+    with zipfile.ZipFile(zip_file_path, "r") as z:
+        txt_files = [f for f in z.namelist() if f.endswith(".txt")]
+        for txt_file in txt_files:
+            app_key = compute_app_key(txt_file)
+            with z.open(txt_file) as file_obj:
+                df_in = pd.read_csv(file_obj, delimiter=delimiter)
+            df_melt = pivot_one_df(df_in, app_key)
+            all_dfs.append(df_melt)
+    if not all_dfs:
+        return pd.DataFrame(columns=["Key", "App", "First", "Attribute", "Value"])
+    df_gamma = pd.concat(all_dfs, ignore_index=True)
+
+    def find_row_ids_for_filter_list(dfa, filter_list):
+        if not filter_list:
+            return set()
+        matched = set()
+        for (attr, vals) in filter_list:
+            mask = (dfa["Attribute"] == attr) & (dfa["Value"].isin(vals))
+            rowids = dfa.loc[mask, "row_id"].unique()
+            matched.update(rowids)
+        return matched
+
+    all_ids = set(df_gamma["row_id"].unique())
+    if include_filters:
+        inc_ids = find_row_ids_for_filter_list(df_gamma, include_filters)
+        all_ids = all_ids.intersection(inc_ids)
+    if exclude_filters:
+        exc_ids = find_row_ids_for_filter_list(df_gamma, exclude_filters)
+        all_ids = all_ids.difference(exc_ids)
+    df_gamma = df_gamma[df_gamma["row_id"].isin(all_ids)]
+    if exclude_attrs_from_final:
+        df_gamma = df_gamma[~df_gamma["Attribute"].isin(exclude_attrs_from_final)]
+    df_gamma["Key"] = df_gamma.apply(
+        lambda row: f"{row['App']} | {row['First']} | {row['Attribute']} | {row['Value']}",
+        axis=1
+    )
+    df_gamma.drop(columns=["row_id"], inplace=True)
+    df_gamma = df_gamma[["Key", "App", "First", "Attribute", "Value"]]
+    df_gamma.drop_duplicates(subset=["Key"], inplace=True)
+    return df_gamma
+
+def read_ex_table(ex_path: Path, sheet_name="Sheet1") -> pd.DataFrame:
+    return pd.read_excel(ex_path, sheet_name=sheet_name)
+
+def create_comparison_excel(df_alfa: pd.DataFrame, df_gamma: pd.DataFrame, df_ex: pd.DataFrame, output_xlsx: Path):
+    hide_keys = set(df_ex.loc[df_ex["Hide Special"] == "yes", "Key"])
+    df_merge = pd.merge(df_alfa, df_gamma, on="Key", how="outer", suffixes=("_Alfa", "_Gamma"))
+    df_merge = df_merge[~df_merge["Key"].isin(hide_keys)]
+
+    def get_status(row):
+        in_alfa = pd.notnull(row["App_Alfa"])
+        in_gamma = pd.notnull(row["App_Gamma"])
+        if in_alfa and in_gamma:
+            return "Matching"
+        elif in_alfa:
+            return "Missing in Gamma"
+        else:
+            return "Missing in Alfa"
+
+    df_merge["Status"] = df_merge.apply(get_status, axis=1)
+    ex_extra_cols = [c for c in df_ex.columns if c not in ("Key", "Hide Special")]
+    if ex_extra_cols:
+        df_merge = pd.merge(df_merge, df_ex[["Key"] + ex_extra_cols], on="Key", how="left")
+    final_cols = [
+        "Key",
+        "App_Alfa", "First_Alfa", "Attribute_Alfa", "Value_Alfa",
+        "App_Gamma", "First_Gamma", "Attribute_Gamma", "Value_Gamma",
+        "Status"
+    ]
+    final_cols.extend(ex_extra_cols)
+    df_merge = df_merge[final_cols]
+    df_merge.to_excel(output_xlsx, sheet_name="Comparison", index=False)
+    wb = load_workbook(output_xlsx)
+    ws = wb["Comparison"]
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    blue_fill = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    match_fill = green_fill
+    header_cells = next(ws.iter_rows(min_row=1, max_row=1))
+    headers = {cell.value: cell.column for cell in header_cells}
+    alfa_cols = ["App_Alfa", "First_Alfa", "Attribute_Alfa", "Value_Alfa"]
+    for col in alfa_cols:
+        if col in headers:
+            col_idx = headers[col]
+            for row in range(2, ws.max_row + 1):
+                ws.cell(row=row, column=col_idx).fill = green_fill
+    gamma_cols = ["App_Gamma", "First_Gamma", "Attribute_Gamma", "Value_Gamma"]
+    for col in gamma_cols:
+        if col in headers:
+            col_idx = headers[col]
+            for row in range(2, ws.max_row + 1):
+                ws.cell(row=row, column=col_idx).fill = blue_fill
+    if "Status" in headers:
+        s_idx = headers["Status"]
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=s_idx)
+            if cell.value == "Matching":
+                cell.fill = match_fill
+            else:
+                cell.fill = red_fill
+    wb.save(output_xlsx)
+
+def main():
+    alfa_input = Path("ALO.xlsx")
+    df_alfa = transform_alfa_with_flexible_exclusion(
+        file_path=alfa_input,
+        sheet_name="Sheet1",
+        skip_rows=3,
+        app_rename_dict={"AlfaOld": "AlfaNew"},
+        attribute_rename_dict={"Attr1": "Attribute One", "First": "PersonName"},
+        exclude_attrs_from_melt=["IgnoreMe"],
+        exclude_attrs_from_final=["SecretColumn"],
+        include_filters=[("Department", ["Sales"])],
+        exclude_filters=[("Type", ["External"])]
+    )
+    gamma_zip_path = Path("your_zip_file.zip")
+    df_gamma = transform_gamma_with_flexible_exclusion(
+        zip_file_path=gamma_zip_path,
+        exclude_attrs_from_melt=["IgnoreColumn1"],
+        exclude_attrs_from_final=["SecretColumn"],
+        app_rename_dict={"GammaOld": "GammaNew"},
+        attribute_rename_dict={"AttrX": "Attribute X"},
+        include_filters=[("Department", ["Support"])],
+        exclude_filters=[("Priority", ["Low"])],
+        delimiter=","
+    )
+    ex_path = Path("Ex_Table.xlsx")
+    df_ex = read_ex_table(ex_path)
+    comparison_out = Path("Comparison.xlsx")
+    create_comparison_excel(df_alfa, df_gamma, df_ex, comparison_out)
+
+if __name__ == "__main__":
+    main()

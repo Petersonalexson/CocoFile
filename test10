@@ -21,13 +21,16 @@ def compute_app_key(filename: str, remove_substring: str = "_ceaster.txt") -> st
 def transform_dataframe(df: pd.DataFrame, app_key: str) -> pd.DataFrame:
 
     # Identify the first column name.
+
     first_col = df.columns[0]
     df = df.copy()  # Work on a copy to avoid mutating the input DataFrame.
 
     # Create a column "First" from the first column.
+
     df["First"] = df[first_col]
 
     # Melt the dataframe to a long format.
+
     df_melted = df.melt(id_vars=["First"], var_name="Attribute", value_name="Value")
 
     # Insert the 'App' column at position 0 (all rows have the same app_key).

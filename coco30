@@ -1,0 +1,696 @@
+# =============================================================================
+# File: coco_final_active_pairs_manytomany.py
+# Description:
+#   Reads "Coco Coco" (Table1) and "Coco Coco Land" (Table2) from Compare.xlsx.
+#   Produces 4 sheets:
+#     1) "Comparison" => merges Blocks 1+2+3
+#     2) "BLOC 1"
+#     3) "BLOC 2"
+#     4) "BLOC 3"
+#
+#   Enhancements:
+#     - Inactive entries are paired 1-1 or 1-to-many based on NoelFirst.
+#     - Daytona matching based on the highest number of shared words.
+#     - Retains all entries, including unmatched ones.
+#     - Applies border logic to both active and inactive pairs.
+#
+#   Styling:
+#     - If both sides are missing => red fill, no border
+#     - If one side missing => that side red fill, no border
+#     - If both exist and both Active:
+#         => match => purple border
+#         => mismatch => orange border
+#     - If both exist and both Inactive:
+#         => match => blue border
+#         => mismatch => gray border
+#     - Else (mixed status) => no border
+#
+# Usage:
+#   1) Adjust "file_path" and "out_path"
+#   2) pip install pandas openpyxl
+#   3) python coco_final_active_pairs_manytomany.py
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+import openpyxl
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from collections import defaultdict
+from datetime import datetime
+
+def main():
+    file_path = r""  # Set input file path (Compare.xlsx)
+
+    # Read T1/T2
+    df_t1 = pd.read_excel(file_path, sheet_name="Coco Coco")
+    df_t2 = pd.read_excel(file_path, sheet_name="Coco Coco Land")
+
+    # Clean column names
+    df_t1.columns = df_t1.columns.str.strip()
+    df_t2.columns = df_t2.columns.str.strip()
+
+    # Parse Noel => (NoelFirst, NoelSecond)
+    df_t1["NoelFirst"], df_t1["NoelSecond"] = zip(*df_t1["Noel"].apply(split_noel))
+    df_t2["NoelFirst"], df_t2["NoelSecond"] = zip(*df_t2["Noel"].apply(split_noel))
+
+    # Mark "Status" => Active/Inactive
+    df_t1["Status"] = df_t1.apply(get_activity_status, axis=1)
+    df_t2["Status"] = df_t2.apply(get_activity_status, axis=1)
+
+    # If T2 has extra columns => for BLOC 3; add extra columns if necessary
+    block3_cols = [
+        # e.g. "Fresca Ana", "Fusion Core", ...
+    ]
+
+    # The set of all NoelFirst
+    all_noels = sorted(set(df_t1["NoelFirst"].dropna()) | set(df_t2["NoelFirst"].dropna()))
+
+    comparison_rows = []
+    block1_rows = []
+    block2_rows = []
+    block3_rows = []
+
+    # Group T2 by NoelFirst for efficient access (if needed later)
+    t2_grouped = df_t2.groupby("NoelFirst")
+
+    for noel_first in all_noels:
+        sub_t1 = df_t1[df_t1["NoelFirst"] == noel_first].reset_index(drop=True)
+        sub_t2 = df_t2[df_t2["NoelFirst"] == noel_first].reset_index(drop=True)
+
+        # Separate active vs. inactive
+        t1_active = sub_t1[sub_t1["Status"] == "Active"].reset_index(drop=True)
+        t1_inactive = sub_t1[sub_t1["Status"] != "Active"].reset_index(drop=True)
+        t2_active = sub_t2[sub_t2["Status"] == "Active"].reset_index(drop=True)
+        t2_inactive = sub_t2[sub_t2["Status"] != "Active"].reset_index(drop=True)
+
+        # For many-to-many comment logic, count how many expansions exist in T2 and how many are active
+        total_exp = len(sub_t2)
+        active_exp = len(t2_active)
+
+        shared_cols = [
+            "Noel", "Daytona", "No Thing", "Pizza", "Pizza No Thing",
+            "Thing Noel", "Pizza Coco Daytona", "Sun Daytona", "Elastic Daytona",
+            "Hero Rome", "Coco Copo Opa Noel", "Coco Coco Opa Elastic Noel"
+        ]
+
+        # === Pair Active Entries ===
+        if not t1_active.empty and not t2_active.empty:
+            for _, row_t1 in t1_active.iterrows():
+                # If there are multiple matching rows in Table2, aggregate their values
+                if len(t2_active) > 1:
+                    # Use the first T2 row for Block1 values (or adjust as required)
+                    b1 = build_block1(row_t1, t2_active.iloc[0], total_exp, active_exp)
+                    # Build Block2: assign Table1 values and aggregate Table2 values
+                    b2 = {}
+                    for c in shared_cols:
+                        b2[f"Table1_{c}"] = row_t1.get(c, np.nan)
+                    agg_t2 = aggregate_table2_properties(t2_active.to_dict(orient="records"), shared_cols)
+                    b2.update(agg_t2)
+                    b2["Comment1_B2"] = "Aggregated many-to-many (active)"
+                    
+                    # Build Block3 using aggregation for extra columns
+                    b3 = {}
+                    for c in block3_cols:
+                        values = [safe_str(row.get(c, "")) for row in t2_active.to_dict(orient="records") if pd.notna(row.get(c))]
+                        b3[f"Table2_{c}"] = ", ".join(sorted(set(values))) if values else np.nan
+
+                    merged = {**b1, **b2, **b3}
+                    comparison_rows.append(merged)
+                    block1_rows.append(b1)
+                    block2_rows.append(b2)
+                    block3_rows.append(b3)
+                else:
+                    # One-to-one active matching (normal nested loop)
+                    for _, row_t2 in t2_active.iterrows():
+                        b1 = build_block1(row_t1, row_t2, total_exp, active_exp)
+                        b2 = build_block2(row_t1, row_t2)
+                        b3 = build_block3(row_t2, block3_cols)
+                        merged = {**b1, **b2, **b3}
+                        comparison_rows.append(merged)
+                        block1_rows.append(b1)
+                        block2_rows.append(b2)
+                        block3_rows.append(b3)
+        elif not t1_active.empty and t2_active.empty:
+            # Table2 has no active rows
+            for _, row_t1 in t1_active.iterrows():
+                b1 = build_block1(row_t1, None, total_exp, active_exp)
+                b2 = build_block2(row_t1, None)
+                b3 = build_block3(None, block3_cols)
+                merged = {**b1, **b2, **b3}
+                comparison_rows.append(merged)
+                block1_rows.append(b1)
+                block2_rows.append(b2)
+                block3_rows.append(b3)
+        elif t1_active.empty and not t2_active.empty:
+            # Table1 has no active rows
+            for _, row_t2 in t2_active.iterrows():
+                b1 = build_block1(None, row_t2, total_exp, active_exp)
+                b2 = build_block2(None, row_t2)
+                b3 = build_block3(row_t2, block3_cols)
+                merged = {**b1, **b2, **b3}
+                comparison_rows.append(merged)
+                block1_rows.append(b1)
+                block2_rows.append(b2)
+                block3_rows.append(b3)
+
+        # === Pair Inactive Entries ===
+        t1_inactive_sorted = sort_by_daytona_similarity(t1_inactive, t2_inactive)
+        t2_inactive_sorted = sort_by_daytona_similarity(t2_inactive, t1_inactive)
+
+        paired_t1_inactive = set()
+        paired_t2_inactive = set()
+
+        # 1-to-1 pairing based on highest shared Daytona words
+        for idx1, row1 in t1_inactive_sorted.iterrows():
+            best_match_idx2, shared_words = find_best_match(row1, t2_inactive_sorted, paired_t2_inactive)
+            if best_match_idx2 is not None:
+                row2 = t2_inactive_sorted.loc[best_match_idx2]
+                paired_t1_inactive.add(idx1)
+                paired_t2_inactive.add(best_match_idx2)
+
+                b1 = build_block1(row1, row2, total_exp, active_exp)
+                b2 = build_block2(row1, row2)
+                b3 = build_block3(row2, block3_cols)
+                merged = {**b1, **b2, **b3}
+                comparison_rows.append(merged)
+                block1_rows.append(b1)
+                block2_rows.append(b2)
+                block3_rows.append(b3)
+
+        # 1-to-many pairing for remaining inactive rows: Table1 row with all remaining T2 rows
+        remaining_t1_inactive = t1_inactive_sorted[~t1_inactive_sorted.index.isin(paired_t1_inactive)]
+        remaining_t2_inactive = t2_inactive_sorted[~t2_inactive_sorted.index.isin(paired_t2_inactive)]
+
+        for _, row_t1 in remaining_t1_inactive.iterrows():
+            if len(remaining_t2_inactive) > 1:
+                b1 = build_block1(row_t1, remaining_t2_inactive.iloc[0], total_exp, active_exp)
+                b2 = {}
+                for c in shared_cols:
+                    b2[f"Table1_{c}"] = row_t1.get(c, np.nan)
+                agg_t2 = aggregate_table2_properties(remaining_t2_inactive.to_dict(orient="records"), shared_cols)
+                b2.update(agg_t2)
+                b2["Comment1_B2"] = "Aggregated many-to-many (inactive)"
+                b3 = {}
+                for c in block3_cols:
+                    values = [safe_str(row.get(c, "")) for row in remaining_t2_inactive.to_dict(orient="records") if pd.notna(row.get(c))]
+                    b3[f"Table2_{c}"] = ", ".join(sorted(set(values))) if values else np.nan
+                merged = {**b1, **b2, **b3}
+                comparison_rows.append(merged)
+                block1_rows.append(b1)
+                block2_rows.append(b2)
+                block3_rows.append(b3)
+            else:
+                for _, row_t2 in remaining_t2_inactive.iterrows():
+                    b1 = build_block1(row_t1, row_t2, total_exp, active_exp)
+                    b2 = build_block2(row_t1, row_t2)
+                    b3 = build_block3(row_t2, block3_cols)
+                    merged = {**b1, **b2, **b3}
+                    comparison_rows.append(merged)
+                    block1_rows.append(b1)
+                    block2_rows.append(b2)
+                    block3_rows.append(b3)
+
+        # Handle unmatched inactive entries: Table1 entries with no Table2 and vice-versa.
+        for _, row_t1 in remaining_t1_inactive.iterrows():
+            b1 = build_block1(row_t1, None, total_exp, active_exp)
+            b2 = build_block2(row_t1, None)
+            b3 = build_block3(None, block3_cols)
+            merged = {**b1, **b2, **b3}
+            comparison_rows.append(merged)
+            block1_rows.append(b1)
+            block2_rows.append(b2)
+            block3_rows.append(b3)
+
+        for _, row_t2 in remaining_t2_inactive.iterrows():
+            b1 = build_block1(None, row_t2, total_exp, active_exp)
+            b2 = build_block2(None, row_t2)
+            b3 = build_block3(row_t2, block3_cols)
+            merged = {**b1, **b2, **b3}
+            comparison_rows.append(merged)
+            block1_rows.append(b1)
+            block2_rows.append(b2)
+            block3_rows.append(b3)
+
+    # Convert to DataFrames
+    df_comparison = pd.DataFrame(comparison_rows)
+    df_block1 = pd.DataFrame(block1_rows)
+    df_block2 = pd.DataFrame(block2_rows)
+    df_block3 = pd.DataFrame(block3_rows)
+
+    # Write to Excel
+    out_path = r""  # Set output file path
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        df_comparison.to_excel(writer, sheet_name="Comparison", index=False)
+        df_block1.to_excel(writer, sheet_name="BLOC 1", index=False)
+        df_block2.to_excel(writer, sheet_name="BLOC 2", index=False)
+        df_block3.to_excel(writer, sheet_name="BLOC 3", index=False)
+
+    # Apply styling
+    wb = openpyxl.load_workbook(out_path)
+    style_worksheet(wb["Comparison"])
+    style_worksheet(wb["BLOC 1"])
+    style_worksheet(wb["BLOC 2"])
+    style_worksheet(wb["BLOC 3"], block3=True)
+    wb.save(out_path)
+
+    print(f"Done. Wrote '{out_path}' with updated Block 1 comments and many-to-many handling.")
+
+# =============================================================================
+# Helper Functions for Aggregation
+# =============================================================================
+def aggregate_table2_properties(rows, shared_cols):
+    """
+    For a list of Table2 rows (as dictionaries), return a dictionary where each key is
+    'Table2_{col}' and the value is a concatenated string of all non-empty, unique values for that column.
+    """
+    agg = {}
+    for col in shared_cols:
+        values = [safe_str(row.get(col, "")) for row in rows if pd.notna(row.get(col))]
+        if values:
+            agg[f"Table2_{col}"] = ", ".join(sorted(set(filter(None, values))))
+        else:
+            agg[f"Table2_{col}"] = np.nan
+    return agg
+
+# =============================================================================
+# BLOC 1
+# =============================================================================
+def build_block1(row1, row2, total_exp, active_exp):
+    """
+    BLOC 1 => columns:
+      BLOC 1,
+      Table1_Noel, Table1_Daytona, Table1_Elastic Daytona, Table1_Status
+      Table2_Noel, Table2_Daytona, Table2_Elastic Daytona, Table2_Status
+      Missing_in_Table1, Missing_in_Table2
+      Comment1_B1 (status summary) and Comment2_B1 (detailed match type)
+    """
+    b1 = {"BLOC 1": None}
+
+    # Table1 values
+    if row1 is not None:
+        noel_t1    = row1.get("Noel", np.nan)
+        dayt_t1    = row1.get("Daytona", np.nan)
+        elast_t1   = row1.get("Elastic Daytona", np.nan)
+        stat_t1    = row1.get("Status", np.nan)
+    else:
+        noel_t1    = np.nan
+        dayt_t1    = np.nan
+        elast_t1   = np.nan
+        stat_t1    = np.nan
+
+    b1["Table1_Noel"]            = noel_t1
+    b1["Table1_Daytona"]         = dayt_t1
+    b1["Table1_Elastic Daytona"] = elast_t1
+    b1["Table1_Status"]          = stat_t1
+
+    # Table2 values
+    if row2 is not None:
+        noel_t2    = row2.get("Noel", np.nan)
+        dayt_t2    = row2.get("Daytona", np.nan)
+        elast_t2   = row2.get("Elastic Daytona", np.nan)
+        stat_t2    = row2.get("Status", np.nan)
+    else:
+        noel_t2    = np.nan
+        dayt_t2    = np.nan
+        elast_t2   = np.nan
+        stat_t2    = np.nan
+
+    b1["Table2_Noel"]            = noel_t2
+    b1["Table2_Daytona"]         = dayt_t2
+    b1["Table2_Elastic Daytona"] = elast_t2
+    b1["Table2_Status"]          = stat_t2
+
+    # Missing flags
+    b1["Missing_in_Table1"] = "Yes" if row1 is None else "No"
+    b1["Missing_in_Table2"] = "Yes" if row2 is None else "No"
+
+    # Comment1_B1: simple status summary.
+    comment_status = []
+    if not pd.isna(stat_t1):
+        comment_status.append(f"Table1 {stat_t1}")
+    if not pd.isna(stat_t2):
+        comment_status.append(f"Table2 {stat_t2}")
+    b1["Comment1_B1"] = ", ".join(comment_status)
+
+    # Comment2_B1: Detailed matching comment.
+    comment = ""
+    if row1 is None and row2 is not None:
+        if total_exp == 1:
+            comment = "0-1: missing in Table1"
+        else:
+            comment = f"0-many: missing in Table1 (Table2 count: {total_exp})"
+    elif row1 is not None and row2 is None:
+        comment = "Table2 missing"
+    elif row1 is not None and row2 is not None:
+        if total_exp == 1:
+            if stat_t1 == "Active" and stat_t2 == "Active":
+                comment = "1-1 (both active)"
+            elif stat_t1 == "Inactive" and stat_t2 == "Inactive":
+                comment = "1-1 (both inactive)"
+            else:
+                comment = "1-1 (mixed active/inactive)"
+        else:
+            if stat_t1 == "Active" and active_exp == 1:
+                comment = "1-many (only 1 active on Table1)"
+            elif stat_t2 == "Active" and active_exp == 1:
+                comment = "1-many (only 1 active on Table2)"
+            elif stat_t1 != stat_t2:
+                comment = "1-many (mixed active/inactive)"
+            else:
+                if stat_t1 == "Active":
+                    comment = "1-many (both active)"
+                elif stat_t1 == "Inactive":
+                    comment = "1-many (both inactive)"
+                else:
+                    comment = "1-many"
+    else:
+        comment = "both missing"
+
+    b1["Comment2_B1"] = comment
+    return b1
+
+# =============================================================================
+# BLOC 2
+# =============================================================================
+def build_block2(row1, row2):
+    """
+    BLOC 2 => columns:
+      BLOC 2,
+      Table1_{Noel,Daytona,No Thing,Pizza,Pizza No Thing,Thing Noel,
+              Pizza Coco Daytona,Sun Daytona,Elastic Daytona,Hero Rome,
+              Coco Copo Opa Noel,Coco Coco Opa Elastic Noel}
+      Table2_{... same}
+      Comment1_B2, Comment2_B2, Comment3_B2
+    """
+    b2 = {"BLOC 2": None}
+
+    shared_cols = [
+        "Noel", "Daytona", "No Thing", "Pizza", "Pizza No Thing",
+        "Thing Noel", "Pizza Coco Daytona", "Sun Daytona", "Elastic Daytona",
+        "Hero Rome", "Coco Copo Opa Noel", "Coco Coco Opa Elastic Noel"
+    ]
+
+    # Table1 columns
+    if row1 is not None:
+        for c in shared_cols:
+            b2[f"Table1_{c}"] = row1.get(c, np.nan)
+    else:
+        for c in shared_cols:
+            b2[f"Table1_{c}"] = np.nan
+
+    # Table2 columns
+    if row2 is not None:
+        for c in shared_cols:
+            b2[f"Table2_{c}"] = row2.get(c, np.nan)
+    else:
+        for c in shared_cols:
+            b2[f"Table2_{c}"] = np.nan
+
+    # Comments logic for BLOC 2
+    noel_t1 = b2["Table1_Noel"]
+    noel_t2 = b2["Table2_Noel"]
+
+    if pd.isna(noel_t1) and pd.notna(noel_t2):
+        b2["Comment1_B2"] = "Missing in Table1"
+    elif pd.notna(noel_t1) and pd.isna(noel_t2):
+        b2["Comment1_B2"] = "Missing in Table2"
+    elif pd.isna(noel_t1) and pd.isna(noel_t2):
+        b2["Comment1_B2"] = "No Noel in both?"
+    else:
+        b2["Comment1_B2"] = "Both present"
+
+    mismatch_flag = False
+    diff_cols = []
+
+    if pd.isna(noel_t1) or pd.isna(noel_t2):
+        b2["Comment2_B2"] = "N/A"
+        b2["Comment3_B2"] = "N/A"
+    else:
+        for c in shared_cols:
+            if c == "Noel":
+                continue
+            v1 = b2[f"Table1_{c}"]
+            v2 = b2[f"Table2_{c}"]
+            if pd.isna(v1) and pd.notna(v2):
+                mismatch_flag = True
+                diff_cols.append(f"{c} [T1 missing, T2 present]")
+            elif pd.notna(v1) and pd.isna(v2):
+                mismatch_flag = True
+                diff_cols.append(f"{c} [T1 present, T2 missing]")
+            else:
+                sv1 = safe_str(v1)
+                sv2 = safe_str(v2)
+                if sv1 != sv2:
+                    mismatch_flag = True
+                    diff_cols.append(f"{c} [T1={sv1}, T2={sv2}]")
+
+        if mismatch_flag:
+            b2["Comment2_B2"] = "shared dimensions GAP"
+            b2["Comment3_B2"] = "Diff columns: " + ", ".join(diff_cols) if diff_cols else "Diff columns: ???"
+        else:
+            b2["Comment2_B2"] = "shared dimensions MATCH"
+            b2["Comment3_B2"] = "No differences"
+
+    return b2
+
+# =============================================================================
+# BLOC 3
+# =============================================================================
+def build_block3(row2, block3_cols):
+    """
+    BLOC 3 => 'BLOC 3' + Table2_{extra columns}; no comments.
+    """
+    b3 = {"BLOC 3": None}
+    if row2 is None:
+        for c in block3_cols:
+            b3[f"Table2_{c}"] = np.nan
+        return b3
+
+    for c in block3_cols:
+        val = row2.get(c, np.nan)
+        b3[f"Table2_{c}"] = val
+    return b3
+
+# =============================================================================
+# STYLING
+# =============================================================================
+def style_worksheet(ws, block3=False):
+    """
+    Styling logic:
+      - Both missing => red fill, no border.
+      - One side missing => that side red fill, no border.
+      - If both exist and both Active:
+            => match => purple border; mismatch => orange border.
+      - If both exist and both Inactive:
+            => match => blue border; mismatch => gray border.
+      - Mixed status => no border.
+    """
+    row_count = ws.max_row
+    col_count = ws.max_column
+    headers = [cell.value for cell in ws[1]]
+
+    green_fill  = PatternFill(start_color="C6E0B4", end_color="C6E0B4", fill_type="solid")
+    blue_fill   = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+    white_fill  = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+    dark_fill   = PatternFill(start_color="808080", end_color="808080", fill_type="solid")
+    red_fill    = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    purple_side = Side(style="medium", color="800080")  # Purple
+    orange_side = Side(style="medium", color="FFA500")  # Orange
+    blue_side   = Side(style="medium", color="0000FF")  # Blue
+    gray_side   = Side(style="medium", color="808080")  # Gray
+
+    # Locate status columns
+    col_t1_status = None
+    col_t2_status = None
+    for i, col_name in enumerate(headers, start=1):
+        if col_name == "Table1_Status":
+            col_t1_status = i
+        elif col_name == "Table2_Status":
+            col_t2_status = i
+
+    # Base fill for each cell
+    for r in range(1, row_count+1):
+        for c in range(1, col_count+1):
+            cell = ws.cell(row=r, column=c)
+            if r == 1:
+                cell.font = Font(bold=True)
+                continue
+            col_header = headers[c-1] if c <= len(headers) else ""
+            if col_header in ["BLOC 1", "BLOC 2", "BLOC 3"]:
+                cell.fill = dark_fill
+                cell.font = Font(color="FFFFFF", bold=True)
+                continue
+            if col_header.startswith("Table1_"):
+                cell.fill = green_fill
+            elif col_header.startswith("Table2_"):
+                cell.fill = blue_fill
+            elif ("Comment" in col_header or "Status" in col_header or "Missing_in_Table" in col_header):
+                cell.fill = white_fill
+            else:
+                cell.fill = white_fill
+
+    # Determine paired columns for border drawing
+    pairs = defaultdict(lambda: {"t1": None, "t2": None})
+    for i, h in enumerate(headers, start=1):
+        if h.startswith("Table1_"):
+            base = h.replace("Table1_", "")
+            pairs[base]["t1"] = i
+        elif h.startswith("Table2_"):
+            base = h.replace("Table2_", "")
+            pairs[base]["t2"] = i
+
+    for base_name, idxs in pairs.items():
+        t1_idx = idxs["t1"]
+        t2_idx = idxs["t2"]
+        if t1_idx and t2_idx:
+            for r in range(2, row_count+1):
+                cell_t1 = ws.cell(row=r, column=t1_idx)
+                cell_t2 = ws.cell(row=r, column=t2_idx)
+                v1 = cell_t1.value
+                v2 = cell_t2.value
+
+                # Read statuses if available
+                status_t1 = ws.cell(row=r, column=col_t1_status).value if col_t1_status else None
+                status_t2 = ws.cell(row=r, column=col_t2_status).value if col_t2_status else None
+
+                if pd.isna(v1) and pd.isna(v2):
+                    cell_t1.fill = red_fill
+                    cell_t2.fill = red_fill
+                    continue
+
+                if pd.isna(v1) and pd.notna(v2):
+                    cell_t1.fill = red_fill
+                    continue
+                elif pd.isna(v2) and pd.notna(v1):
+                    cell_t2.fill = red_fill
+                    continue
+
+                if pd.notna(v1) and pd.notna(v2):
+                    if status_t1 == "Active" and status_t2 == "Active":
+                        s1 = safe_str(v1)
+                        s2 = safe_str(v2)
+                        if s1 == s2:
+                            set_border(cell_t1, purple_side)
+                            set_border(cell_t2, purple_side)
+                        else:
+                            set_border(cell_t1, orange_side)
+                            set_border(cell_t2, orange_side)
+                    elif status_t1 == "Inactive" and status_t2 == "Inactive":
+                        s1 = safe_str(v1)
+                        s2 = safe_str(v2)
+                        if s1 == s2:
+                            set_border(cell_t1, blue_side)
+                            set_border(cell_t2, blue_side)
+                        else:
+                            set_border(cell_t1, gray_side)
+                            set_border(cell_t2, gray_side)
+                    else:
+                        pass
+
+    # Auto-fit columns and adjust alignment
+    for c in range(1, col_count+1):
+        max_len = 0
+        for r in range(1, row_count+1):
+            val = ws.cell(row=r, column=c).value
+            s = str(val) if val is not None else ""
+            max_len = max(max_len, len(s))
+        ws.column_dimensions[get_column_letter(c)].width = min(50, max(10, max_len + 2))
+        for r in range(1, row_count+1):
+            ws.cell(row=r, column=c).alignment = Alignment(vertical="top", wrap_text=True)
+
+def set_border(cell, side):
+    """Sets all sides of 'cell' to 'side'."""
+    cell.border = Border(left=side, right=side, top=side, bottom=side)
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+def get_activity_status(row):
+    """
+    Mark a row as Inactive if 'Daytona' contains 'close'/'closed'
+    or if 'Elastic Daytona' (interpreted as a date) is in the past.
+    Otherwise, mark Active.
+    """
+    dayt = str(row.get("Daytona", "")).lower()
+    elast = row.get("Elastic Daytona", "")
+    if "close" in dayt:
+        return "Inactive"
+    if pd.notna(elast):
+        try:
+            dt = pd.to_datetime(elast)
+            if dt < pd.Timestamp.now():
+                return "Inactive"
+        except Exception:
+            pass
+    return "Active"
+
+def split_noel(val):
+    """
+    Splits a Noel value; e.g. 'AAAA_0001' => (AAAA,0001), 'AAAA' => (AAAA,None)
+    """
+    if pd.isna(val):
+        return None, None
+    s = str(val).strip()
+    if "_" in s:
+        left, right = s.split("_", 1)
+        return left, right
+    else:
+        return s, None
+
+def safe_str(x):
+    """Returns string version of x, or empty string if NaN."""
+    return "" if pd.isna(x) else str(x).strip()
+
+def count_shared_words(str1, str2):
+    """
+    Counts the number of shared words between two strings.
+    """
+    if pd.isna(str1) or pd.isna(str2):
+        return 0
+    words1 = set(str1.lower().split())
+    words2 = set(str2.lower().split())
+    return len(words1 & words2)
+
+def sort_by_daytona_similarity(df_primary, df_secondary):
+    """
+    Sorts df_primary based on the similarity of the 'Daytona' field with df_secondary.
+    Entries with higher shared words come first.
+    """
+    if df_secondary.empty:
+        return df_primary
+    df_sorted = df_primary.copy()
+    similarity_scores = []
+    for _, row in df_sorted.iterrows():
+        max_shared = 0
+        for _, sec_row in df_secondary.iterrows():
+            shared = count_shared_words(row.get("Daytona", ""), sec_row.get("Daytona", ""))
+            if shared > max_shared:
+                max_shared = shared
+        similarity_scores.append(max_shared)
+    df_sorted['Similarity'] = similarity_scores
+    df_sorted = df_sorted.sort_values(by='Similarity', ascending=False).drop(columns=['Similarity'])
+    return df_sorted
+
+def find_best_match(row, df_candidates, paired_indices):
+    """
+    Finds the best match in df_candidates for the given row based on 'Daytona' similarity.
+    Skips any candidate indices already in paired_indices.
+    Returns the best match's index and the number of shared words.
+    """
+    best_match_idx = None
+    max_shared = -1
+    for idx, candidate in df_candidates.iterrows():
+        if idx in paired_indices:
+            continue
+        shared = count_shared_words(row.get("Daytona", ""), candidate.get("Daytona", ""))
+        if shared > max_shared:
+            max_shared = shared
+            best_match_idx = idx
+    if max_shared > 0:
+        return best_match_idx, max_shared
+    else:
+        return None, max_shared
+
+if __name__ == "__main__":
+    main()

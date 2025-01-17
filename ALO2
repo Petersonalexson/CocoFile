@@ -1,0 +1,122 @@
+import pandas as pd
+from pathlib import Path
+
+def transform_alo_sheet_keep_and_include_first_with_multiple_filters(
+    file_path: Path,
+    output_path: Path,
+    sheet_name: str = "Sheet1",
+    skip_rows: int = 3,
+    app_rename_dict: dict = None,
+    attribute_rename_dict: dict = None,
+    excluded_attributes: list = None,
+    include_filters: list = None,
+    exclude_filters: list = None
+) -> None:
+    df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=skip_rows)
+    df.rename(columns={
+        df.columns[2]: "App",
+        df.columns[3]: "First"
+    }, inplace=True)
+
+    if app_rename_dict:
+        df["App"] = df["App"].replace(app_rename_dict)
+
+    df["row_id"] = df.index
+
+    if excluded_attributes:
+        must_keep = {"App", "row_id"}
+        to_drop = [col for col in excluded_attributes if col not in must_keep]
+        df.drop(columns=to_drop, inplace=True, errors="ignore")
+
+    id_vars = ["App", "row_id"]
+    value_vars = [col for col in df.columns if col not in id_vars]
+    df_melt = df.melt(
+        id_vars=id_vars,
+        value_vars=value_vars,
+        var_name="Attribute",
+        value_name="Value"
+    )
+
+    original_first_map = df.set_index("row_id")["First"].to_dict()
+    df_melt["First"] = df_melt["row_id"].map(original_first_map)
+
+    if attribute_rename_dict:
+        df_melt["Attribute"] = df_melt["Attribute"].replace(attribute_rename_dict)
+
+    def find_row_ids_for_filter_list(df_long, filter_list):
+        if not filter_list:
+            return set()
+        matched_ids = set()
+        for (attr, values) in filter_list:
+            mask = (df_long["Attribute"] == attr) & (df_long["Value"].isin(values))
+            matched_ids.update(df_long.loc[mask, "row_id"].unique())
+        return matched_ids
+
+    all_row_ids = set(df_melt["row_id"].unique())
+
+    if include_filters:
+        include_ids = find_row_ids_for_filter_list(df_melt, include_filters)
+        all_row_ids = all_row_ids.intersection(include_ids)
+
+    if exclude_filters:
+        exclude_ids = find_row_ids_for_filter_list(df_melt, exclude_filters)
+        all_row_ids = all_row_ids.difference(exclude_ids)
+
+    df_melt = df_melt[df_melt["row_id"].isin(all_row_ids)]
+
+    df_melt["Key"] = df_melt.apply(
+        lambda row: f"{row['App']} | {row['First']} | {row['Attribute']} | {row['Value']}",
+        axis=1
+    )
+
+    df_melt.drop(columns=["row_id"], inplace=True)
+
+    df_melt = df_melt[["Key", "App", "First", "Attribute", "Value"]]
+
+    if df_melt.empty:
+        no_data_df = pd.DataFrame({"Info": ["No Data remains after filtering."]})
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            no_data_df.to_excel(writer, sheet_name="No Data", index=False)
+        print("No data to write; created a fallback 'No Data' sheet.")
+        return
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        df_melt.to_excel(writer, sheet_name="Combined Data", index=False)
+
+    print(f"Data from '{file_path}' was transformed and saved to '{output_path}'. "
+          "Open 'Combined Data' to see the results.")
+
+def main():
+    input_file = Path("ALO.xlsx")
+    output_file = Path("ALO_filtered_multi_value.xlsx")
+
+    app_name_map = {"OldAppName": "NewAppName"}
+    attribute_name_map = {
+        "First": "PersonName",
+        "Attr1": "Attribute One",
+        "Attr2": "Attribute Two"
+    }
+    excluded_attrs = ["IgnoreMe", "NotNeeded"]
+    include_filters = [
+        ("Status", ["Approved", "Active"]),
+        ("Department", ["Sales", "Engineering"])
+    ]
+    exclude_filters = [
+        ("Type", ["External", "Test"]),
+        ("Priority", ["Low", "Undefined"])
+    ]
+
+    transform_alo_sheet_keep_and_include_first_with_multiple_filters(
+        file_path=input_file,
+        output_path=output_file,
+        sheet_name="Sheet1",
+        skip_rows=3,
+        app_rename_dict=app_name_map,
+        attribute_rename_dict=attribute_name_map,
+        excluded_attributes=excluded_attrs,
+        include_filters=include_filters,
+        exclude_filters=exclude_filters
+    )
+
+if __name__ == "__main__":
+    main()

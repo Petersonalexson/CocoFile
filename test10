@@ -1,4 +1,4 @@
-import os
+"""import os
 import zipfile
 from pathlib import Path
 import pandas as pd
@@ -91,4 +91,65 @@ def main():
 
 
 if __name__ == "__main__":
+    main()"""
+
+import os
+import zipfile
+from pathlib import Path
+import pandas as pd
+
+def compute_app_key(filename: str, remove_substring: str = "_ceaster.txt") -> str:
+    base = os.path.basename(filename)
+    if remove_substring in base:
+        base = base.replace(remove_substring, "")
+    else:
+        base, _ = os.path.splitext(base)
+    return base.replace("_", " ")
+
+def transform_dataframe(df: pd.DataFrame, app_key: str) -> pd.DataFrame:
+    first_col = df.columns[0]
+    df = df.copy()
+    df["First"] = df[first_col]
+    df_melted = df.melt(id_vars=["First"], var_name="Attribute", value_name="Value")
+    df_melted.insert(0, "App", app_key)
+    df_melted["Key"] = df_melted.apply(
+        lambda row: f"{row['App']} | {row['First']} | {row['Attribute']} | {row['Value']}",
+        axis=1
+    )
+    df_melted = df_melted[["Key", "App", "First", "Attribute", "Value"]]
+    return df_melted
+
+def main():
+    zip_file_path = Path("your_zip_file.zip")
+    output_excel_path = Path("output_workbook.xlsx")
+    if not zip_file_path.is_file():
+        raise FileNotFoundError(f"ZIP file not found: {zip_file_path}")
+    combined_df_list = []
+    try:
+        with zipfile.ZipFile(zip_file_path, "r") as z:
+            txt_files = [f for f in z.namelist() if f.endswith(".txt")]
+            for txt_file in txt_files:
+                app_key = compute_app_key(txt_file)
+                with z.open(txt_file) as file_obj:
+                    df = pd.read_csv(file_obj, delimiter=",")
+                transformed_df = transform_dataframe(df, app_key)
+                combined_df_list.append(transformed_df)
+        if combined_df_list:
+            combined_df = pd.concat(combined_df_list, ignore_index=True)
+            sheet_name = "Combined Data"
+        else:
+            combined_df = pd.DataFrame(
+                {"Info": ["No TXT files were found or they were all empty."]}
+            )
+            sheet_name = "No Data"
+        with pd.ExcelWriter(output_excel_path, engine="openpyxl") as writer:
+            combined_df.to_excel(writer, sheet_name=sheet_name, index=False)
+        print(f"Excel workbook created: {output_excel_path} (Sheet: '{sheet_name}')")
+    except zipfile.BadZipFile:
+        print(f"Error: The file '{zip_file_path}' is not a valid ZIP file.")
+    except Exception as ex:
+        print(f"An unexpected error occurred: {ex}")
+
+if __name__ == "__main__":
     main()
+

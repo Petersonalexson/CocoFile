@@ -120,7 +120,7 @@ def transform_dataframe(df: pd.DataFrame, app_key: str) -> pd.DataFrame:
     return df_melted
 
 def main():
-    zip_file_path = Path("your_zip_file.zip")
+    zip_file_path = Path("zip_file.zip")
     output_excel_path = Path("output_workbook.xlsx")
     if not zip_file_path.is_file():
         raise FileNotFoundError(f"ZIP file not found: {zip_file_path}")

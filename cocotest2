@@ -23,7 +23,7 @@ def transform_alfa(
     exclude_filters: list = None
 ) -> pd.DataFrame:
     """
-    Transforms an Excel file (Alfa). 
+    Transforms Excel file (Alfa). 
     Column C is 'Dimension', Column D is 'First'. 
     The result is a DataFrame with columns: [Key, Dimension, First, Attribute, Value].
 
@@ -31,10 +31,10 @@ def transform_alfa(
       - Reads the Excel, skipping 'skip_rows' so row (skip_rows+1) is a header.
       - Renames column C -> 'Dimension', column D -> 'First'.
       - Melts remaining columns into [Attribute, Value].
-      - (Optional) renames dimension values (dimension_rename_dict).
-      - (Optional) renames attribute names (attr_rename_dict).
-      - (Optional) keeps or ignores certain attributes.
-      - (Optional) applies include/exclude filters based on (Attribute, Value).
+      -    renames dimension values (dimension_rename_dict).
+      -    renames attribute names (attr_rename_dict).
+      -    keeps or ignores certain attributes.
+      -    applies include/exclude filters based on (Attribute, Value).
       - Removes rows whose 'Key' is in excluded_keys.
       - Drops duplicates by 'Key'.
       - Returns the final DataFrame.
@@ -51,7 +51,7 @@ def transform_alfa(
         df.columns[3]: "First"
     }, inplace=True)
 
-    # Rename dimension values if desired
+    # Rename dimension values  
     if dimension_rename_dict:
         df["Dimension"] = df["Dimension"].replace(dimension_rename_dict)
 
@@ -66,7 +66,7 @@ def transform_alfa(
         value_name="Value"
     )
 
-    # Rename attribute names if desired
+    # Rename attribute names  
     if attr_rename_dict:
         df_melt["Attribute"] = df_melt["Attribute"].replace(attr_rename_dict)
 
@@ -120,7 +120,7 @@ def transform_alfa(
 def compute_dimension_key(filename: str, remove_substring: str = "_ceaster.txt") -> str:
     """
     Generates a dimension name from a .txt filename by removing
-    a particular substring and underscores.
+    substring and underscores.
     """
     base = os.path.basename(filename)
     if remove_substring in base:
@@ -148,10 +148,10 @@ def transform_gamma(
     Steps:
       - Opens the ZIP and reads each .txt as CSV.
       - Assigns a dimension name based on the filename (compute_dimension_key).
-      - (Optional) renames dimension (dimension_rename_dict).
+      -    renames dimension (dimension_rename_dict).
       - Melts all columns except [Dimension, First].
-      - (Optional) renames attributes (attr_rename_dict).
-      - (Optional) keeps or ignores certain attributes.
+      -    renames attributes (attr_rename_dict).
+      -    keeps or ignores certain attributes.
       - Applies include/exclude filters.
       - Removes rows whose 'Key' is in excluded_keys.
       - Drops duplicates by 'Key'.
@@ -172,7 +172,7 @@ def transform_gamma(
                 return pd.DataFrame(columns=["Key", "Dimension", "First", "Attribute", "Value"])
 
             for txt_file in txt_files:
-                dimension_name = compute_dimension_key(txt_file)  # e.g. "My Dimension"
+                dimension_name = compute_dimension_key(txt_file)  #
                 with z.open(txt_file) as file_obj:
                     df_in = pd.read_csv(file_obj, delimiter=delimiter)
 
@@ -186,7 +186,7 @@ def transform_gamma(
                 # Insert a 'Dimension' column
                 df_in["Dimension"] = dimension_name
 
-                # Rename dimension if desired
+                # Rename dimension  
                 if dimension_rename_dict:
                     df_in["Dimension"] = df_in["Dimension"].replace(dimension_rename_dict)
 
@@ -201,7 +201,7 @@ def transform_gamma(
                     value_name="Value"
                 )
 
-                # Rename attributes if desired
+                # Rename attributes
                 if attr_rename_dict:
                     dfa["Attribute"] = dfa["Attribute"].replace(attr_rename_dict)
 
@@ -260,7 +260,7 @@ def transform_gamma(
 def read_exclusion_table(ex_table_path: Path) -> pd.DataFrame:
     """
     Reads an Excel with at least a 'Key' column. 
-    All such Keys are excluded from both Alfa and Gamma.
+    All Keys are excluded from both Alfa and Gamma.
     """
     if not ex_table_path.is_file():
         print(f"[Ex Table] File not found at {ex_table_path}. Returning empty.")
@@ -298,7 +298,7 @@ def create_comparison_excel(
         on="Key", how="outer",
         suffixes=("_Alfa", "_Gamma")
     )
-    # Now columns: 
+    # columns: 
     #   Key,
     #   Dimension_Alfa, First_Alfa, Attribute_Alfa, Value_Alfa,
     #   Dimension_Gamma, First_Gamma, Attribute_Gamma, Value_Gamma
@@ -373,7 +373,7 @@ def create_comparison_excel(
 def main():
     """
     Example usage:
-      1) Read an Exclusion Table -> gather excluded Keys.
+      1) Read an Exclusion Table.
       2) Transform Alfa (Excel).
       3) Transform Gamma (ZIP).
       4) Create a color-coded comparison.

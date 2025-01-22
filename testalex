@@ -1,0 +1,128 @@
+def transform_alfa(
+    file_path: Path,
+    excluded_keys: set,
+    pre_melt_exclude_rules: list = None,
+    post_melt_bad_dimensions: list = None,
+    post_melt_bad_attributes: list = None,
+    dimension_rename_dict: dict = None,
+    attribute_rename_dict: dict = None,
+    sheet_name: str = "Sheet1",
+    skip_rows: int = 3
+) -> pd.DataFrame:
+    """
+    Transforms the Alfa (Excel) data.
+    """
+    if not file_path.is_file():
+        print(f"[Alfa] File not found: {file_path}")
+        return pd.DataFrame(columns=["Key", "Dimension", "NameID", "Attribute", "Value"])
+
+    # 1) Read Excel
+    df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=skip_rows)
+    print(f"[Alfa] Initial rows: {len(df)}")
+    if df.shape[1] < 4:
+        print("[Alfa] Warning: fewer than 4 columns. Returning empty.")
+        return pd.DataFrame(columns=["Key", "Dimension", "NameID", "Attribute", "Value"])
+
+    # 2) Pre-melt exclude
+    df = filter_pre_melt(df, pre_melt_exclude_rules)
+
+    # 3) Rename columns => col[2]->Dimension_Name, col[3]->First
+    df.rename(columns={
+        df.columns[2]: "Dimension_Name",
+        df.columns[3]: "First"
+    }, inplace=True)
+    print(f"[Alfa] Columns after renaming: {df.columns.tolist()}")  # **Added Debug**
+
+    # 4) Split 'Dimension_Name' into 'Dimension' and 'Name'
+    if 'Dimension_Name' in df.columns:
+        split_df = df['Dimension_Name'].str.split('_', 1, expand=True)
+        if split_df.shape[1] == 2:
+            df['Dimension'] = split_df[0]
+            df['Name'] = split_df[1]
+            print(f"[Alfa] Split 'Dimension_Name' into 'Dimension' and 'Name':\n{df[['Dimension', 'Name']].head()}")  # **Added Debug**
+        else:
+            print("[Alfa] Warning: 'Dimension_Name' does not contain an underscore. 'Name' cannot be extracted.")
+            df['Dimension'] = df['Dimension_Name']
+            df['Name'] = pd.NA  # Assign NaN if split fails
+    else:
+        print("[Alfa] 'Dimension_Name' column not found after renaming.")
+        df['Dimension'] = pd.NA
+        df['Name'] = pd.NA
+
+    # 5) Remove 'Dimension_Name' as it's now split
+    df.drop(columns=['Dimension_Name'], inplace=True)
+    print(f"[Alfa] Columns after dropping 'Dimension_Name': {df.columns.tolist()}")  # **Added Debug**
+
+    # 6) Assign 'NameID' as NaN initially
+    df['NameID'] = pd.NA
+    print(f"[Alfa] Initialized 'NameID' column.")  # **Added Debug**
+
+    # 7) Melt
+    # To include 'Name' as an attribute, ensure 'Name' is part of value_vars
+    id_vars = ['Dimension']
+    val_vars = [c for c in df.columns if c not in id_vars and c != 'Name']
+    print(f"[Alfa] id_vars: {id_vars}, val_vars before adding 'Name': {val_vars}")  # **Added Debug**
+
+    # Include 'Name' in val_vars to ensure it becomes an attribute
+    if 'Name' in df.columns:
+        val_vars = [c for c in df.columns if c not in id_vars and c != 'Name']
+        val_vars += ['Name']  # Ensure 'Name' is included
+    else:
+        print("[Alfa] 'Name' column not found.")
+    print(f"[Alfa] val_vars after ensuring 'Name' is included: {val_vars}")  # **Added Debug**
+
+    df_melt = df.melt(
+        id_vars=id_vars,
+        value_vars=val_vars,
+        var_name="Attribute",
+        value_name="Value"
+    )
+    print(f"[Alfa] Rows after melt: {len(df_melt)}")  # **Added Debug**
+
+    # 8) Rename dimension/attribute if needed
+    if dimension_rename_dict:
+        df_melt["Dimension"] = df_melt["Dimension"].replace(dimension_rename_dict)
+        print(f"[Alfa] Dimensions after renaming: {df_melt['Dimension'].unique()}")  # **Added Debug**
+    if attribute_rename_dict:
+        df_melt["Attribute"] = df_melt["Attribute"].replace(attribute_rename_dict)
+        print(f"[Alfa] Attributes after renaming: {df_melt['Attribute'].unique()}")  # **Added Debug**
+
+    # 9) Exclude certain Dimensions or Attributes
+    df_melt = exclude_dimension_attribute(
+        df_melt,
+        bad_dimensions=post_melt_bad_dimensions,
+        bad_attributes=post_melt_bad_attributes
+    )
+    print(f"[Alfa] Rows after post-melt exclusion: {len(df_melt)}")  # **Added Debug**
+
+    # 10) Assign NameID from 'Name' attribute
+    # Find rows where Attribute is 'Name', assign 'NameID'
+    name_mask = (df_melt["Attribute"] == "Name")
+    df_melt.loc[name_mask, "NameID"] = df_melt.loc[name_mask, "Value"]
+    # Forward fill NameID based on Dimension
+    df_melt["NameID"] = df_melt.groupby("Dimension")["NameID"].ffill()
+    print(f"[Alfa] Rows after assigning NameID:\n{df_melt[['Dimension', 'NameID']].drop_duplicates().head()}")  # **Added Debug**
+
+    # 11) Build Key
+    df_melt["Key"] = df_melt.apply(
+        lambda row: f"{row['Dimension']} | {row['NameID']} | {row['Attribute']} | {row['Value']}",
+        axis=1
+    )
+    print(f"[Alfa] Sample Keys:\n{df_melt['Key'].head()}")  # **Added Debug**
+
+    # 12) Exclude rows based on Keys
+    before_exclusion = len(df_melt)
+    df_melt = df_melt[~df_melt["Key"].isin(excluded_keys)]
+    after_exclusion = len(df_melt)
+    print(f"[Alfa] Excluded {before_exclusion - after_exclusion} rows based on excluded_keys.")  # **Added Debug**
+
+    # 13) Remove duplicates if necessary
+    before_dedup = len(df_melt)
+    df_melt.drop_duplicates(subset=["Key"], inplace=True)
+    after_dedup = len(df_melt)
+    print(f"[Alfa] Removed {before_dedup - after_dedup} duplicate rows.")  # **Added Debug**
+
+    # 14) Final DataFrame
+    final_df = df_melt[["Key", "Dimension", "NameID", "Attribute", "Value"]]
+    print(f"[Alfa] Final rows: {len(final_df)}")  # **Added Debug**
+    return final_df

@@ -1,0 +1,468 @@
+import os
+import zipfile
+import pandas as pd
+from pathlib import Path
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+
+# -----------------------------------------
+#    READ EXCLUSION TABLE
+# -----------------------------------------
+def read_exclusion_table(ex_table_path: Path) -> set:
+    """
+    Reads an Excel file that has at least: Key,   omega hide.
+    Returns a set of keys to exclude where   omega hide == 'yes'.
+    """
+    if not ex_table_path.is_file():
+        print(f"[Ex Table] File not found: {ex_table_path}. No exclusions will be applied.")
+        return set()
+
+    df_ex = pd.read_excel(ex_table_path, sheet_name="Sheet1")
+    if "Key" not in df_ex.columns or "  omega hide" not in df_ex.columns:
+        print("[Ex Table] Missing either 'Key' or '  omega hide' columns. No exclusions.")
+        return set()
+
+    # Only exclude keys where   omega hide == yes (case-insensitive)
+    mask = df_ex["  omega hide"].astype(str).str.lower() == "yes"
+    excluded_keys = set(df_ex.loc[mask, "Key"].dropna().unique())
+    return excluded_keys
+
+
+# -----------------------------------------
+#   GENERIC INCLUDE/EXCLUDE (ANY COLUMN)
+# -----------------------------------------
+def apply_filters(df: pd.DataFrame,
+                  include_filters: list = None,
+                  exclude_filters: list = None) -> pd.DataFrame:
+    """
+    Applies include/exclude filters on ANY column of df.
+    Each filter is a tuple: (columnName, [list_of_values]).
+
+    - include_filters => keep rows that match ANY of those (logical OR)
+    - exclude_filters => remove rows that match ANY of those (logical OR)
+
+    Example:
+      include_filters = [
+          ("Dimension", ["MyDimA", "MyDimB"]),
+          ("Attribute", ["Status", "Department"])
+      ]
+      exclude_filters = [
+          ("Value", ["Low", "Undefined"]),
+          ("First", ["TestUser"])
+      ]
+    """
+    # 1) Include Filters => keep any row that matches ANY of them
+    if include_filters:
+        mask_include = pd.Series(False, index=df.index)
+        for (colName, valuesList) in include_filters:
+            part_mask = df[colName].isin(valuesList)
+            mask_include = mask_include | part_mask
+        df = df[mask_include]
+
+    # 2) Exclude Filters => remove any row that matches ANY
+    if exclude_filters:
+        mask_exclude = pd.Series(False, index=df.index)
+        for (colName, valuesList) in exclude_filters:
+            part_mask = df[colName].isin(valuesList)
+            mask_exclude = mask_exclude | part_mask
+        df = df[~mask_exclude]
+
+    return df
+
+
+# -----------------------------------------
+#    ALFA PRE-MELT FILTER
+# -----------------------------------------
+def alfa_pre_melt_filter(df: pd.DataFrame,
+                         include_filters: list = None,
+                         exclude_filters: list = None) -> pd.DataFrame:
+    """
+    Apply any 'pre-melt' filtering logic on the raw Alfa DataFrame.
+    Typically filter based on certain columns that exist BEFORE melting.
+    For instance:
+      - Only keep rows where a particular column has certain values
+      - Exclude rows where a different column has certain values
+    """
+    if not df.empty:
+        df = apply_filters(df, include_filters, exclude_filters)
+    return df
+
+
+# -----------------------------------------
+#    ALFA POST-MELT FILTER
+# -----------------------------------------
+def alfa_post_melt_filter(df: pd.DataFrame,
+                          include_filters: list = None,
+                          exclude_filters: list = None) -> pd.DataFrame:
+    """
+    Apply 'post-melt' filtering on the melted Alfa DataFrame (has columns
+    [Dimension, First, Attribute, Value], plus a Key if you create it).
+    """
+    if not df.empty:
+        df = apply_filters(df, include_filters, exclude_filters)
+    return df
+
+
+# -----------------------------------------
+#    ALFA TRANSFORM (EXCEL-BASED)
+# -----------------------------------------
+def transform_alfa(
+    file_path: Path,
+    excluded_keys: set,
+    dimension_rename_dict: dict = None,
+    attr_rename_dict: dict = None,
+    pre_melt_includes: list = None,
+    pre_melt_excludes: list = None,
+    post_melt_includes: list = None,
+    post_melt_excludes: list = None,
+    sheet_name: str = "Sheet1",
+    skip_rows: int = 3
+) -> pd.DataFrame:
+    """
+    1) Read the Excel.
+    2)    apply pre-melt filtering on raw columns
+    3) Rename col[2] => "Dimension", col[3] => "First"
+    4) Melt (remaining columns => [Attribute, Value])
+    5)    rename dimension or attribute values
+    6)    apply post-melt filtering
+    7) Build 'Key' and exclude any keys from excluded_keys
+    8) Return final [Key, Dimension, First, Attribute, Value]
+    """
+    if not file_path.is_file():
+        print(f"[Alfa] Excel not found: {file_path}")
+        return pd.DataFrame(columns=["Key", "Dimension", "First", "Attribute", "Value"])
+
+    # ---------- 1) READ EXCEL -----------
+    df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=skip_rows)
+    if df.shape[1] < 4:
+        print("[Alfa] Warning: fewer than 4 columns. Returning empty.")
+        return pd.DataFrame(columns=["Key", "Dimension", "First", "Attribute", "Value"])
+
+    # ---------- 2) PRE-MELT FILTERING -----------
+    df = alfa_pre_melt_filter(df, pre_melt_includes, pre_melt_excludes)
+
+    # rename col[2] => "Dimension", col[3] => "First"
+    df.rename(columns={
+        df.columns[2]: "Dimension",
+        df.columns[3]: "First"
+    }, inplace=True)
+
+    # ---------- 3) MELT -----------
+    id_vars = ["Dimension", "First"]
+    val_vars = [c for c in df.columns if c not in id_vars]
+    df_melt = df.melt(
+        id_vars=id_vars,
+        value_vars=val_vars,
+        var_name="Attribute",
+        value_name="Value"
+    )
+
+    # ---------- 4)    rename dimension/attribute -----------
+    if dimension_rename_dict:
+        df_melt["Dimension"] = df_melt["Dimension"].replace(dimension_rename_dict)
+    if attr_rename_dict:
+        df_melt["Attribute"] = df_melt["Attribute"].replace(attr_rename_dict)
+
+    # ---------- 5) POST-MELT FILTERING -----------
+    df_melt = alfa_post_melt_filter(df_melt, post_melt_includes, post_melt_excludes)
+
+    # ---------- 6) Build Key & Exclude -----------
+    df_melt["Key"] = df_melt.apply(
+        lambda row: f"{row['Dimension']} | {row['First']} | {row['Attribute']} | {row['Value']}",
+        axis=1
+    )
+    df_melt = df_melt[~df_melt["Key"].isin(excluded_keys)]
+
+    df_melt.drop_duplicates(subset=["Key"], inplace=True)
+
+    # Reorder columns
+    df_melt = df_melt[["Key", "Dimension", "First", "Attribute", "Value"]]
+
+    return df_melt
+
+
+# -----------------------------------------
+#    GAMMA POST-MELT FILTER (similar idea)
+# -----------------------------------------
+def gamma_post_melt_filter(df: pd.DataFrame,
+                           include_filters: list = None,
+                           exclude_filters: list = None) -> pd.DataFrame:
+    """
+    Apply 'post-melt' filtering on the melted Gamma DataFrame
+    (has [Dimension, First, Attribute, Value]).
+    """
+    if not df.empty:
+        df = apply_filters(df, include_filters, exclude_filters)
+    return df
+
+
+# -----------------------------------------
+#    GAMMA TRANSFORM (ZIP-BASED)
+# -----------------------------------------
+def compute_dimension_name(filename: str, remove_substring: str = "_ceaster.txt") -> str:
+    """
+    Builds dimension name from .txt filename by removing a substring and underscores.
+    """
+    base = os.path.basename(filename)
+    if remove_substring in base:
+        base = base.replace(remove_substring, "")
+    else:
+        base, _ = os.path.splitext(base)
+    return base.replace("_", " ")
+
+
+def transform_gamma(
+    zip_file_path: Path,
+    excluded_keys: set,
+    dimension_rename_dict: dict = None,
+    attr_rename_dict: dict = None,
+    post_melt_includes: list = None,
+    post_melt_excludes: list = None,
+    delimiter: str = ","
+) -> pd.DataFrame:
+    """
+    1) Read each .txt file in the ZIP => CSV
+    2) The first column => 'First'
+    3) 'Dimension' derived from filename
+    4) Melt => [Attribute, Value]
+    5)    rename dimension/attribute
+    6)    post-melt filter
+    7) Exclude any Key from excluded_keys
+    8) Concatenate all .txt data
+    """
+    if not zip_file_path.is_file():
+        print(f"[Gamma] ZIP not found: {zip_file_path}")
+        return pd.DataFrame(columns=["Key", "Dimension", "First", "Attribute", "Value"])
+
+    df_list = []
+    try:
+        with zipfile.ZipFile(zip_file_path, "r") as z:
+            txt_files = [f for f in z.namelist() if f.endswith(".txt")]
+            if not txt_files:
+                print("[Gamma] No .txt files found in the ZIP.")
+                return pd.DataFrame(columns=["Key", "Dimension", "First", "Attribute", "Value"])
+
+            for txt_file in txt_files:
+                dimension_name = compute_dimension_name(txt_file)
+                with z.open(txt_file) as file_obj:
+                    df_in = pd.read_csv(file_obj, delimiter=delimiter)
+                if df_in.empty:
+                    continue
+
+                # first column => 'First'
+                first_col = df_in.columns[0]
+                df_in["First"] = df_in[first_col]
+
+                # dimension
+                df_in["Dimension"] = dimension_name
+                if dimension_rename_dict:
+                    df_in["Dimension"] = df_in["Dimension"].replace(dimension_rename_dict)
+
+                # melt
+                id_vars = ["Dimension", "First"]
+                val_vars = [c for c in df_in.columns if c not in id_vars]
+                dfa = df_in.melt(
+                    id_vars=id_vars,
+                    value_vars=val_vars,
+                    var_name="Attribute",
+                    value_name="Value"
+                )
+
+                # rename attributes if desired
+                if attr_rename_dict:
+                    dfa["Attribute"] = dfa["Attribute"].replace(attr_rename_dict)
+
+                # post-melt filter
+                dfa = gamma_post_melt_filter(dfa, post_melt_includes, post_melt_excludes)
+
+                # build key
+                dfa["Key"] = dfa.apply(
+                    lambda row: f"{row['Dimension']} | {row['First']} | {row['Attribute']} | {row['Value']}",
+                    axis=1
+                )
+                # exclude from ex_table
+                dfa = dfa[~dfa["Key"].isin(excluded_keys)]
+
+                dfa.drop_duplicates(subset=["Key"], inplace=True)
+
+                dfa = dfa[["Key", "Dimension", "First", "Attribute", "Value"]]
+                df_list.append(dfa)
+
+        if not df_list:
+            return pd.DataFrame(columns=["Key", "Dimension", "First", "Attribute", "Value"])
+
+        df_gamma = pd.concat(df_list, ignore_index=True)
+        df_gamma.drop_duplicates(subset=["Key"], inplace=True)
+        return df_gamma
+
+    except zipfile.BadZipFile:
+        print(f"[Gamma] Invalid ZIP: {zip_file_path}")
+        return pd.DataFrame(columns=["Key", "Dimension", "First", "Attribute", "Value"])
+
+
+# -----------------------------------------
+#          COMPARISON LOGIC
+# -----------------------------------------
+def create_comparison_excel(df_alfa: pd.DataFrame,
+                            df_gamma: pd.DataFrame,
+                            output_path: Path):
+    """
+    Outer join df_alfa & df_gamma on 'Key', color-code each set of columns,
+    add a 'Status' column for presence in Alfa vs. Gamma.
+
+    Final columns:
+     Key,
+     Dimension_Alfa, First_Alfa, Attribute_Alfa, Value_Alfa,
+     Dimension_Gamma, First_Gamma, Attribute_Gamma, Value_Gamma,
+     Status
+    """
+
+    df_merge = pd.merge(
+        df_alfa, df_gamma,
+        on="Key", how="outer",
+        suffixes=("_Alfa", "_Gamma")
+    )
+
+    def get_status(row):
+        in_alfa = pd.notnull(row["Dimension_Alfa"])
+        in_gamma = pd.notnull(row["Dimension_Gamma"])
+        if in_alfa and in_gamma:
+            return "Matching"
+        elif in_alfa:
+            return "Missing in Gamma"
+        else:
+            return "Missing in Alfa"
+
+    df_merge["Status"] = df_merge.apply(get_status, axis=1)
+
+    final_cols = [
+        "Key",
+        "Dimension_Alfa", "First_Alfa", "Attribute_Alfa", "Value_Alfa",
+        "Dimension_Gamma", "First_Gamma", "Attribute_Gamma", "Value_Gamma",
+        "Status"
+    ]
+    df_merge = df_merge[final_cols]
+
+    df_merge.to_excel(output_path, sheet_name="Comparison", index=False)
+
+    # ----- Color the Excel file -----
+    wb = load_workbook(output_path)
+    ws = wb["Comparison"]
+
+    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    fill_blue = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+    fill_red = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+    # Map header => column index
+    header_row = next(ws.iter_rows(min_row=1, max_row=1))
+    headers = {cell.value: cell.column for cell in header_row}
+
+    # color Alfa => green
+    alfa_cols = ["Dimension_Alfa", "First_Alfa", "Attribute_Alfa", "Value_Alfa"]
+    for col in alfa_cols:
+        col_idx = headers.get(col)
+        if col_idx:
+            for row_idx in range(2, ws.max_row + 1):
+                ws.cell(row=row_idx, column=col_idx).fill = fill_green
+
+    # color Gamma => blue
+    gamma_cols = ["Dimension_Gamma", "First_Gamma", "Attribute_Gamma", "Value_Gamma"]
+    for col in gamma_cols:
+        col_idx = headers.get(col)
+        if col_idx:
+            for row_idx in range(2, ws.max_row + 1):
+                ws.cell(row=row_idx, column=col_idx).fill = fill_blue
+
+    # color Status => green if "Matching", else red
+    status_col = headers.get("Status")
+    if status_col:
+        for row_idx in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row_idx, column=status_col)
+            if cell.value == "Matching":
+                cell.fill = fill_green
+            else:
+                cell.fill = fill_red
+
+    wb.save(output_path)
+    print(f"[Comparison] Wrote {output_path}")
+
+
+# -----------------------------------------
+#                 MAIN
+# -----------------------------------------
+def main():
+    """
+    1) Read Exclusion Table => set of keys to exclude
+    2) Transform Alfa (with pre-melt & post-melt filters)
+    3) Transform Gamma (with post-melt filters)
+    4) Create Comparison Excel
+    """
+
+    # 1) Read Exclusion Table
+    ex_path = Path("Ex_Table.xlsx")
+    excluded_keys = read_exclusion_table(ex_path)
+
+    # 2) Transform Alfa:
+    #    Pre-melt example => "Keep only rows where the 2nd column in raw data is X
+    #                        Exclude rows where the 5th column is Y", etc.
+    alfa_pre_includes = [
+        # e.g. ("Column_1", ["SomeValue"])
+    ]
+    alfa_pre_excludes = [
+        # e.g. ("Column_2", ["SomethingToExclude"])
+    ]
+
+    #    Post-melt example => "Remove rows that have Dimension=foo and/or Attribute=bar"
+    alfa_post_includes = [
+        # e.g. ("Dimension", ["WantedDim1", "WantedDim2"])
+    ]
+    alfa_post_excludes = [
+        # e.g. ("Attribute", ["ExcludeThisAttribute"]),
+        #      ("Dimension", ["ExcludeThisDimension"])
+    ]
+
+    alfa_path = Path("ALO.xlsx")
+    df_alfa = transform_alfa(
+        file_path=alfa_path,
+        excluded_keys=excluded_keys,
+        dimension_rename_dict=None,
+        attr_rename_dict=None,
+        pre_melt_includes=alfa_pre_includes,
+        pre_melt_excludes=alfa_pre_excludes,
+        post_melt_includes=alfa_post_includes,
+        post_melt_excludes=alfa_post_excludes,
+        sheet_name="Sheet1",
+        skip_rows=3
+    )
+    print("[Alfa] final rows:", len(df_alfa))
+
+    # 3) Transform Gamma:
+    #    Post-melt filters only in this example
+    gamma_includes = [
+        # e.g. ("Dimension", ["GammaDimensionA"]),
+        #      ("Attribute", ["Dept", "Status"])
+    ]
+    gamma_excludes = [
+        # e.g. ("Value", ["Low"]),
+        #      ("First", ["TestUser"])
+    ]
+
+    gamma_zip_path = Path("zip_file.zip")
+    df_gamma = transform_gamma(
+        zip_file_path=gamma_zip_path,
+        excluded_keys=excluded_keys,
+        dimension_rename_dict=None,
+        attr_rename_dict=None,
+        post_melt_includes=gamma_includes,
+        post_melt_excludes=gamma_excludes,
+        delimiter=","
+    )
+    print("[Gamma] final rows:", len(df_gamma))
+
+    # 4) Create comparison
+    comparison_out = Path("Comparison.xlsx")
+    create_comparison_excel(df_alfa, df_gamma, comparison_out)
+
+
+if __name__ == "__main__":
+    main()

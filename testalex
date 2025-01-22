@@ -29,6 +29,7 @@ def transform_alfa(
     # 1) Read Excel
     df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=skip_rows)
     print(f"[Alfa] Initial rows: {len(df)}")
+    print(f"[Alfa] Initial columns: {df.columns.tolist()}")
     if df.shape[1] < 4:
         print("[Alfa] Warning: fewer than 4 columns. Returning empty.")
         return pd.DataFrame(columns=["Key", "Dimension", "NameID", "Attribute", "Value"])
@@ -37,20 +38,23 @@ def transform_alfa(
     df = filter_pre_melt(df, pre_melt_exclude_rules)
 
     # 3) Rename 'Dimension_Name' to 'Name'
+    # Assuming the third column is 'Dimension_Name'
+    original_dimension_name_col = df.columns[2]
     df.rename(columns={
-        df.columns[2]: "Name",  # Assuming the third column is 'Dimension_Name'
+        original_dimension_name_col: "Name",
         df.columns[3]: "First"  # Rename if necessary; adjust based on actual data
     }, inplace=True)
     print(f"[Alfa] Columns after renaming: {df.columns.tolist()}")  # **Debug**
 
     # 4) Melt DataFrame to include 'Name' as an attribute
-    # Assuming 'Dimension' is another column in the DataFrame
+    # Ensure 'Dimension' is present
     if 'Dimension' not in df.columns:
         print("[Alfa] Warning: 'Dimension' column not found.")
         # Handle accordingly, e.g., assign a default value or skip processing
-        df['Dimension'] = pd.NA  # Assign NaN if 'Dimension' is missing
+        # For this example, we'll skip processing
+        return pd.DataFrame(columns=["Key", "Dimension", "NameID", "Attribute", "Value"])
 
-    id_vars = ["Dimension"]  # Columns to keep fixed during melt
+    id_vars = ['Dimension']  # Columns to keep fixed during melt
     # Include all columns except 'Dimension' as value_vars, including 'Name'
     val_vars = [c for c in df.columns if c not in id_vars]
     print(f"[Alfa] id_vars: {id_vars}, val_vars: {val_vars}")  # **Debug**
@@ -62,6 +66,7 @@ def transform_alfa(
         value_name="Value"
     )
     print(f"[Alfa] Rows after melt: {len(df_melt)}")  # **Debug**
+    print(f"[Alfa] Sample melted data:\n{df_melt.head()}")  # **Debug**
 
     # 5) Rename dimension/attribute if needed
     if dimension_rename_dict:
@@ -80,10 +85,10 @@ def transform_alfa(
     print(f"[Alfa] Rows after post-melt exclusion: {len(df_melt)}")  # **Debug**
 
     # 7) Assign NameID from 'Name' attribute
-    # Locate rows where Attribute is 'Name' and assign NameID
+    # Find rows where Attribute is 'Name', assign 'NameID'
     name_mask = (df_melt["Attribute"] == "Name")
     df_melt.loc[name_mask, "NameID"] = df_melt.loc[name_mask, "Value"]
-    # Forward fill NameID within each Dimension group to propagate NameID to other attributes
+    # Forward fill NameID based on Dimension
     df_melt["NameID"] = df_melt.groupby("Dimension")["NameID"].ffill()
     print(f"[Alfa] Rows after assigning NameID:\n{df_melt[['Dimension', 'NameID']].drop_duplicates().head()}")  # **Debug**
 
@@ -109,4 +114,5 @@ def transform_alfa(
     # 11) Final DataFrame
     final_df = df_melt[["Key", "Dimension", "NameID", "Attribute", "Value"]]
     print(f"[Alfa] Final rows: {len(final_df)}")  # **Debug**
+    print(f"[Alfa] Final DataFrame sample:\n{final_df.head()}")  # **Debug**
     return final_df

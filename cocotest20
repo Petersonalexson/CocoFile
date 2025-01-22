@@ -20,7 +20,7 @@ def read_exclusion_table(ex_table_path: Path) -> set:
     df_ex = pd.read_excel(ex_table_path, sheet_name="Sheet1")
     if "Key" not in df_ex.columns or "hide exception" not in df_ex.columns:
         print("[Exclusion] Missing 'Key' or 'hide exception' columns. No exclusions.")
-        return set()
+        return set()ad
 
     mask = df_ex["hide exception"].astype(str).str.lower() == "yes"
     excluded_keys = set(df_ex.loc[mask, "Key"].dropna().unique())
@@ -83,7 +83,7 @@ def transform_alfa(
     Steps:
       1) Read Excel
       2) Pre-melt filter (remove rows by certain columns)
-      3) Rename col[2] => Dimension, col[3] => First (adjust if actual data differs)
+      3) Rename col[2] => Dimension, col[3] => First 
       4) Melt => Dimension as ID var only => 'First' becomes an attribute named "Name" (via rename dict).
       5) Rename Dimension/Attribute values
       6) Exclude certain Dimensions/Attributes
@@ -105,7 +105,7 @@ def transform_alfa(
     df = filter_pre_melt(df, pre_melt_exclude_rules)
 
     # 3) Rename columns => col[2]->Dimension, col[3]->First
-    #    Adjust if the actual sheet differs
+
     df.rename(columns={
         df.columns[2]: "Dimension",
         df.columns[3]: "First"

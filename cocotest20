@@ -354,9 +354,6 @@ def create_comparison_excel(
 # 7) MAIN
 # -----------------------------------------
 def main():
-    """
-    Example usage with placeholders. Adjust paths, column names, exclude rules, etc.
-    """
 
     # 1) Read Exclusion Table
     ex_table_path = Path("Ex_Table.xlsx")

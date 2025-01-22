@@ -1,0 +1,175 @@
+def transform_alfa(
+    file_path: Path,
+    excluded_keys: set,
+    sheet_name: str = "Sheet1",
+    skip_rows: int = 3,
+    dimension_rename_dict: dict = None,
+    attr_rename_dict: dict = None,
+    keep_attributes: list = None,
+    ignore_attributes: list = None,
+    include_filters: list = None,
+    exclude_filters: list = None,
+    pre_exclude_filters: list = None  # New parameter for pre-melt exclusion
+) -> pd.DataFrame:
+    """
+    Transforms Excel file (Alfa). 
+    Column C is 'Dimension', Column D is 'NameID'. 
+    The result is a DataFrame with columns: [Key, Dimension, NameID, Attribute, Value].
+
+    Steps:
+      1. Read the Excel file, skipping specified rows.
+      2. Rename columns:
+         - Column C -> 'Dimension'
+         - Column D -> 'NameID'
+      3. Create 'Name' column equal to 'NameID' (for inclusion as an attribute).
+      4. Apply pre-exclude filters based on other attributes (excluding 'Name').
+      5. Melt the DataFrame to include 'Name' as an attribute, excluding 'NameID'.
+      6. Rename dimensions and attributes if renaming dictionaries are provided.
+      7. Keep or ignore certain attributes based on provided lists.
+      8. Apply include/exclude filters based on (Attribute, Value) pairs.
+      9. Build the 'Key' column.
+      10. Exclude rows whose 'Key' is in excluded_keys.
+      11. Drop duplicate rows based on 'Key'.
+      12. Return the final DataFrame with columns: [Key, Dimension, NameID, Attribute, Value].
+    """
+
+    # 1. Read Excel
+    try:
+        df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=skip_rows)
+        print(f"[Alfa] Initial rows: {len(df)}")
+        print(f"[Alfa] Initial columns: {df.columns.tolist()}")
+    except Exception as e:
+        print(f"[Alfa] Error reading Excel file: {e}")
+        return pd.DataFrame(columns=["Key", "Dimension", "NameID", "Attribute", "Value"])
+
+    if df.shape[1] < 4:
+        print("[Alfa] Warning: fewer than 4 columns in the Excel. Returning empty DataFrame.")
+        return pd.DataFrame(columns=["Key", "Dimension", "NameID", "Attribute", "Value"])
+
+    # 2. Rename columns: Column C -> 'Dimension', Column D -> 'NameID'
+    original_dimension_col = df.columns[2]  # Column C (0-based index)
+    original_nameid_col = df.columns[3]     # Column D
+    df.rename(columns={
+        original_dimension_col: "Dimension",
+        original_nameid_col: "NameID"
+    }, inplace=True)
+    print(f"[Alfa] Columns after renaming: {df.columns.tolist()}")  # **Debug**
+
+    # 3. Create 'Name' column equal to 'NameID'
+    df['Name'] = df['NameID']
+    print(f"[Alfa] Added 'Name' column:\n{df[['NameID', 'Name']].head()}")  # **Debug**
+
+    # 4. Apply pre-exclude filters based on other attributes (excluding 'Name')
+    if pre_exclude_filters:
+        # Define a helper function for matching pre-exclude filters
+        def match_pre_exclude(dfa, filters):
+            if not filters:
+                return pd.Series([False] * len(dfa), index=dfa.index)
+            combined_mask = pd.Series([False] * len(dfa), index=dfa.index)
+            for (attr, val_list) in filters:
+                # Exclude 'Name' from pre-exclude considerations
+                if attr.lower() == 'name':
+                    continue
+                sub_mask = (dfa["Attribute"] == attr) & (dfa["Value"].isin(val_list))
+                combined_mask = combined_mask | sub_mask
+            return combined_mask
+
+        # Since pre-exclude is before melting, we need to apply it on the wide DataFrame
+        # Convert pre_exclude_filters into boolean masks to filter rows
+        combined_pre_exclude_mask = pd.Series([False] * len(df), index=df.index)
+        for (attr, val_list) in pre_exclude_filters:
+            if attr.lower() == 'name':
+                continue  # Skip 'Name' attribute
+            if attr not in df.columns:
+                print(f"[Alfa] Warning: Attribute '{attr}' not found in DataFrame columns for pre-exclude.")
+                continue
+            sub_mask = df[attr].isin(val_list)
+            combined_pre_exclude_mask = combined_pre_exclude_mask | sub_mask
+
+        # Apply the pre-exclude mask to filter out rows
+        pre_excluded_rows = df[combined_pre_exclude_mask]
+        excluded_count = len(pre_excluded_rows)
+        df = df[~combined_pre_exclude_mask]
+        print(f"[Alfa] Pre-excluded {excluded_count} rows based on pre_exclude_filters.")  # **Debug**
+
+    # 5. Melt the DataFrame, keeping 'Dimension' and 'NameID' as id_vars
+    id_vars = ['Dimension', 'NameID']
+    val_vars = [col for col in df.columns if col not in id_vars]
+    print(f"[Alfa] id_vars: {id_vars}, val_vars: {val_vars}")  # **Debug**
+
+    # Ensure 'Name' is included as an attribute
+    if 'Name' not in val_vars and 'Name' in df.columns:
+        val_vars.append('Name')
+    print(f"[Alfa] Updated val_vars: {val_vars}")  # **Debug**
+
+    df_melt = df.melt(
+        id_vars=id_vars,
+        value_vars=val_vars,
+        var_name="Attribute",
+        value_name="Value"
+    )
+    print(f"[Alfa] Rows after melt: {len(df_melt)}")  # **Debug**
+    print(f"[Alfa] Sample melted data:\n{df_melt.head()}")  # **Debug**
+
+    # 6. Rename dimensions and attributes if renaming dictionaries are provided
+    if dimension_rename_dict:
+        df_melt["Dimension"] = df_melt["Dimension"].replace(dimension_rename_dict)
+        print(f"[Alfa] Dimensions after renaming: {df_melt['Dimension'].unique()}")  # **Debug**
+    if attr_rename_dict:
+        df_melt["Attribute"] = df_melt["Attribute"].replace(attr_rename_dict)
+        print(f"[Alfa] Attributes after renaming: {df_melt['Attribute'].unique()}")  # **Debug**
+
+    # 7. Keep or ignore certain attributes based on provided lists
+    if keep_attributes is not None:
+        df_melt = df_melt[df_melt["Attribute"].isin(keep_attributes)]
+        print(f"[Alfa] Rows after keeping attributes {keep_attributes}: {len(df_melt)}")  # **Debug**
+    if ignore_attributes is not None:
+        df_melt = df_melt[~df_melt["Attribute"].isin(ignore_attributes)]
+        print(f"[Alfa] Rows after ignoring attributes {ignore_attributes}: {len(df_melt)}")  # **Debug**
+
+    # 8. Apply include/exclude filters based on (Attribute, Value) pairs
+    # Define a helper function for matching filters
+    def match_any_filter(dfa, filters):
+        if not filters:
+            return pd.Series([False] * len(dfa), index=dfa.index)
+        combined_mask = pd.Series([False] * len(dfa), index=dfa.index)
+        for (attr, val_list) in filters:
+            sub_mask = (dfa["Attribute"] == attr) & (dfa["Value"].isin(val_list))
+            combined_mask = combined_mask | sub_mask
+        return combined_mask
+
+    if include_filters:
+        inc_mask = match_any_filter(df_melt, include_filters)
+        df_melt = df_melt[inc_mask]
+        print(f"[Alfa] Rows after include_filters: {len(df_melt)}")  # **Debug**
+
+    if exclude_filters:
+        exc_mask = match_any_filter(df_melt, exclude_filters)
+        df_melt = df_melt[~exc_mask]
+        print(f"[Alfa] Rows after exclude_filters: {len(df_melt)}")  # **Debug**
+
+    # 9. Build the 'Key' column
+    df_melt["Key"] = df_melt.apply(
+        lambda row: f"{row['Dimension']} | {row['NameID']} | {row['Attribute']} | {row['Value']}",
+        axis=1
+    )
+    print(f"[Alfa] Sample Keys:\n{df_melt['Key'].head()}")  # **Debug**
+
+    # 10. Exclude rows with Keys in excluded_keys
+    before_exclusion = len(df_melt)
+    df_melt = df_melt[~df_melt["Key"].isin(excluded_keys)]
+    after_exclusion = len(df_melt)
+    print(f"[Alfa] Excluded {before_exclusion - after_exclusion} rows based on excluded_keys.")  # **Debug**
+
+    # 11. Remove duplicate rows based on 'Key'
+    before_dedup = len(df_melt)
+    df_melt.drop_duplicates(subset=["Key"], inplace=True)
+    after_dedup = len(df_melt)
+    print(f"[Alfa] Removed {before_dedup - after_dedup} duplicate rows.")  # **Debug**
+
+    # 12. Finalize the DataFrame with desired columns
+    final_df = df_melt[["Key", "Dimension", "NameID", "Attribute", "Value"]]
+    print(f"[Alfa] Final rows: {len(final_df)}")  # **Debug**
+    print(f"[Alfa] Final DataFrame sample:\n{final_df.head()}")  # **Debug**
+
+    return final_df

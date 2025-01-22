@@ -12,88 +12,60 @@ def transform_alfa(
 ) -> pd.DataFrame:
     """
     Transforms Excel file (Alfa). 
-    Column C is 'Dimension', Column D is 'NameID'. 
-    The result is a DataFrame with columns: [Key, Dimension, NameID, Attribute, Value].
+    Column C is 'Dimension', Column D is 'First'. 
+    The result is a DataFrame with columns: [Key, Dimension, First, Attribute, Value].
 
     Steps:
-      1. Read the Excel file, skipping specified rows.
-      2. Rename columns:
-         - Column C -> 'Dimension'
-         - Column D -> 'NameID'
-      3. Create 'Name' column equal to 'NameID' (for inclusion as an attribute).
-      4. Melt the DataFrame to include 'Name' as an attribute, excluding 'NameID'.
-      5. Rename dimensions and attributes if renaming dictionaries are provided.
-      6. Keep or ignore certain attributes based on provided lists.
-      7. Apply include/exclude filters based on (Attribute, Value) pairs.
-      8. Build the 'Key' column.
-      9. Exclude rows whose 'Key' is in excluded_keys.
-      10. Drop duplicate rows based on 'Key'.
-      11. Return the final DataFrame with columns: [Key, Dimension, NameID, Attribute, Value].
+      - Reads the Excel, skipping 'skip_rows' so row (skip_rows+1) is a header.
+      - Renames column C -> 'Dimension', column D -> 'First'.
+      - Melts remaining columns into [Attribute, Value].
+      -    renames dimension values (dimension_rename_dict).
+      -    renames attribute names (attr_rename_dict).
+      -    keeps or ignores certain attributes.
+      -    applies include/exclude filters based on (Attribute, Value).
+      - Removes rows whose 'Key' is in excluded_keys.
+      - Drops duplicates by 'Key'.
+      - Returns the final DataFrame.
     """
 
-    # 1. Read Excel
-    try:
-        df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=skip_rows)
-        print(f"[Alfa] Initial rows: {len(df)}")
-        print(f"[Alfa] Initial columns: {df.columns.tolist()}")
-    except Exception as e:
-        print(f"[Alfa] Error reading Excel file: {e}")
-        return pd.DataFrame(columns=["Key", "Dimension", "NameID", "Attribute", "Value"])
-
+    df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=skip_rows)
     if df.shape[1] < 4:
         print("[Alfa] Warning: fewer than 4 columns in the Excel. Returning empty DataFrame.")
-        return pd.DataFrame(columns=["Key", "Dimension", "NameID", "Attribute", "Value"])
+        return pd.DataFrame(columns=["Key", "Dimension", "First", "Attribute", "Value"])
 
-    # 2. Pre-melt exclude (if any pre-melt exclusion rules are provided)
-    if pre_melt_exclude_rules := [rule for rule in [include_filters, exclude_filters] if rule]:
-        df = filter_pre_melt(df, pre_melt_exclude_rules)
-        print(f"[Alfa] Rows after pre-melt exclusion: {len(df)}")
-
-    # 3. Rename columns: Column C -> 'Dimension', Column D -> 'NameID'
-    original_dimension_col = df.columns[2]  # Column C (0-based index)
-    original_nameid_col = df.columns[3]     # Column D
+    # Renaming columns: C -> 'Dimension', D -> 'First'
     df.rename(columns={
-        original_dimension_col: "Dimension",
-        original_nameid_col: "NameID"
+        df.columns[2]: "Dimension",
+        df.columns[3]: "First"
     }, inplace=True)
-    print(f"[Alfa] Columns after renaming: {df.columns.tolist()}")  # **Debug**
 
-    # 4. Create 'Name' column equal to 'NameID'
-    df['Name'] = df['NameID']
-    print(f"[Alfa] Added 'Name' column:\n{df[['NameID', 'Name']].head()}")  # **Debug**
+    # Rename dimension values  
+    if dimension_rename_dict:
+        df["Dimension"] = df["Dimension"].replace(dimension_rename_dict)
 
-    # 5. Melt the DataFrame, keeping 'Dimension' and 'NameID' as id_vars
-    id_vars = ['Dimension', 'NameID']
-    val_vars = [col for col in df.columns if col not in id_vars]
-    print(f"[Alfa] id_vars: {id_vars}, val_vars: {val_vars}")  # **Debug**
+    # Melt columns except 'Dimension' and 'First'
+    id_vars = ["Dimension", "First"]
+    melt_cols = [c for c in df.columns if c not in id_vars]
 
     df_melt = df.melt(
         id_vars=id_vars,
-        value_vars=val_vars,
+        value_vars=melt_cols,
         var_name="Attribute",
         value_name="Value"
     )
-    print(f"[Alfa] Rows after melt: {len(df_melt)}")  # **Debug**
-    print(f"[Alfa] Sample melted data:\n{df_melt.head()}")  # **Debug**
 
-    # 6. Rename dimensions and attributes if renaming dictionaries are provided
-    if dimension_rename_dict:
-        df_melt["Dimension"] = df_melt["Dimension"].replace(dimension_rename_dict)
-        print(f"[Alfa] Dimensions after renaming: {df_melt['Dimension'].unique()}")  # **Debug**
+    # Rename attribute names  
     if attr_rename_dict:
         df_melt["Attribute"] = df_melt["Attribute"].replace(attr_rename_dict)
-        print(f"[Alfa] Attributes after renaming: {df_melt['Attribute'].unique()}")  # **Debug**
 
-    # 7. Keep or ignore certain attributes based on provided lists
+    # Keep or ignore certain attributes
     if keep_attributes is not None:
         df_melt = df_melt[df_melt["Attribute"].isin(keep_attributes)]
-        print(f"[Alfa] Rows after keeping attributes {keep_attributes}: {len(df_melt)}")  # **Debug**
     if ignore_attributes is not None:
         df_melt = df_melt[~df_melt["Attribute"].isin(ignore_attributes)]
-        print(f"[Alfa] Rows after ignoring attributes {ignore_attributes}: {len(df_melt)}")  # **Debug**
 
-    # 8. Apply include/exclude filters based on (Attribute, Value) pairs
-    # Define a helper function for matching filters
+    # Include/Exclude filters
+    # Matches a row if (Attribute == X) & (Value in [list_of_vals])
     def match_any_filter(dfa, filters):
         if not filters:
             return pd.Series([False] * len(dfa), index=dfa.index)
@@ -106,35 +78,24 @@ def transform_alfa(
     if include_filters:
         inc_mask = match_any_filter(df_melt, include_filters)
         df_melt = df_melt[inc_mask]
-        print(f"[Alfa] Rows after include_filters: {len(df_melt)}")  # **Debug**
 
     if exclude_filters:
         exc_mask = match_any_filter(df_melt, exclude_filters)
         df_melt = df_melt[~exc_mask]
-        print(f"[Alfa] Rows after exclude_filters: {len(df_melt)}")  # **Debug**
 
-    # 9. Build the 'Key' column
+    # Create Key
     df_melt["Key"] = df_melt.apply(
-        lambda row: f"{row['Dimension']} | {row['NameID']} | {row['Attribute']} | {row['Value']}",
+        lambda row: f"{row['Dimension']} | {row['First']} | {row['Attribute']} | {row['Value']}",
         axis=1
     )
-    print(f"[Alfa] Sample Keys:\n{df_melt['Key'].head()}")  # **Debug**
 
-    # 10. Exclude rows with Keys in excluded_keys
-    before_exclusion = len(df_melt)
+    # Exclude based on the excluded_keys set
     df_melt = df_melt[~df_melt["Key"].isin(excluded_keys)]
-    after_exclusion = len(df_melt)
-    print(f"[Alfa] Excluded {before_exclusion - after_exclusion} rows based on excluded_keys.")  # **Debug**
 
-    # 11. Remove duplicate rows based on 'Key'
-    before_dedup = len(df_melt)
+    # Reorder columns
+    df_melt = df_melt[["Key", "Dimension", "First", "Attribute", "Value"]]
+
+    # Drop duplicates by Key
     df_melt.drop_duplicates(subset=["Key"], inplace=True)
-    after_dedup = len(df_melt)
-    print(f"[Alfa] Removed {before_dedup - after_dedup} duplicate rows.")  # **Debug**
 
-    # 12. Finalize the DataFrame with desired columns
-    final_df = df_melt[["Key", "Dimension", "NameID", "Attribute", "Value"]]
-    print(f"[Alfa] Final rows: {len(final_df)}")  # **Debug**
-    print(f"[Alfa] Final DataFrame sample:\n{final_df.head()}")  # **Debug**
-
-    return final_df
+    return df_melt

@@ -66,25 +66,27 @@ def read_exclusion_table(ex_table_path: Path) -> set:
 # -----------------------------------------
 def read_exception_table(exception_table_path: Path) -> pd.DataFrame:
     """
-    Reads an Excel file with columns: [Key, Comments_Gamma, Comments_Alfa].
-    Returns a DataFrame with comments for each key.
+    Reads an Excel file with columns: [Key, Comments_1, Comments_2, hide exception].
+    Returns a DataFrame with these columns. Rows where 'hide exception' == 'yes'
+    can be filtered out later in the process.
     """
     try:
         if not exception_table_path.is_file():
             logging.warning(f"[Exception] File not found: {exception_table_path}. No comments added.")
-            return pd.DataFrame(columns=["Key", "Comments_Gamma", "Comments_Alfa"])
+            return pd.DataFrame(columns=["Key", "Comments_1", "Comments_2", "hide exception"])
 
         df_exc = pd.read_excel(exception_table_path, sheet_name="Sheet1")
-        required_columns = {"Key", "Comments_Gamma", "Comments_Alfa"}
+        required_columns = {"Key", "Comments_1", "Comments_2", "hide exception"}
         if not required_columns.issubset(df_exc.columns):
-            logging.warning("[Exception] Missing one or more required columns: 'Key', 'Comments_Gamma', 'Comments_Alfa'. No comments added.")
-            return pd.DataFrame(columns=["Key", "Comments_Gamma", "Comments_Alfa"])
+            missing_cols = required_columns - set(df_exc.columns)
+            logging.warning(f"[Exception] Missing columns {missing_cols}. No comments added.")
+            return pd.DataFrame(columns=list(required_columns))
 
         logging.info(f"[Exception] Loaded comments for {len(df_exc)} keys.")
         return df_exc
     except Exception as e:
         logging.error(f"[Exception] Error reading exception table: {e}")
-        return pd.DataFrame(columns=["Key", "Comments_Gamma", "Comments_Alfa"])
+        return pd.DataFrame(columns=["Key", "Comments_1", "Comments_2", "hide exception"])
 
 # -----------------------------------------
 # 2) PRE-MELT FILTER (Remove Rows by Column)
@@ -131,10 +133,13 @@ def exclude_dimension_attribute(df: pd.DataFrame,
             df = df[~df["Dimension"].isin(bad_dimensions)]
             excluded_dims = initial_count - len(df)
             logging.debug(f"[Post-Melt] Excluded Dimensions {bad_dimensions}: {excluded_dims} rows removed")
+            initial_count = len(df)
+
         if bad_attributes:
             df = df[~df["Attribute"].isin(bad_attributes)]
             excluded_attrs = initial_count - len(df)
             logging.debug(f"[Post-Melt] Excluded Attributes {bad_attributes}: {excluded_attrs} rows removed")
+
         logging.info(f"[Post-Melt] Rows after exclusion: {len(df)}")
         return df
     except Exception as e:
@@ -217,7 +222,6 @@ def transform_alfa(
             lambda row: f"{row['Dimension']} | {row['Attribute']} | {row['Value']}",
             axis=1
         )
-        logging.debug(f"[Alfa] Sample Keys without NameID:\n{df_melt['Key_NoName'].head()}")
 
         # 9) Exclude rows based on Keys
         before_exclusion = len(df_melt)
@@ -225,13 +229,19 @@ def transform_alfa(
         after_exclusion = len(df_melt)
         logging.info(f"[Alfa] Excluded {before_exclusion - after_exclusion} rows based on excluded_keys.")
 
-        # 10) Remove duplicates if necessary
+        # 10) Create a 'Key' column (Dimension | NameID | Attribute | Value)
+        df_melt["Key"] = df_melt.apply(
+            lambda row: f"{row['Dimension']} | {row['NameID']} | {row['Attribute']} | {row['Value']}",
+            axis=1
+        )
+
+        # 11) Remove duplicates if necessary
         before_dedup = len(df_melt)
         df_melt.drop_duplicates(subset=["Key", "Key_NoName"], inplace=True)
         after_dedup = len(df_melt)
         logging.info(f"[Alfa] Removed {before_dedup - after_dedup} duplicate rows.")
 
-        # 11) Final DataFrame
+        # 12) Final DataFrame
         final_df = df_melt[["Key_NoName", "Key", "Dimension", "NameID", "Attribute", "Value"]]
         logging.info(f"[Alfa] Final rows: {len(final_df)}")
         return final_df
@@ -291,35 +301,30 @@ def transform_gamma(
                         logging.warning(f"[Gamma] File {txt_file} is empty. Skipping.")
                         continue
 
-                    # 3. Inspect columns
                     logging.debug(f"[Gamma] Columns in {txt_file}: {df_in.columns.tolist()}")
 
-                    # 4. Rename the first column to 'NameID'
+                    # 3. Rename the first column to 'NameID'
                     first_col = df_in.columns[0]
                     df_in.rename(columns={first_col: "NameID"}, inplace=True)
-                    logging.debug(f"[Gamma] Columns after renaming: {df_in.columns.tolist()}")
 
-                    # 5. Handle missing NameID values
+                    # 4. Handle missing NameID values
                     if df_in["NameID"].isnull().any():
                         logging.warning(f"[Gamma] Some NameID values are blank in {txt_file}. Filling with 'Unknown'.")
                         df_in["NameID"] = df_in["NameID"].fillna("Unknown")
 
-                    # 6. Apply Pre-Melt Exclusions
+                    # 5. Apply Pre-Melt Exclusions
                     df_in = filter_pre_melt(df_in, pre_melt_exclude_rules)
                     logging.debug(f"[Gamma] Rows after pre-melt filtering in {txt_file}: {len(df_in)}")
 
-                    # 7. Add Dimension Column
+                    # 6. Add Dimension Column
                     df_in["Dimension"] = dimension_name
 
-                    # 8. Create 'Name' column equal to 'NameID' for inclusion as an attribute
+                    # 7. Create 'Name' column
                     df_in['Name'] = df_in['NameID']
-                    logging.debug(f"[Gamma] Added 'Name' column in {txt_file}:\n{df_in[['NameID', 'Name']].head()}")
 
-                    # 9. Melt Other Columns into Attributes
+                    # 8. Melt Other Columns into Attributes
                     id_vars = ["Dimension", "NameID"]
                     val_vars = [c for c in df_in.columns if c not in id_vars]
-                    logging.debug(f"[Gamma] id_vars: {id_vars}, val_vars: {val_vars}")
-
                     if not val_vars:
                         logging.warning(f"[Gamma] No value_vars to melt for {txt_file}. Skipping.")
                         continue
@@ -330,35 +335,37 @@ def transform_gamma(
                         var_name="Attribute",
                         value_name="Value"
                     )
-                    logging.debug(f"[Gamma] Rows after melt in {txt_file}: {len(df_melt)}")
 
-                    # 10. Rename dimension/attribute if needed
+                    # 9. Rename dimension/attribute if needed
                     if dimension_rename_dict:
                         df_melt["Dimension"] = df_melt["Dimension"].replace(dimension_rename_dict)
-                        logging.debug(f"[Gamma] Dimensions after renaming: {df_melt['Dimension'].unique()}")
                     if attribute_rename_dict:
                         df_melt["Attribute"] = df_melt["Attribute"].replace(attribute_rename_dict)
-                        logging.debug(f"[Gamma] Attributes after renaming: {df_melt['Attribute'].unique()}")
 
-                    # 11. Exclude certain Dimensions or Attributes
+                    # 10. Exclude certain Dimensions or Attributes
                     df_melt = exclude_dimension_attribute(
                         df_melt,
                         bad_dimensions=post_melt_bad_dimensions,
                         bad_attributes=post_melt_bad_attributes
                     )
 
-                    # 12. Build Key without NameID for grouping
+                    # 11. Build Key without NameID
                     df_melt["Key_NoName"] = df_melt.apply(
                         lambda row: f"{row['Dimension']} | {row['Attribute']} | {row['Value']}",
                         axis=1
                     )
-                    logging.debug(f"[Gamma] Sample Keys without NameID:\n{df_melt['Key_NoName'].head()}")
 
-                    # 13. Exclude rows based on Keys
+                    # 12. Exclude rows based on Keys
                     before_exclusion = len(df_melt)
                     df_melt = df_melt[~df_melt["Key_NoName"].isin(excluded_keys)]
                     after_exclusion = len(df_melt)
                     logging.info(f"[Gamma] Excluded {before_exclusion - after_exclusion} rows based on excluded_keys in {txt_file}.")
+
+                    # 13. Create a 'Key' column (Dimension | NameID | Attribute | Value)
+                    df_melt["Key"] = df_melt.apply(
+                        lambda row: f"{row['Dimension']} | {row['NameID']} | {row['Attribute']} | {row['Value']}",
+                        axis=1
+                    )
 
                     # 14. Remove duplicates if necessary
                     before_dedup = len(df_melt)
@@ -384,234 +391,257 @@ def transform_gamma(
             logging.warning("[Gamma] No data collected from ZIP.")
 
         return df_gamma
-    # -----------------------------------------
-    # 6) CREATE MISSING ITEMS EXCEL
-    # -----------------------------------------
-    def create_missing_items_excel(
-        df_alfa: pd.DataFrame,
-        df_gamma: pd.DataFrame,
-        df_exceptions: pd.DataFrame,
-        output_path: Path
-    ):
-        """
-        Identifies all missing items in Alfa and Gamma, includes comments, and compiles them into a single table.
-        The table includes:
-        - Key
-        - Dimension
-        - NameID
-        - Attribute
-        - Value
-        - Comments
-        - Action Item
-        Only includes:
-        - Missing NameID entries within matching dimensions.
-        - Missing other properties only if NameID is present in both datasets.
-        """
+    except Exception as e:
+        logging.error(f"[Gamma] Error during transformation: {e}")
+        return pd.DataFrame(columns=["Key_NoName", "Key", "Dimension", "NameID", "Attribute", "Value"])
+
+# -----------------------------------------
+# 6) CREATE MISSING ITEMS EXCEL
+# -----------------------------------------
+def create_missing_items_excel(
+    df_alfa: pd.DataFrame,
+    df_gamma: pd.DataFrame,
+    df_exceptions: pd.DataFrame,
+    output_path: Path
+):
+    """
+    Identifies all missing items in Alfa and Gamma, merges with exceptions (which
+    have 'Comments_1', 'Comments_2', 'hide exception'), excludes rows where
+    hide exception == 'yes', and compiles them into an Excel report.
+
+    The final output has columns:
+      - Key
+      - Dimension
+      - NameID
+      - Attribute
+      - Value
+      - Comments_1
+      - Comments_2
+      - Action Item
+      - Missing In  (used for color-coding)
+
+    Rows missing in Gamma are colored green for Dimension/NameID/Attribute/Value.
+    Rows missing in Alfa  are colored blue  for Dimension/NameID/Attribute/Value.
+    """
+    try:
+        logging.info("[Missing Items] Identifying matching dimensions between Alfa and Gamma...")
+        # Identify dimensions present in both Alfa and Gamma
+        dimensions_alfa = set(df_alfa['Dimension'].unique())
+        dimensions_gamma = set(df_gamma['Dimension'].unique())
+        matching_dimensions = dimensions_alfa.intersection(dimensions_gamma)
+        logging.info(f"[Missing Items] Matching Dimensions Count: {len(matching_dimensions)}")
+
+        # Filter Alfa and Gamma to only include matching dimensions
+        df_alfa_matching = df_alfa[df_alfa['Dimension'].isin(matching_dimensions)].copy()
+        df_gamma_matching = df_gamma[df_gamma['Dimension'].isin(matching_dimensions)].copy()
+
+        logging.info("[Missing Items] Identifying missing NameIDs and other missing items...")
+        # Group Alfa by Key_NoName and get set of NameIDs
+        alfa_group = df_alfa_matching.groupby("Key_NoName")["NameID"].apply(set).reset_index()
+        alfa_group.rename(columns={"NameID": "NameIDs_Alfa"}, inplace=True)
+
+        # Group Gamma by Key_NoName and get set of NameIDs
+        gamma_group = df_gamma_matching.groupby("Key_NoName")["NameID"].apply(set).reset_index()
+        gamma_group.rename(columns={"NameID": "NameIDs_Gamma"}, inplace=True)
+
+        # Merge Alfa and Gamma groups
+        merged_group = alfa_group.merge(gamma_group, on="Key_NoName", how="inner")
+
+        # Identify missing NameIDs in Gamma
+        merged_group["Missing_In_Gamma"] = merged_group.apply(
+            lambda row: row["NameIDs_Alfa"] - row["NameIDs_Gamma"],
+            axis=1
+        )
+
+        # Identify missing NameIDs in Alfa
+        merged_group["Missing_In_Alfa"] = merged_group.apply(
+            lambda row: row["NameIDs_Gamma"] - row["NameIDs_Alfa"],
+            axis=1
+        )
+
+        # Prepare list for missing items
+        missing_items = []
+
+        for _, row in merged_group.iterrows():
+            key_noname = row["Key_NoName"]
+            missing_in_gamma = row["Missing_In_Gamma"]
+            missing_in_alfa = row["Missing_In_Alfa"]
+
+            # If there are missing NameIDs in Gamma or Alfa, collect them
+            # and skip other property-level differences for that Key_NoName.
+            if missing_in_gamma or missing_in_alfa:
+                # For each missing NameID in Gamma
+                for nameid in missing_in_gamma:
+                    # Find the original details from Alfa
+                    details = df_alfa_matching[
+                        (df_alfa_matching['NameID'] == nameid) &
+                        (df_alfa_matching['Key_NoName'] == key_noname)
+                    ]
+                    if not details.empty:
+                        details = details.iloc[0]
+                        missing_items.append({
+                            "Key": details["Key"],
+                            "Dimension": details["Dimension"],
+                            "NameID": nameid,
+                            "Attribute": details["Attribute"],
+                            "Value": details["Value"],
+                            "Missing In": "Gamma"
+                        })
+
+                # For each missing NameID in Alfa
+                for nameid in missing_in_alfa:
+                    # Find the original details from Gamma
+                    details = df_gamma_matching[
+                        (df_gamma_matching['NameID'] == nameid) &
+                        (df_gamma_matching['Key_NoName'] == key_noname)
+                    ]
+                    if not details.empty:
+                        details = details.iloc[0]
+                        missing_items.append({
+                            "Key": details["Key"],
+                            "Dimension": details["Dimension"],
+                            "NameID": nameid,
+                            "Attribute": details["Attribute"],
+                            "Value": details["Value"],
+                            "Missing In": "Alfa"
+                        })
+
+                # Move to next Key_NoName
+                continue
+
+            # Else, if no NameID is missing, identify other missing items
+            alfa_keys = set(df_alfa_matching[df_alfa_matching['Key_NoName'] == key_noname]['Key'])
+            gamma_keys = set(df_gamma_matching[df_gamma_matching['Key_NoName'] == key_noname]['Key'])
+
+            # Items in Alfa not in Gamma
+            missing_in_gamma_other = alfa_keys - gamma_keys
+            for key in missing_in_gamma_other:
+                details = df_alfa_matching[df_alfa_matching['Key'] == key].iloc[0]
+                missing_items.append({
+                    "Key": details["Key"],
+                    "Dimension": details["Dimension"],
+                    "NameID": details["NameID"],
+                    "Attribute": details["Attribute"],
+                    "Value": details["Value"],
+                    "Missing In": "Gamma"
+                })
+
+            # Items in Gamma not in Alfa
+            missing_in_alfa_other = gamma_keys - alfa_keys
+            for key in missing_in_alfa_other:
+                details = df_gamma_matching[df_gamma_matching['Key'] == key].iloc[0]
+                missing_items.append({
+                    "Key": details["Key"],
+                    "Dimension": details["Dimension"],
+                    "NameID": details["NameID"],
+                    "Attribute": details["Attribute"],
+                    "Value": details["Value"],
+                    "Missing In": "Alfa"
+                })
+
+        df_missing = pd.DataFrame(missing_items)
+        logging.info(f"[Missing Items] Total missing items after processing: {len(df_missing)}")
+
+        if df_missing.empty:
+            logging.info("[Missing Items] No missing items to report.")
+            return
+
+        # Merge with exception comments (Comments_1, Comments_2, hide exception)
+        df_missing = df_missing.merge(
+            df_exceptions,
+            on='Key',
+            how='left'
+        )
+        logging.info(f"[Missing Items] Merged with exception table. Rows: {len(df_missing)}")
+
+        # Exclude rows where 'hide exception' == 'yes'
+        df_missing['hide exception'] = df_missing['hide exception'].astype(str).str.lower().fillna('no')
+        before_hide = len(df_missing)
+        df_missing = df_missing[df_missing['hide exception'] != 'yes']
+        after_hide = len(df_missing)
+        logging.info(f"[Missing Items] Excluded {before_hide - after_hide} rows where 'hide exception' == 'yes'.")
+
+        # Build final DataFrame with both comment columns
+        df_missing['Action Item'] = ''
+        final_columns = [
+            'Key',
+            'Dimension',
+            'NameID',
+            'Attribute',
+            'Value',
+            'Comments_1',
+            'Comments_2',
+            'Action Item',
+            'Missing In'
+        ]
+        df_missing = df_missing.reindex(columns=final_columns)
+
+        logging.info(f"[Missing Items] Final DataFrame with selected columns has {len(df_missing)} rows.")
+
+        # Write to Excel
+        df_missing.to_excel(output_path, sheet_name="Missing_Items", index=False)
+        logging.info(f"[Missing Items] Wrote missing items to {output_path}")
+
+        # --- Apply Color Formatting for Missing Rows ---
         try:
-            logging.info("[Missing Items] Identifying matching dimensions between Alfa and Gamma...")
-            # Identify dimensions present in both Alfa and Gamma
-            dimensions_alfa = set(df_alfa['Dimension'].unique())
-            dimensions_gamma = set(df_gamma['Dimension'].unique())
-            matching_dimensions = dimensions_alfa.intersection(dimensions_gamma)
-            logging.info(f"[Missing Items] Matching Dimensions Count: {len(matching_dimensions)}")
+            wb = load_workbook(output_path)
+            ws = wb["Missing_Items"]
 
-            # Filter Alfa and Gamma to only include matching dimensions
-            df_alfa_matching = df_alfa[df_alfa['Dimension'].isin(matching_dimensions)].copy()
-            df_gamma_matching = df_gamma[df_gamma['Dimension'].isin(matching_dimensions)].copy()
+            # Define font, header fill, and color fills
+            bold_font = Font(bold=True)
+            fill_header = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")  
+            # For row coloring:
+            fill_gamma = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # green
+            fill_alfa  = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")  # blue
 
-            logging.info("[Missing Items] Identifying missing NameIDs and other missing items...")
-            # Group Alfa by Key_NoName and get set of NameIDs
-            alfa_group = df_alfa_matching.groupby("Key_NoName")["NameID"].apply(set).reset_index()
-            alfa_group.rename(columns={"NameID": "NameIDs_Alfa"}, inplace=True)
+            # Identify columns by header name
+            header_row = next(ws.iter_rows(min_row=1, max_row=1))
+            headers = {cell.value: cell.column for cell in header_row}
 
-            # Group Gamma by Key_NoName and get set of NameIDs
-            gamma_group = df_gamma_matching.groupby("Key_NoName")["NameID"].apply(set).reset_index()
-            gamma_group.rename(columns={"NameID": "NameIDs_Gamma"}, inplace=True)
+            # Bold + gray fill on header
+            for cell in header_row:
+                cell.font = bold_font
+                cell.fill = fill_header
 
-            # Merge Alfa and Gamma groups
-            merged_group = alfa_group.merge(gamma_group, on="Key_NoName", how="inner")
-            logging.debug(f"[Missing Items] Merged group sample:\n{merged_group.head()}")
+            # We'll color only Dimension, NameID, Attribute, Value columns
+            col_dimension = headers.get("Dimension")
+            col_nameid    = headers.get("NameID")
+            col_attribute = headers.get("Attribute")
+            col_value     = headers.get("Value")
+            col_missing   = headers.get("Missing In")  # so we can read whether it's Gamma or Alfa
 
-            # Identify missing NameIDs in Gamma
-            merged_group["Missing_In_Gamma"] = merged_group.apply(
-                lambda row: row["NameIDs_Alfa"] - row["NameIDs_Gamma"],
-                axis=1
-            )
+            if not all([col_dimension, col_nameid, col_attribute, col_value, col_missing]):
+                logging.warning("[Missing Items] One or more required columns for coloring are missing in the sheet.")
+            else:
+                # Loop through rows to apply color
+                for row_idx in range(2, ws.max_row + 1):
+                    missing_in_value = ws.cell(row=row_idx, column=col_missing).value
+                    if str(missing_in_value).lower() == "gamma":
+                        fill_color = fill_gamma
+                    elif str(missing_in_value).lower() == "alfa":
+                        fill_color = fill_alfa
+                    else:
+                        # Not coloring if it's not specifically 'Gamma' or 'Alfa'
+                        continue
 
-            # Identify missing NameIDs in Alfa
-            merged_group["Missing_In_Alfa"] = merged_group.apply(
-                lambda row: row["NameIDs_Gamma"] - row["NameIDs_Alfa"],
-                axis=1
-            )
+                    # Color the Dimension/NameID/Attribute/Value cells
+                    ws.cell(row=row_idx, column=col_dimension).fill = fill_color
+                    ws.cell(row=row_idx, column=col_nameid).fill    = fill_color
+                    ws.cell(row=row_idx, column=col_attribute).fill = fill_color
+                    ws.cell(row=row_idx, column=col_value).fill     = fill_color
 
-            # Prepare list for missing items
-            missing_items = []
+            # Freeze the top row
+            ws.freeze_panes = ws["A2"]
 
-            for _, row in merged_group.iterrows():
-                key_noname = row["Key_NoName"]
-                missing_in_gamma = row["Missing_In_Gamma"]
-                missing_in_alfa = row["Missing_In_Alfa"]
-
-                # If there are missing NameIDs in Gamma or Alfa, collect them and skip other missing items in this Key_NoName
-                if missing_in_gamma or missing_in_alfa:
-                    # For each missing NameID in Gamma
-                    for nameid in missing_in_gamma:
-                        # Find the original details from Alfa
-                        details = df_alfa_matching[
-                            (df_alfa_matching['NameID'] == nameid) &
-                            (df_alfa_matching['Key_NoName'] == key_noname)
-                        ]
-                        if not details.empty:
-                            details = details.iloc[0]
-                            missing_items.append({
-                                "Key": details["Key"],
-                                "Dimension": details["Dimension"],
-                                "NameID": nameid,
-                                "Attribute": details["Attribute"],
-                                "Value": details["Value"],
-                                "Missing In": "Gamma"
-                            })
-
-                    # For each missing NameID in Alfa
-                    for nameid in missing_in_alfa:
-                        # Find the original details from Gamma
-                        details = df_gamma_matching[
-                            (df_gamma_matching['NameID'] == nameid) &
-                            (df_gamma_matching['Key_NoName'] == key_noname)
-                        ]
-                        if not details.empty:
-                            details = details.iloc[0]
-                            missing_items.append({
-                                "Key": details["Key"],
-                                "Dimension": details["Dimension"],
-                                "NameID": nameid,
-                                "Attribute": details["Attribute"],
-                                "Value": details["Value"],
-                                "Missing In": "Alfa"
-                            })
-                    # Skip processing other missing items in this Key_NoName since NameID is missing
-                    continue
-
-                # Else, if no NameID is missing, identify other missing items
-                # Compare the full keys (Key_NoName | NameID) to find missing items
-                alfa_keys = set(df_alfa_matching[df_alfa_matching['Key_NoName'] == key_noname]['Key'])
-                gamma_keys = set(df_gamma_matching[df_gamma_matching['Key_NoName'] == key_noname]['Key'])
-
-                # Items in Alfa not in Gamma
-                missing_in_gamma_other = alfa_keys - gamma_keys
-                for key in missing_in_gamma_other:
-                    details = df_alfa_matching[df_alfa_matching['Key'] == key].iloc[0]
-                    missing_items.append({
-                        "Key": details["Key"],
-                        "Dimension": details["Dimension"],
-                        "NameID": details["NameID"],
-                        "Attribute": details["Attribute"],
-                        "Value": details["Value"],
-                        "Missing In": "Gamma"
-                    })
-
-                # Items in Gamma not in Alfa
-                missing_in_alfa_other = gamma_keys - alfa_keys
-                for key in missing_in_alfa_other:
-                    details = df_gamma_matching[df_gamma_matching['Key'] == key].iloc[0]
-                    missing_items.append({
-                        "Key": details["Key"],
-                        "Dimension": details["Dimension"],
-                        "NameID": details["NameID"],
-                        "Attribute": details["Attribute"],
-                        "Value": details["Value"],
-                        "Missing In": "Alfa"
-                    })
-
-            # Create DataFrame from missing items
-            df_missing = pd.DataFrame(missing_items)
-            logging.info(f"[Missing Items] Total missing items after processing: {len(df_missing)}")
-
-            if df_missing.empty:
-                logging.info("[Missing Items] No missing items to report.")
-                return
-
-            # Merge with exception comments
-            df_missing = df_missing.merge(
-                df_exceptions,
-                on='Key',
-                how='left'
-            )
-            logging.info(f"[Missing Items] Merged with exception comments. Rows: {len(df_missing)}")
-
-            # Assign 'Comments' based on where it's missing
-            df_missing['Comments'] = df_missing.apply(
-                lambda row: row['Comments_Gamma'] if row['Missing In'] == 'Gamma' else row['Comments_Alfa'],
-                axis=1
-            )
-
-            # Select relevant columns and add 'Action Item'
-            df_missing = df_missing[['Key', 'Dimension', 'NameID', 'Attribute', 'Value', 'Comments']]
-            df_missing['Action Item'] = ''
-
-            # Reorder columns
-            final_columns = ['Key', 'Dimension', 'NameID', 'Attribute', 'Value', 'Comments', 'Action Item']
-            df_missing = df_missing[final_columns]
-            logging.info(f"[Missing Items] Final DataFrame with selected columns has {len(df_missing)} rows.")
-
-            # Write to Excel
-            df_missing.to_excel(output_path, sheet_name="Missing_Items", index=False)
-            logging.info(f"[Missing Items] Wrote missing items to {output_path}")
-
-            # --- Apply Color Formatting ---
-            try:
-                wb = load_workbook(output_path)
-                ws = wb["Missing_Items"]
-
-                # Define fills
-                fill_header = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")  # Light Gray for header
-                fill_key = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")     # Light Blue for Key column
-
-                # Define font
-                bold_font = Font(bold=True)
-
-                # Map headers to column indices
-                header_row = next(ws.iter_rows(min_row=1, max_row=1))
-                headers = {cell.value: cell.column for cell in header_row}
-
-                # Apply bold font and header fill
-                for cell in header_row:
-                    cell.font = bold_font
-                    cell.fill = fill_header
-
-                # Color 'Key' column
-                key_col = headers.get("Key")
-                if key_col:
-                    for row in ws.iter_rows(min_row=2, min_col=key_col, max_col=key_col, max_row=ws.max_row):
-                        cell = row[0]
-                        cell.fill = fill_key
-
-                # Ensure 'Comments' and 'Action Item' columns have white background
-                comments_col = headers.get("Comments")
-                action_col = headers.get("Action Item")
-                white_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")  # White
-
-                if comments_col:
-                    for row in ws.iter_rows(min_row=2, min_col=comments_col, max_col=comments_col, max_row=ws.max_row):
-                        cell = row[0]
-                        cell.fill = white_fill
-
-                if action_col:
-                    for row in ws.iter_rows(min_row=2, min_col=action_col, max_col=action_col, max_row=ws.max_row):
-                        cell = row[0]
-                        cell.fill = white_fill
-
-                # Freeze the top row
-                ws.freeze_panes = ws["A2"]
-
-                # Save the colored Excel
-                wb.save(output_path)
-                logging.info(f"[Missing Items] Applied color formatting and froze top pane in {output_path}")
-            except Exception as e:
-                logging.error(f"[Missing Items] Error applying color formatting: {e}")
+            # Save the colored Excel
+            wb.save(output_path)
+            logging.info(f"[Missing Items] Applied color formatting and froze top pane in {output_path}")
 
         except Exception as e:
-            logging.error(f"[Missing Items] Error creating missing items Excel: {e}")
+            logging.error(f"[Missing Items] Error applying color formatting: {e}")
+
+    except Exception as e:
+        logging.error(f"[Missing Items] Error creating missing items Excel: {e}")
 
 # -----------------------------------------
 # 7) MAIN
@@ -627,25 +657,22 @@ def main():
         ex_table_path = Path("Ex_Table.xlsx")
         excluded_keys = read_exclusion_table(ex_table_path)
 
-        # 1a) Read Exception Table
-        exception_table_path = Path("Exception_Table.xlsx")  # Ensure this file exists with required columns
+        # 1a) Read Exception Table (includes Key, Comments_1, Comments_2, hide exception)
+        exception_table_path = Path("Exception_Table.xlsx")
         df_exceptions = read_exception_table(exception_table_path)
 
         # 2) ALFA
-        #    Example: remove rows pre-melt if 'ColA'=="X" or 'ColB'=="Y"
         alfa_pre_exclude = [
             ("ColA", ["X"]),
             ("ColB", ["Y"])
         ]
-        #    Remove Dimension="UnwantedDim", Attribute="Debug" post-melt
         alfa_bad_dims = ["UnwantedDim"]
         alfa_bad_attrs = ["Debug"]
-        #    Rename dimension or attribute if needed
         alfa_dim_rename = {
             "DimOld": "DimNew"
         }
         alfa_attr_rename = {
-            "First": "Name"  # Ensures 'Name' is an attribute
+            "First": "Name"
         }
 
         alfa_path = Path("AlfaData.xlsx")
@@ -663,18 +690,16 @@ def main():
         logging.info(f"[Alfa] Final rows: {len(df_alfa)}")
 
         # 3) GAMMA
-        #    Example: remove rows pre-melt if 'RawCol'=="Z"
         gamma_pre_exclude = [
             ("RawCol", ["Z"])
         ]
-        #    Remove dimension="TestDim" or attribute="BadAttr" post-melt
         gamma_bad_dims = ["TestDim"]
         gamma_bad_attrs = ["BadAttr"]
         gamma_dim_rename = {
             "GammaOld": "GammaNew"
         }
         gamma_attr_rename = {
-            "First": "Name"  # Ensures 'Name' is an attribute
+            "First": "Name"
         }
 
         gamma_zip = Path("GammaData.zip")
@@ -686,7 +711,7 @@ def main():
             post_melt_bad_attributes=gamma_bad_attrs,
             dimension_rename_dict=gamma_dim_rename,
             attribute_rename_dict=gamma_attr_rename,
-            delimiter=",", 
+            delimiter=",",
             remove_substring="_ceaster.txt"
         )
         logging.info(f"[Gamma] Final rows: {len(df_gamma)}")

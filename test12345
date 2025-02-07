@@ -1,0 +1,39 @@
+/* ref_names_df = melted[melted["Attribute"] == "Name"][["RecordID", "Value"]].drop_duplicates("RecordID")
+ref_names_df.rename(columns={"Value": "RefName"}, inplace=True)
+melted = melted.merge(ref_names_df, on="RecordID", how="left")
+melted["RefName"] = melted["RefName"].fillna("")
+
+        # --- Apply Color Formatting ---
+        try:
+            wb = load_workbook(output_path)
+            ws = wb["Missing_Items"]
+            header_font = Font(bold=True)
+            fill_header = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+            fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # green for Gamma
+            fill_blue = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")   # blue for Alfa
+
+            # Format header row.
+            header_row = next(ws.iter_rows(min_row=1, max_row=1))
+            headers = {cell.value: cell.column for cell in header_row}
+            for cell in header_row:
+                cell.font = header_font
+                cell.fill = fill_header
+
+            # Get the column number for the last column ("Missing In")
+            if "Missing In" not in headers:
+                logging.warning("[Missing Items] 'Missing In' column not found for coloring.")
+            else:
+                missing_in_col = headers["Missing In"]
+                # Color only the "Missing In" cells.
+                for row_idx in range(2, ws.max_row + 1):
+                    cell_value = str(ws.cell(row=row_idx, column=missing_in_col).value).strip().lower()
+                    if cell_value == "gamma":
+                        ws.cell(row=row_idx, column=missing_in_col).fill = fill_green
+                    elif cell_value == "alfa":
+                        ws.cell(row=row_idx, column=missing_in_col).fill = fill_blue
+
+            ws.freeze_panes = ws["A2"]
+            wb.save(output_path)
+            logging.info("[Missing Items] Applied color formatting to Excel.")
+        except Exception as e:
+            logging.error(f"[Missing Items] Error applying color formatting: {e}") */

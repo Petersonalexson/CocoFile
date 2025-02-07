@@ -1,31 +1,3 @@
-
-"""
-Script to compare Alfa and Gamma source data.
-
-Data is read from:
-  - An Excel file (Alfa) where the third and fourth columns are assumed to be 
-    Dimension and NameID respectively.
-  - A ZIP file (Gamma) containing .txt (CSV) files.
-
-Each record is "melted" so that all attributes appear as rows. In particular,
-a "Name" attribute is forced (set from the NameID) to serve as a reference.
-Data is filtered before melting (pre-exclude) and after melting (bad dims/attrs are dropped)
-using configurable rules.
-
-In the final output (an Excel report), records are grouped by Dimension and NameID.
-If the "Name" row is missing in one source then only that missing "Name" row is reported.
-Otherwise, differences in the other (non-"Name") attributes are reported.
-
-Optionally, an exceptions table (with Key, Comments_1, Comments_2, and hide exception flag)
-is merged so that you can hide or annotate certain rows.
-
-Color formatting is applied:
-  - Blue for rows missing in Alfa.
-  - Green for rows missing in Gamma.
-
-Modify the parameters in the main() function as needed.
-"""
-
 import os
 import zipfile
 import pandas as pd
@@ -80,10 +52,6 @@ def filter_pre_melt(df: pd.DataFrame, exclude_rules: list = None) -> pd.DataFram
 def exclude_dimension_attribute(df: pd.DataFrame, bad_dimensions: list = None, bad_attributes: list = None) -> pd.DataFrame:
     """
     Exclude rows based on bad dimensions or attributes.
-    
-    Parameters:
-      - bad_dimensions: list of dimension names to drop.
-      - bad_attributes: list of attribute names to drop.
     """
     if bad_dimensions:
         initial = len(df)
@@ -114,9 +82,6 @@ def transform_alfa(file_path: Path,
       - The fourth column is NameID.
     A "Name" column is forced (equal to NameID) so that when melting,
     a row with Attribute "Name" is produced.
-    
-    Pre-melt filtering is applied first. After melting, rows with bad dimensions or attributes
-    are dropped. Finally, renaming dictionaries are applied.
     """
     try:
         if not file_path.is_file():
@@ -150,9 +115,10 @@ def transform_alfa(file_path: Path,
         melted = exclude_dimension_attribute(melted, bad_dimensions, bad_attributes)
         
         # Create a grouping key: Dimension | NameID.
-        melted["GroupKey"] = (melted["Dimension"].astype(str).str.strip() +
-                              " | " +
-                              melted["NameID"].astype(str).str.strip())
+        melted["GroupKey"] = (
+            melted["Dimension"].astype(str).str.strip() + " | " +
+            melted["NameID"].astype(str).str.strip()
+        )
         
         # Build a full key string for each row: "Dimension | NameID | Attribute | Value"
         def build_full_key(row):
@@ -184,8 +150,7 @@ def transform_gamma(zip_file_path: Path,
       - The filename (with an optional substring removed) defines the Dimension.
       - The first column is renamed to "NameID" and used to force a "Name" attribute.
       - Pre-melt filtering is applied.
-      - The DataFrame is melted, then filtered for bad dimensions/attributes,
-        and renaming dictionaries are applied.
+      - The DataFrame is melted, then filtered, and renaming dictionaries are applied.
     """
     try:
         if not zip_file_path.is_file():
@@ -229,8 +194,11 @@ def transform_gamma(zip_file_path: Path,
                     df["Name"] = df["NameID"]
                     
                     # Melt the DataFrame.
-                    melted = df.melt(id_vars=["Dimension", "NameID"],
-                                     var_name="Attribute", value_name="Value")
+                    melted = df.melt(
+                        id_vars=["Dimension", "NameID"],
+                        var_name="Attribute",
+                        value_name="Value"
+                    )
                     
                     # Apply renaming if provided.
                     if dimension_rename:
@@ -242,9 +210,10 @@ def transform_gamma(zip_file_path: Path,
                     melted = exclude_dimension_attribute(melted, bad_dimensions, bad_attributes)
                     
                     # Create GroupKey: Dimension | NameID.
-                    melted["GroupKey"] = (melted["Dimension"].astype(str).str.strip() +
-                                          " | " +
-                                          melted["NameID"].astype(str).str.strip())
+                    melted["GroupKey"] = (
+                        melted["Dimension"].astype(str).str.strip() + " | " +
+                        melted["NameID"].astype(str).str.strip()
+                    )
                     
                     # Build the full key.
                     def build_full_key(row):
@@ -278,20 +247,11 @@ def create_missing_items_excel(df_alfa: pd.DataFrame,
     """
     Compares Alfa and Gamma records (grouped by Dimension and NameID) and outputs only keys
     (rows) that are missing in one source.
-    
-    For each group:
-      - If the group is missing entirely in one source, the missing "Name" row from that source is reported.
-      - If both groups exist but one source is missing the "Name" attribute, that missing row is reported
-        (and differences on non-"Name" attributes are ignored).
-      - Otherwise, only differences in non-"Name" attributes are reported.
-    
-    Optionally, the exceptions table (if provided) is merged (to hide rows or add comments).
-    Color formatting is applied in the final Excel (blue for missing in Alfa, green for missing in Gamma).
     """
     try:
         logging.info("[Missing Items] Starting comparison between Alfa and Gamma.")
         
-        # Ensure key columns are strings.
+        # Ensure key columns are strings (but do not force them to lower case).
         for df in [df_alfa, df_gamma]:
             df["Dimension"] = df["Dimension"].fillna("").astype(str)
             df["NameID"] = df["NameID"].fillna("").astype(str)
@@ -396,9 +356,14 @@ def create_missing_items_excel(df_alfa: pd.DataFrame,
         
         # Merge with exceptions table if provided.
         if not df_exceptions.empty:
-            df_missing["Key"] = df_missing["Key"].astype(str).str.strip().str.lower()
-            df_exceptions["Key"] = df_exceptions["Key"].astype(str).str.strip().str.lower()
+            # Only strip; do not lower-case the keys.
+            df_missing["Key"] = df_missing["Key"].astype(str).str.strip()
+            df_exceptions["Key"] = df_exceptions["Key"].astype(str).str.strip()
+            
             df_missing = df_missing.merge(df_exceptions, on="Key", how="left")
+            
+            # If you rely on the 'hide exception' column being recognized in a case-insensitive
+            # way, you can keep `.str.lower()`. Otherwise, remove it.
             df_missing["hide exception"] = df_missing["hide exception"].astype(str).str.lower().fillna("no")
             df_missing = df_missing[df_missing["hide exception"] != "yes"]
         
@@ -418,8 +383,8 @@ def create_missing_items_excel(df_alfa: pd.DataFrame,
             ws = wb["Missing_Items"]
             header_font = Font(bold=True)
             fill_header = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
-            fill_gamma = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # green for Gamma
-            fill_alfa = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")   # blue for Alfa
+            fill_gamma = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # green
+            fill_alfa = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")   # blue
 
             header_row = next(ws.iter_rows(min_row=1, max_row=1))
             headers = {cell.value: cell.column for cell in header_row}
@@ -468,7 +433,8 @@ def read_exception_table(exception_file: Path) -> pd.DataFrame:
         df = pd.read_excel(exception_file, sheet_name="Sheet1")
         required_cols = {"Key", "Comments_1", "Comments_2", "hide exception"}
         if not required_cols.issubset(set(df.columns)):
-            logging.warning(f"[Exception] Missing required columns: {required_cols - set(df.columns)}")
+            missing = required_cols - set(df.columns)
+            logging.warning(f"[Exception] Missing required columns: {missing}")
             return pd.DataFrame()
         logging.info(f"[Exception] Loaded {len(df)} exception rows.")
         return df
@@ -485,45 +451,51 @@ def main() -> None:
         setup_logging(log_file)
         logging.info("Script started.")
         
-        # Exception table (optional)
+        # Example: Read an exception table (optional).
         exception_file = Path("Exception_Table.xlsx")
         df_exceptions = read_exception_table(exception_file)
         
-        # --- ALFA configuration ---
+        # ALFA configuration (sample)
         alfa_file = Path("AlfaData.xlsx")
-        alfa_pre_exclude = [("ColA", ["X"]), ("ColB", ["Y"])]  # Pre-melt filtering rules.
-        alfa_bad_dims = ["UnwantedDim"]        # Rows with these Dimension values will be dropped.
-        alfa_bad_attrs = ["Debug"]               # Rows with these Attribute values will be dropped.
-        alfa_dimension_rename = {"DimOld": "DimNew"}   # Rename dimensions if needed.
-        alfa_attribute_rename = {"First": "Name"}        # Rename attributes if needed.
-        df_alfa = transform_alfa(alfa_file,
-                                  pre_melt_exclude_rules=alfa_pre_exclude,
-                                  bad_dimensions=alfa_bad_dims,
-                                  bad_attributes=alfa_bad_attrs,
-                                  dimension_rename=alfa_dimension_rename,
-                                  attribute_rename=alfa_attribute_rename,
-                                  sheet_name="Sheet1",
-                                  skip_rows=3)
+        alfa_pre_exclude = [("ColA", ["X"]), ("ColB", ["Y"])]  
+        alfa_bad_dims = ["UnwantedDim"]
+        alfa_bad_attrs = ["Debug"]
+        alfa_dimension_rename = {"DimOld": "DimNew"}
+        alfa_attribute_rename = {"First": "Name"}
+        
+        df_alfa = transform_alfa(
+            alfa_file,
+            pre_melt_exclude_rules=alfa_pre_exclude,
+            bad_dimensions=alfa_bad_dims,
+            bad_attributes=alfa_bad_attrs,
+            dimension_rename=alfa_dimension_rename,
+            attribute_rename=alfa_attribute_rename,
+            sheet_name="Sheet1",
+            skip_rows=3
+        )
         logging.info(f"[Alfa] Transformed data contains {len(df_alfa)} rows.")
         
-        # --- GAMMA configuration ---
+        # GAMMA configuration (sample)
         gamma_zip = Path("GammaData.zip")
-        gamma_pre_exclude = [("RawCol", ["Z"])]  # Pre-melt filtering rules.
-        gamma_bad_dims = ["TestDim"]             # Rows with these Dimension values will be dropped.
-        gamma_bad_attrs = ["BadAttr"]              # Rows with these Attribute values will be dropped.
+        gamma_pre_exclude = [("RawCol", ["Z"])]
+        gamma_bad_dims = ["TestDim"]
+        gamma_bad_attrs = ["BadAttr"]
         gamma_dimension_rename = {"GammaOld": "GammaNew"}
         gamma_attribute_rename = {"First": "Name"}
-        df_gamma = transform_gamma(gamma_zip,
-                                   pre_melt_exclude_rules=gamma_pre_exclude,
-                                   bad_dimensions=gamma_bad_dims,
-                                   bad_attributes=gamma_bad_attrs,
-                                   dimension_rename=gamma_dimension_rename,
-                                   attribute_rename=gamma_attribute_rename,
-                                   delimiter=",",
-                                   remove_substring="_ceaster.txt")
+        
+        df_gamma = transform_gamma(
+            gamma_zip,
+            pre_melt_exclude_rules=gamma_pre_exclude,
+            bad_dimensions=gamma_bad_dims,
+            bad_attributes=gamma_bad_attrs,
+            dimension_rename=gamma_dimension_rename,
+            attribute_rename=gamma_attribute_rename,
+            delimiter=",",
+            remove_substring="_ceaster.txt"
+        )
         logging.info(f"[Gamma] Transformed data contains {len(df_gamma)} rows.")
         
-        # --- Create Missing Items Excel Report ---
+        # Create Missing Items Excel Report
         output_file = Path("Missing_Items.xlsx")
         create_missing_items_excel(df_alfa, df_gamma, df_exceptions, output_file)
         

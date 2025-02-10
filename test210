@@ -3,30 +3,32 @@
 ULTRA-MEGA Data Reconciliation Script with customtkinter GUI
 -------------------------------------------------------------
 Features:
-  • Modern light-mode GUI with customtkinter and CTkTabview.
+  • Modern light-mode GUI using customtkinter and CTkTabview.
   • Five tabs:
-       Paths;
-       Exclusions & Renames;
-       Keep/DoNotKeep;
-       Run & Progress;
-       Charts & Analysis.
+       - Paths
+       - Exclusions & Renames
+       - Keep/DoNotKeep
+       - Run & Progress
+       - Charts & Analysis
   • Scrollable frames with vertical and horizontal scrollbars.
-  • Treeviews with a professional font (Arial 16) and centered in their container.
-  • Reconciliation logic with three comparison modes:
-         Option 1 (“All Missing”): Lists all missing values for every attribute.
-         Option 2 (“Missing – Name Special”): 
-             - When both sides have a nonblank Name, if the names differ then only the Name rows are output.
-             - If the names match then differences in the other attributes are output.
-             - If one side’s Name is missing, then only the missing Name (RefName) is output.
-         Option 3 (“Full Comparison”): Generates two Excel sheets – one for differences ("Missing_Items")
-             and one for matching attributes ("Matching_Items").
-  • The Excel output includes columns:
-         Key, Dimension, Name, Attribute, Value, Comments_1, Comments_2, Action Item, Missing In.
-  • Exception table merging: rows with “hide exception” set to "yes" are removed, and Comments are merged.
+  • Treeviews with a professional Arial font (size 16) that are centered.
+  • Three reconciliation modes selectable via radio buttons:
+         Option 1 (“All Missing”): Lists all missing/differing values for every attribute.
+         Option 2 (“Missing – Name Special”):
+             • If both sides have a nonblank Name and they differ, only the Name rows are output.
+             • If names match, then differences for other attributes are output.
+             • If one side’s Name is missing, then only that missing Name (RefName) is output.
+         Option 3 (“Full Comparison”): Generates two Excel sheets –
+             one for differences (“Missing_Items”) and one for matching attributes (“Matching_Items”).
+  • The Excel output includes the columns: Key, Dimension, Name, Attribute, Value,
+     Comments_1, Comments_2, Action Item, Missing In.
+  • Exception table merging: if provided, rows with "hide exception"=="yes" are omitted and
+     Comments_1/Comments_2 are merged.
+  • Excel formatting uses a 12‐point font for a compact output.
   • A multi-step progress bar and log area.
   • Interactive bar charts (Matplotlib with mplcursors).
   
-Customize the defaults and rules as needed.
+Customize defaults and rules as needed.
 """
 
 import customtkinter as ctk
@@ -337,17 +339,17 @@ def create_missing_items_excel(df_alfa: pd.DataFrame,
     
     Parameters:
       comparison_mode:
-         1 = Option 1 (“All Missing”): List all missing values.
-         2 = Option 2 (“Missing – Name Special”): 
-             When both sides have a Name, if names differ output only the Name row;
-             if names match, compare other attributes.
-             If one side’s Name is missing, output only the missing Name (RefName).
-         3 = Option 3 (“Full Comparison”): Generate two Excel sheets – one for differences
-             ("Missing_Items") and one for matching attributes ("Matching_Items").
+         1 = Option 1 (“All Missing”): List all missing/differing values.
+         2 = Option 2 (“Missing – Name Special”):
+             • If both sides have a Name and they differ, output only the Name rows.
+             • If names match, compare other attributes.
+             • If one side’s Name is missing, output only that missing Name.
+         3 = Option 3 (“Full Comparison”): Generate two Excel sheets –
+             one for differences ("Missing_Items") and one for matching attributes ("Matching_Items").
     
     The Excel output includes columns:
          Key, Dimension, Name, Attribute, Value, Comments_1, Comments_2, Action Item, Missing In.
-    Merges an exception table (if provided) to include Comments_1, Comments_2 and to hide rows.
+    Merges an exception table (if provided) to include Comments and to remove rows with "hide exception"=="yes".
     """
     def build_map(df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
         out = {}
@@ -364,14 +366,14 @@ def create_missing_items_excel(df_alfa: pd.DataFrame,
     
     missing_rows = []
     matching_rows = []  # For Option 3
-    
+
     for group_key in all_keys:
         parts = group_key.split(" | ", maxsplit=1)
         dimension = parts[0] if parts else ""
         a_dict = alfa_map.get(group_key)
         g_dict = gamma_map.get(group_key)
-        
-        # Option 1: List all missing/different values for every attribute
+
+        # Option 1: All Missing
         if comparison_mode == 1:
             if a_dict is None and g_dict is not None:
                 for attr, g_val in g_dict.items():
@@ -526,7 +528,7 @@ def create_missing_items_excel(df_alfa: pd.DataFrame,
                         "Value": a_dict.get("Name", "").strip(),
                         "Missing In": "Gamma"
                     })
-        # Option 3: Full Comparison – collect differences and matching values.
+        # Option 3: Full Comparison – differences and matches.
         elif comparison_mode == 3:
             if a_dict is None or g_dict is None:
                 if a_dict is None and g_dict is not None:
@@ -592,14 +594,14 @@ def create_missing_items_excel(df_alfa: pd.DataFrame,
                             "Missing In": ""
                         })
     
-    # Convert missing_rows to DataFrame and add a Key column.
+    # Create a Key for each row.
     df_missing = pd.DataFrame(missing_rows)
     df_missing["Key"] = (df_missing["Dimension"].str.strip() + " | " +
                          df_missing["Name"].str.strip() + " | " +
                          df_missing["Attribute"].str.strip() + " | " +
                          df_missing["Value"].str.strip())
     
-    # Merge exception table if provided to include Comments_1, Comments_2 and hide exceptions.
+    # Merge with exception table (if provided) to bring in Comments and hide rows.
     if not df_exceptions.empty:
         val_cols = {"Key", "Comments_1", "Comments_2", "hide exception"}
         exc = df_exceptions[[col for col in df_exceptions.columns if col in val_cols]].copy()
@@ -608,7 +610,7 @@ def create_missing_items_excel(df_alfa: pd.DataFrame,
         df_missing["hide exception"] = df_missing["hide exception"].fillna("no").str.lower()
         before_len = len(df_missing)
         df_missing = df_missing[df_missing["hide exception"] != "yes"]
-        logging.debug(f"[Missing Items] Excluded {before_len - len(df_missing)} hidden exception rows")
+        logging.debug(f"[Excel] Excluded {before_len - len(df_missing)} rows due to hidden exception.")
     
     if "Action Item" not in df_missing.columns:
         df_missing["Action Item"] = ""
@@ -633,7 +635,7 @@ def create_missing_items_excel(df_alfa: pd.DataFrame,
             df_matching_sheet.to_excel(writer, sheet_name="Matching_Items", index=False)
         df_out = df_missing_sheet
 
-    # Excel formatting (font size 12)
+    # Excel formatting: set header and data fonts to size 12, freeze top row.
     try:
         wb = load_workbook(output_path)
         for sheet in wb.sheetnames:
@@ -766,7 +768,7 @@ class ReconciliationApp(ctk.CTk):
         setup_logging(gui_log_widget=self.log_text)
         logging.info("[GUI] CustomTkinter app started")
         self.df_missing = pd.DataFrame()
-        # Define the comparison_mode_var attribute here (default Option 2)
+        # Define the comparison mode variable (default Option 2)
         self.comparison_mode_var = tk.IntVar(value=2)
         self.populate_defaults()
 

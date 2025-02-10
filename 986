@@ -1,0 +1,682 @@
+
+"""
+Future-proof Script for Transforming Alfa (Excel) and Gamma (ZIP of TXT)
+Data into a Single Missing Items Report.
+
+Key Features:
+  * Uses Python 3.10+ type hints (for clarity & future-proofing).
+  * Explicitly copies DataFrames to avoid SettingWithCopyWarning.
+  * Provides robust logging to both file and console.
+  * Allows flexible encoding for reading text files, preventing UnicodeDecodeErrors.
+  * Maintains the same "melting" logic and final missing-items comparison.
+  * Preserves dimension, attribute, and value columns for consistent outputs.
+  * Merges with an optional exceptions table to hide known/irrelevant discrepancies.
+"""
+
+import logging
+import os
+import zipfile
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional, Union
+
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font
+
+
+# ------------------------------------------------------------------------------
+# 0) SETUP LOGGING
+# ------------------------------------------------------------------------------
+def setup_logging(log_file: Path) -> None:
+    """
+    Sets up both console and file logging at different verbosity levels.
+    
+    :param log_file: Path to the log file to which DEBUG-level logs will be written.
+    """
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+
+    # Console handler (INFO level)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_format = logging.Formatter("%(levelname)s: %(message)s")
+    console_handler.setFormatter(console_format)
+
+    # File handler (DEBUG level)
+    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_format = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    file_handler.setFormatter(file_format)
+
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+
+    logging.debug("Logging system initialized.")
+
+
+# ------------------------------------------------------------------------------
+# 1) PRE-MELT FILTER
+# ------------------------------------------------------------------------------
+def filter_pre_melt(
+    df: pd.DataFrame,
+    exclude_rules: Optional[List[Tuple[str, List[str]]]] = None
+) -> pd.DataFrame:
+    """
+    Excludes rows based on provided (column_name, [bad_values]) rules.
+    Returns a copy to avoid SettingWithCopy issues.
+
+    :param df: Input DataFrame.
+    :param exclude_rules: A list of tuples, e.g. [("SomeColumn", ["BadValue"])].
+    :return: Filtered copy of df.
+    """
+    df = df.copy(deep=True)  # Ensure we avoid any SettingWithCopyWarning
+    if not exclude_rules:
+        return df
+
+    combined_mask = pd.Series(False, index=df.index)
+    for col, bad_values in exclude_rules:
+        if col in df.columns:
+            mask = df[col].isin(bad_values)
+            logging.debug(
+                f"[Pre-Melt] Excluding {mask.sum()} rows from '{col}' with values {bad_values}"
+            )
+            combined_mask |= mask
+        else:
+            logging.warning(f"[Pre-Melt] Column '{col}' not found in DataFrame. Skipping...")
+
+    return df[~combined_mask].copy()
+
+
+# ------------------------------------------------------------------------------
+# 2) POST-MELT FILTER
+# ------------------------------------------------------------------------------
+def exclude_dimension_attribute(
+    df: pd.DataFrame,
+    bad_dimensions: Optional[List[str]] = None,
+    bad_attributes: Optional[List[str]] = None
+) -> pd.DataFrame:
+    """
+    Removes rows whose 'Dimension' or 'Attribute' appears in the "bad" lists.
+    Returns a copy to avoid SettingWithCopy warnings.
+
+    :param df: Input (melted) DataFrame with columns ["Dimension", "Attribute", ...].
+    :param bad_dimensions: Dimension values to exclude entirely.
+    :param bad_attributes: Attribute values to exclude entirely.
+    :return: Filtered DataFrame.
+    """
+    df = df.copy(deep=True)
+    if bad_dimensions:
+        initial = len(df)
+        df = df[~df["Dimension"].isin(bad_dimensions)]
+        logging.debug(f"[Post-Melt] Excluded {initial - len(df)} rows (bad dimensions).")
+
+    if bad_attributes:
+        initial = len(df)
+        df = df[~df["Attribute"].isin(bad_attributes)]
+        logging.debug(f"[Post-Melt] Excluded {initial - len(df)} rows (bad attributes).")
+
+    return df
+
+
+# ------------------------------------------------------------------------------
+# 3) TRANSFORM ALFA (EXCEL)
+# ------------------------------------------------------------------------------
+def transform_alfa(
+    file_path: Path,
+    pre_melt_exclude_rules: Optional[List[Tuple[str, List[str]]]] = None,
+    bad_dimensions: Optional[List[str]] = None,
+    bad_attributes: Optional[List[str]] = None,
+    dimension_rename: Optional[Dict[str, str]] = None,
+    attribute_rename: Optional[Dict[str, str]] = None,
+    sheet_name: str = "Sheet1",
+    skip_rows: int = 3
+) -> pd.DataFrame:
+    """
+    Reads and transforms Alfa Excel data.
+    - Expects headers on row 4 (skip_rows=3).
+    - Uses 'Dimension_Name' or 3rd column for 'Dimension'.
+    - Uses 'Name' or 4th column if 'Name' not found.
+    - Melts all columns except 'Dimension' & 'RecordID' into attribute-value pairs.
+    - Extracts 'Name' rows as the "RefName" for grouping.
+    - Returns the final melted DataFrame with added 'GroupKey' and 'Key'.
+
+    :param file_path: Path to the Excel file.
+    :param pre_melt_exclude_rules: List of (column, [values]) to filter out pre-melt.
+    :param bad_dimensions: Dimensions to exclude post-melt.
+    :param bad_attributes: Attributes to exclude post-melt.
+    :param dimension_rename: Mapping to rename dimension values.
+    :param attribute_rename: Mapping to rename attribute values.
+    :param sheet_name: Excel sheet name.
+    :param skip_rows: Rows to skip at the top (default=3) so row 4 is the header.
+    :return: Final melted DataFrame.
+    """
+    if not file_path.is_file():
+        logging.error(f"[Alfa] File not found: {file_path}")
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=skip_rows)
+        df = df.copy(deep=True)  # Isolate from any future SettingWithCopy
+        logging.info(f"[Alfa] Loaded {len(df)} rows from Excel: {file_path.name}")
+
+        # 1) Determine the Dimension column
+        if "Dimension_Name" in df.columns:
+            df.rename(columns={"Dimension_Name": "Dimension"}, inplace=True)
+            logging.debug("[Alfa] 'Dimension_Name' -> 'Dimension'.")
+        else:
+            third_col = df.columns[2]
+            df.rename(columns={third_col: "Dimension"}, inplace=True)
+            logging.debug(f"[Alfa] 3rd column '{third_col}' -> 'Dimension'.")
+
+        # 2) Ensure 'Name' column
+        if "Name" not in df.columns:
+            fourth_col = df.columns[3]
+            df.rename(columns={fourth_col: "Name"}, inplace=True)
+            logging.debug(f"[Alfa] 4th column '{fourth_col}' -> 'Name'.")
+
+        # 3) Add RecordID from index
+        df["RecordID"] = df.index.astype(str)
+
+        # 4) Apply pre-melt filtering
+        df = filter_pre_melt(df, pre_melt_exclude_rules)
+
+        # 5) Melt all columns except 'Dimension' + 'RecordID'
+        id_vars = ["Dimension", "RecordID"]
+        value_vars = [c for c in df.columns if c not in id_vars]
+        melted = df.melt(id_vars=id_vars, value_vars=value_vars,
+                         var_name="Attribute", value_name="Value")
+        logging.debug(f"[Alfa] Melted into {len(melted)} rows.")
+
+        # 6) Rename dimension/attribute values
+        if dimension_rename:
+            melted["Dimension"] = melted["Dimension"].replace(dimension_rename)
+        if attribute_rename:
+            melted["Attribute"] = melted["Attribute"].replace(attribute_rename)
+
+        # 7) Exclude bad dimension/attribute rows
+        melted = exclude_dimension_attribute(melted, bad_dimensions, bad_attributes)
+
+        # 8) Extract RefName from where Attribute == 'Name'
+        ref_df = melted[melted["Attribute"] == "Name"][["RecordID", "Value"]].drop_duplicates("RecordID")
+        ref_df.rename(columns={"Value": "RefName"}, inplace=True)
+        melted = melted.merge(ref_df, on="RecordID", how="left")
+        melted["RefName"] = melted["RefName"].fillna("").astype(str)
+
+        # 9) Create GroupKey
+        melted["GroupKey"] = melted["Dimension"].astype(str).str.strip() + " | " + melted["RefName"].str.strip()
+
+        # 10) Build Key
+        melted["Key"] = melted.apply(
+            lambda row: f"{row['Dimension'].strip()} | {row['RefName'].strip()} | "
+                        f"{row['Attribute'].strip()} | {str(row['Value']).strip()}",
+            axis=1
+        )
+
+        melted.drop_duplicates(inplace=True)
+        logging.info(f"[Alfa] Final transformed rows: {len(melted)}")
+        return melted
+
+    except Exception as e:
+        logging.exception(f"[Alfa] Error processing {file_path}: {e}")
+        return pd.DataFrame()
+
+
+# ------------------------------------------------------------------------------
+# 4) TRANSFORM GAMMA (ZIP WITH .TXT FILES)
+# ------------------------------------------------------------------------------
+def transform_gamma(
+    zip_file_path: Path,
+    pre_melt_exclude_rules: Optional[List[Tuple[str, List[str]]]] = None,
+    bad_dimensions: Optional[List[str]] = None,
+    bad_attributes: Optional[List[str]] = None,
+    dimension_rename: Optional[Dict[str, str]] = None,
+    attribute_rename: Optional[Dict[str, str]] = None,
+    delimiter: str = ",",
+    remove_substring: str = "_ceaster.txt",
+    encoding: str = "latin-1"
+) -> pd.DataFrame:
+    """
+    Reads and transforms Gamma data from a ZIP containing .txt files (CSV-like).
+
+    Steps:
+      1) Each .txt file in the ZIP is read into a DataFrame via pandas.
+      2) The file name (minus remove_substring) becomes 'Dimension'.
+      3) First column is renamed 'Name'.
+      4) DataFrame is melted (all columns except 'Dimension'/'RecordID' => attribute/value pairs).
+      5) 'Name' rows become 'RefName'; final DataFrame includes 'GroupKey' and 'Key'.
+
+    :param zip_file_path: Path to the ZIP file.
+    :param pre_melt_exclude_rules: Filtering rules prior to melting.
+    :param bad_dimensions: Dimensions to exclude post-melt.
+    :param bad_attributes: Attributes to exclude post-melt.
+    :param dimension_rename: Mapping for dimension value rename.
+    :param attribute_rename: Mapping for attribute rename.
+    :param delimiter: CSV delimiter for .txt files.
+    :param remove_substring: Substring to remove from file name to form dimension.
+    :param encoding: File encoding (default='latin-1') to avoid decode errors.
+    :return: Combined melted DataFrame from all .txt files in the ZIP.
+    """
+    if not zip_file_path.is_file():
+        logging.error(f"[Gamma] ZIP file not found: {zip_file_path}")
+        return pd.DataFrame()
+
+    all_dfs: List[pd.DataFrame] = []
+    try:
+        with zipfile.ZipFile(zip_file_path, "r") as z:
+            txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+            if not txt_files:
+                logging.warning("[Gamma] No .txt files found in the ZIP.")
+                return pd.DataFrame()
+
+            for txt_file in txt_files:
+                try:
+                    base = os.path.basename(txt_file)
+                    if remove_substring in base:
+                        base = base.replace(remove_substring, "")
+                    else:
+                        base, _ = os.path.splitext(base)
+                    dimension = base.replace("_", " ").strip()
+
+                    with z.open(txt_file) as fo:
+                        # Force an encoding to avoid UnicodeDecodeError
+                        df = pd.read_csv(fo, delimiter=delimiter, encoding=encoding)
+                        df = df.copy(deep=True)
+
+                    if df.empty:
+                        logging.warning(f"[Gamma] File '{txt_file}' is empty. Skipping.")
+                        continue
+
+                    # First column -> "Name"
+                    first_col = df.columns[0]
+                    df.rename(columns={first_col: "Name"}, inplace=True)
+                    df["Name"] = df["Name"].fillna("Unknown").astype(str)
+
+                    # Pre-melt filter
+                    df = filter_pre_melt(df, pre_melt_exclude_rules)
+
+                    # Dimension & RecordID
+                    df["Dimension"] = dimension
+                    df["RecordID"] = df.index.astype(str)
+
+                    # Melt
+                    id_vars = ["Dimension", "RecordID"]
+                    value_vars = [c for c in df.columns if c not in id_vars]
+                    melted = df.melt(id_vars=id_vars, value_vars=value_vars,
+                                     var_name="Attribute", value_name="Value")
+
+                    # Rename dimension/attribute
+                    if dimension_rename:
+                        melted["Dimension"] = melted["Dimension"].replace(dimension_rename)
+                    if attribute_rename:
+                        melted["Attribute"] = melted["Attribute"].replace(attribute_rename)
+
+                    # Exclude bad dimension/attribute
+                    melted = exclude_dimension_attribute(melted, bad_dimensions, bad_attributes)
+
+                    # Extract RefName
+                    ref_df = melted[melted["Attribute"] == "Name"][["RecordID", "Value"]].drop_duplicates("RecordID")
+                    ref_df.rename(columns={"Value": "RefName"}, inplace=True)
+                    melted = melted.merge(ref_df, on="RecordID", how="left")
+                    melted["RefName"] = melted["RefName"].fillna("").astype(str)
+
+                    # GroupKey & Key
+                    melted["GroupKey"] = melted["Dimension"].astype(str).str.strip() \
+                                         + " | " + melted["RefName"].astype(str).str.strip()
+
+                    melted["Key"] = melted.apply(
+                        lambda row: f"{row['Dimension'].strip()} | {row['RefName'].strip()} | "
+                                    f"{row['Attribute'].strip()} | {str(row['Value']).strip()}",
+                        axis=1
+                    )
+
+                    melted.drop_duplicates(inplace=True)
+                    logging.info(f"[Gamma] '{txt_file}' => {len(melted)} rows.")
+                    all_dfs.append(melted.copy(deep=True))
+
+                except Exception as inner_e:
+                    logging.error(f"[Gamma] Error in file '{txt_file}': {inner_e}")
+                    continue
+
+        if all_dfs:
+            df_gamma = pd.concat(all_dfs, ignore_index=True)
+            logging.info(f"[Gamma] Combined => {len(df_gamma)} rows total.")
+            return df_gamma
+        else:
+            logging.warning("[Gamma] No valid data found in the ZIP.")
+            return pd.DataFrame()
+
+    except Exception as e:
+        logging.exception(f"[Gamma] Error reading ZIP '{zip_file_path}': {e}")
+        return pd.DataFrame()
+
+
+# ------------------------------------------------------------------------------
+# 5) CREATE MISSING ITEMS EXCEL
+# ------------------------------------------------------------------------------
+def create_missing_items_excel(
+    df_alfa: pd.DataFrame,
+    df_gamma: pd.DataFrame,
+    df_exceptions: pd.DataFrame,
+    output_path: Path
+) -> None:
+    """
+    Compares data from Alfa and Gamma, grouped by "Dimension | RefName", to identify:
+      - Missing records entirely.
+      - Missing or differing attributes.
+      - Optionally merges with an exceptions table to hide known differences.
+
+    The final output is written to Excel with color-coded rows based on "Missing In" field.
+
+    :param df_alfa: Melted DataFrame from Alfa.
+    :param df_gamma: Melted DataFrame from Gamma.
+    :param df_exceptions: Exceptions DataFrame (Key, Comments_1, Comments_2, hide exception).
+    :param output_path: Path to write the resulting Excel file.
+    """
+
+    def build_attr_dict(df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+        """
+        Group by 'GroupKey' => {attribute: value}, storing only the first occurrence per attribute.
+        """
+        attr_map: Dict[str, Dict[str, str]] = {}
+        for gk, sub_df in df.groupby("GroupKey"):
+            sub_dict: Dict[str, str] = {}
+            for attr, sub_sub_df in sub_df.groupby("Attribute"):
+                # Only take the first occurrence for each attribute
+                sub_dict[attr] = str(sub_sub_df["Value"].iloc[0])
+            attr_map[gk] = sub_dict
+        return attr_map
+
+    if "GroupKey" not in df_alfa.columns or "GroupKey" not in df_gamma.columns:
+        logging.error("Missing 'GroupKey' column in Alfa or Gamma data.")
+        return
+
+    # Build dictionaries for fast lookups
+    alfa_map = build_attr_dict(df_alfa)
+    gamma_map = build_attr_dict(df_gamma)
+    all_keys = set(alfa_map.keys()).union(set(gamma_map.keys()))
+
+    missing_items = []
+    for group_key in all_keys:
+        a_dict = alfa_map.get(group_key)
+        g_dict = gamma_map.get(group_key)
+
+        # Parse dimension and ref_name from GroupKey
+        parts = group_key.split(" | ", maxsplit=1)
+        dimension = parts[0] if len(parts) > 0 else ""
+        ref_name = parts[1] if len(parts) > 1 else ""
+
+        # Entirely missing on one side?
+        if a_dict is None and g_dict is not None:
+            # Show missing name row
+            if "Name" in g_dict:
+                missing_items.append({
+                    "Dimension": dimension,
+                    "Name": g_dict["Name"],
+                    "Attribute": "Name",
+                    "Value": g_dict["Name"],
+                    "Missing In": "Alfa"
+                })
+            continue
+        if g_dict is None and a_dict is not None:
+            # Show missing name row
+            if "Name" in a_dict:
+                missing_items.append({
+                    "Dimension": dimension,
+                    "Name": a_dict["Name"],
+                    "Attribute": "Name",
+                    "Value": a_dict["Name"],
+                    "Missing In": "Gamma"
+                })
+            continue
+
+        if a_dict and g_dict:
+            # If 'Name' is missing in one side, show that
+            has_name_a = "Name" in a_dict
+            has_name_g = "Name" in g_dict
+            if not has_name_a and has_name_g:
+                missing_items.append({
+                    "Dimension": dimension,
+                    "Name": g_dict["Name"],
+                    "Attribute": "Name",
+                    "Value": g_dict["Name"],
+                    "Missing In": "Alfa"
+                })
+                continue
+            if not has_name_g and has_name_a:
+                missing_items.append({
+                    "Dimension": dimension,
+                    "Name": a_dict["Name"],
+                    "Attribute": "Name",
+                    "Value": a_dict["Name"],
+                    "Missing In": "Gamma"
+                })
+                continue
+
+            # Both have 'Name'; compare all attributes except 'Name'
+            all_attrs = set(a_dict.keys()).union(set(g_dict.keys()))
+            if "Name" in all_attrs:
+                all_attrs.remove("Name")
+
+            for attr in all_attrs:
+                a_val = a_dict.get(attr)
+                g_val = g_dict.get(attr)
+                if a_val is None and g_val is not None:
+                    missing_items.append({
+                        "Dimension": dimension,
+                        "Name": g_dict["Name"],  # or a_dict["Name"] if you prefer
+                        "Attribute": attr,
+                        "Value": g_val,
+                        "Missing In": "Alfa"
+                    })
+                elif g_val is None and a_val is not None:
+                    missing_items.append({
+                        "Dimension": dimension,
+                        "Name": a_dict["Name"],
+                        "Attribute": attr,
+                        "Value": a_val,
+                        "Missing In": "Gamma"
+                    })
+                elif a_val != g_val:
+                    # Value differs -> 2 rows
+                    missing_items.append({
+                        "Dimension": dimension,
+                        "Name": a_dict["Name"],
+                        "Attribute": attr,
+                        "Value": a_val,
+                        "Missing In": "Gamma"
+                    })
+                    missing_items.append({
+                        "Dimension": dimension,
+                        "Name": a_dict["Name"],
+                        "Attribute": attr,
+                        "Value": g_val,
+                        "Missing In": "Alfa"
+                    })
+
+    df_missing = pd.DataFrame(missing_items)
+    logging.info(f"[Missing Items] Found {len(df_missing)} missing/differing entries.")
+
+    if df_missing.empty:
+        logging.info("[Missing Items] Nothing to report; writing empty file.")
+        # Write an empty template if you prefer
+        df_template = pd.DataFrame(columns=[
+            "Key", "Dimension", "Name", "Attribute", "Value",
+            "Comments_1", "Comments_2", "Action Item", "Missing In"
+        ])
+        df_template.to_excel(output_path, sheet_name="Missing_Items", index=False)
+        return
+
+    # Fill NA
+    for col in ("Dimension", "Name", "Attribute", "Value"):
+        df_missing[col] = df_missing[col].fillna("")
+
+    # Build Key: "Dimension | Name | Attribute | Value"
+    df_missing["Key"] = (
+        df_missing["Dimension"].astype(str).str.strip() + " | "
+        + df_missing["Name"].astype(str).str.strip() + " | "
+        + df_missing["Attribute"].astype(str).str.strip() + " | "
+        + df_missing["Value"].astype(str).str.strip()
+    )
+
+    # Merge with exceptions if any
+    if not df_exceptions.empty:
+        # Only take columns we expect from exceptions
+        expected_exc_cols = {"Key", "Comments_1", "Comments_2", "hide exception"}
+        exc_cols = [c for c in df_exceptions.columns if c in expected_exc_cols]
+        df_exceptions = df_exceptions[exc_cols].copy()
+        df_exceptions["Key"] = df_exceptions["Key"].astype(str).str.strip()
+
+        df_missing = pd.merge(df_missing, df_exceptions, on="Key", how="left", suffixes=("", "_exc"))
+        df_missing["hide exception"] = df_missing["hide exception"].fillna("no").str.lower()
+        df_missing = df_missing[df_missing["hide exception"] != "yes"]
+        logging.debug("[Missing Items] Merged with exceptions table and removed hidden items.")
+
+    # Add an Action Item column
+    df_missing["Action Item"] = ""
+
+    # Reorder columns: Key first
+    final_cols = [
+        "Key", "Dimension", "Name", "Attribute", "Value",
+        "Comments_1", "Comments_2", "Action Item", "Missing In"
+    ]
+    df_missing = df_missing.reindex(columns=final_cols)
+
+    df_missing.to_excel(output_path, sheet_name="Missing_Items", index=False)
+    logging.info(f"[Missing Items] Wrote {len(df_missing)} rows to {output_path}")
+
+    # --- Color formatting ---
+    try:
+        wb = load_workbook(output_path)
+        ws = wb["Missing_Items"]
+
+        header_font = Font(bold=True)
+        fill_header = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+        fill_gamma = PatternFill(start_color="D5E8D4", end_color="D5E8D4", fill_type="solid")  # Pastel green
+        fill_alfa = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")   # Pastel blue
+
+        # Format header row
+        header_row = next(ws.iter_rows(min_row=1, max_row=1))
+        headers = {cell.value: cell.column for cell in header_row}
+        for cell in header_row:
+            cell.font = header_font
+            cell.fill = fill_header
+
+        # Color entire row based on 'Missing In'
+        missing_in_col = headers.get("Missing In")
+        if missing_in_col is None:
+            logging.warning("[Missing Items] 'Missing In' column not found for coloring.")
+        else:
+            max_col = ws.max_column
+            for row_idx in range(2, ws.max_row + 1):
+                val = str(ws.cell(row=row_idx, column=missing_in_col).value).strip().lower()
+                if val == "gamma":
+                    fill_color = fill_gamma
+                elif val == "alfa":
+                    fill_color = fill_alfa
+                else:
+                    fill_color = None
+
+                if fill_color is not None:
+                    for col_idx in range(1, max_col + 1):
+                        ws.cell(row=row_idx, column=col_idx).fill = fill_color
+
+        ws.freeze_panes = ws["A2"]
+        wb.save(output_path)
+        logging.info("[Missing Items] Excel row coloring applied successfully.")
+    except Exception as e:
+        logging.exception(f"[Missing Items] Error applying color formatting: {e}")
+
+
+# ------------------------------------------------------------------------------
+# 6) READ EXCEPTION TABLE
+# ------------------------------------------------------------------------------
+def read_exception_table(exception_file: Path) -> pd.DataFrame:
+    """
+    Reads an Excel file containing exceptions.
+    Expected columns: Key, Comments_1, Comments_2, hide exception.
+
+    :param exception_file: Path to the exceptions Excel file.
+    :return: DataFrame with the exceptions or empty if not found / invalid.
+    """
+    if not exception_file.is_file():
+        logging.warning(f"[Exception] File '{exception_file}' not found.")
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_excel(exception_file, sheet_name="Sheet1")
+        return df.copy(deep=True)
+    except Exception as e:
+        logging.exception(f"[Exception] Error reading '{exception_file}': {e}")
+        return pd.DataFrame()
+
+
+# ------------------------------------------------------------------------------
+# 7) MAIN FUNCTION
+# ------------------------------------------------------------------------------
+def main() -> None:
+    """
+    Main entry point for the script.
+    1) Sets up logging.
+    2) Reads optional exceptions file.
+    3) Transforms ALFA (Excel).
+    4) Transforms GAMMA (ZIP).
+    5) Generates Missing Items report in Excel.
+    """
+    log_file = Path("script.log")
+    setup_logging(log_file)
+    logging.info("Script started (ultra-futuristic version).")
+
+    # --- Read exceptions (optional) ---
+    exception_file = Path("Exception_Table.xlsx")
+    df_exceptions = read_exception_table(exception_file)
+
+    # --- ALFA configuration ---
+    alfa_file = Path("AlfaData.xlsx")
+    alfa_pre_exclude = [("SomeColumn", ["BadValue"])]
+    alfa_bad_dims = ["UnwantedDim"]
+    alfa_bad_attrs = ["Debug"]
+    alfa_dim_rename = {"DimOld": "DimNew"}
+    alfa_attr_rename = {"First": "Name"}
+
+    df_alfa = transform_alfa(
+        file_path=alfa_file,
+        pre_melt_exclude_rules=alfa_pre_exclude,
+        bad_dimensions=alfa_bad_dims,
+        bad_attributes=alfa_bad_attrs,
+        dimension_rename=alfa_dim_rename,
+        attribute_rename=alfa_attr_rename,
+        sheet_name="Sheet1",
+        skip_rows=3
+    )
+    logging.info(f"[Alfa] Final row count: {len(df_alfa)}")
+
+    # --- GAMMA configuration ---
+    gamma_zip = Path("GammaData.zip")
+    gamma_pre_exclude = [("SomeColumn", ["BadValue"])]
+    gamma_bad_dims = ["TestDim"]
+    gamma_bad_attrs = ["BadAttr"]
+    gamma_dim_rename = {"GammaOld": "GammaNew"}
+    gamma_attr_rename = {"First": "Name"}
+
+    df_gamma = transform_gamma(
+        zip_file_path=gamma_zip,
+        pre_melt_exclude_rules=gamma_pre_exclude,
+        bad_dimensions=gamma_bad_dims,
+        bad_attributes=gamma_bad_attrs,
+        dimension_rename=gamma_dim_rename,
+        attribute_rename=gamma_attr_rename,
+        delimiter=",",
+        remove_substring="_ceaster.txt",
+        encoding="latin-1"  # or "utf-8", "utf-8-sig", etc.
+    )
+    logging.info(f"[Gamma] Final row count: {len(df_gamma)}")
+
+    # --- Create Missing Items Report ---
+    output_file = Path("Missing_Items.xlsx")
+    create_missing_items_excel(df_alfa, df_gamma, df_exceptions, output_file)
+
+    logging.info("Script completed successfully.")
+
+
+if __name__ == "__main__":
+    main()

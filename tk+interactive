@@ -1,0 +1,1230 @@
+"""
+ULTRA-MEGA Data Reconciliation with:
+  - Original logic (filter_pre_melt, exclude_dimension_attribute, transform_alfa/gamma, create_missing_items_excel)
+  - Keep & Do Not Keep (Alfa=AND/OR, Gamma=OR/OR)
+  - Dark Mode, Scrollable multi-tab UI
+  - Treeviews for Bad Dims/Attrs, Renames, Keep/DoNotKeep
+  - Interactive bar charts (matplotlib + mplcursors)
+  - Interactive pie charts (Plotly + tkhtmlview)
+No "NaN" in final Key, color-blind pastel-coded Excel for missing items.
+"""
+
+import logging
+import os
+import zipfile
+import tkinter as tk
+from tkinter import ttk, filedialog, scrolledtext
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # We'll embed figures in Tk with FigureCanvas
+import matplotlib.pyplot as plt
+import mplcursors  # for interactive tooltips
+
+import plotly.express as px  # for interactive pies
+from tkhtmlview import HTMLLabel  # to embed the HTML in a Tk widget
+
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font
+from io import BytesIO
+from PIL import Image, ImageTk
+
+# ------------------------------------------------------------------------------
+# 0) Dark Mode
+# ------------------------------------------------------------------------------
+def apply_dark_mode(style: ttk.Style):
+    """
+    Sets up a dark theme across the entire Tkinter UI.
+    """
+    # We'll base it on 'clam', override some colors
+    style.theme_use("clam")
+
+    dark_bg = "#2B2B2B"
+    dark_fg = "#FFFFFF"
+    accent_bg= "#3C3F41"
+    style.configure(".", background=dark_bg, foreground=dark_fg)
+    style.configure("TFrame", background=dark_bg, foreground=dark_fg)
+    style.configure("TLabel", background=dark_bg, foreground=dark_fg)
+    style.configure("TButton", background=accent_bg, foreground=dark_fg)
+    style.configure("Treeview", background="#444444", foreground=dark_fg, fieldbackground="#444444")
+    style.map("Treeview", background=[("selected", "#666666")])
+    style.configure("TEntry", fieldbackground="#454545", foreground=dark_fg)
+    style.configure("TNotebook", background=dark_bg)
+    style.configure("TNotebook.Tab", background=accent_bg, foreground=dark_fg)
+    style.map("TNotebook.Tab", background=[("selected", dark_bg)], foreground=[("selected", dark_fg)])
+
+
+# ------------------------------------------------------------------------------
+# 1) LOGGING
+# ------------------------------------------------------------------------------
+LOG_FILE = Path("script.log")
+def setup_logging():
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch_fmt= logging.Formatter("%(levelname)s: %(message)s")
+    ch.setFormatter(ch_fmt)
+    logger.addHandler(ch)
+
+    fh= logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh_fmt= logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    fh.setFormatter(fh_fmt)
+    logger.addHandler(fh)
+
+    logging.debug("Dark-Mode Logging Initialized.")
+
+
+# ------------------------------------------------------------------------------
+# 2) SCROLLABLE FRAME
+# ------------------------------------------------------------------------------
+class ScrollableFrame(ttk.Frame):
+    def __init__(self, parent, *args, **kwargs):
+        super().__init__(parent, *args, **kwargs)
+
+        self.canvas = tk.Canvas(self, highlightthickness=0, bg="#2B2B2B")
+        self.vscrollbar=ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vscrollbar.set)
+
+        self.scrollable_area=ttk.Frame(self.canvas)
+        self.scrollable_area.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+
+        self.canvas.create_window((0,0), window=self.scrollable_area, anchor="nw")
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.vscrollbar.pack(side="right", fill="y")
+
+        self.bind("<Configure>", self._on_frame_resized)
+
+    def _on_frame_resized(self, event=None):
+        self.canvas.config(width=self.winfo_width(), height=self.winfo_height())
+
+
+# ------------------------------------------------------------------------------
+# 3) OG-Style Pre-Melt & Exclude Dimension
+# ------------------------------------------------------------------------------
+def filter_pre_melt(
+    df: pd.DataFrame,
+    exclude_rules: Optional[List[Tuple[str, List[str]]]]=None
+)-> pd.DataFrame:
+    df=df.copy(deep=True)
+    if not exclude_rules:
+        return df
+    combined_mask=pd.Series(False, index=df.index)
+    for col,bad_vals in exclude_rules:
+        if col in df.columns:
+            mask = df[col].isin(bad_vals)
+            combined_mask|=mask
+        else:
+            logging.warning(f"[Pre-Melt] col '{col}' not found => skip {bad_vals}")
+    return df[~combined_mask].copy(deep=True)
+
+def exclude_dimension_attribute(
+    df: pd.DataFrame,
+    bad_dimensions: Optional[List[str]]=None,
+    bad_attributes: Optional[List[str]]=None
+)->pd.DataFrame:
+    df=df.copy(deep=True)
+    if bad_dimensions:
+        init=len(df)
+        df=df[~df["Dimension"].isin(bad_dimensions)]
+        logging.debug(f"[ExcludeDimAttr] removed {init-len(df)} by dims={bad_dimensions}")
+    if bad_attributes:
+        init=len(df)
+        df=df[~df["Attribute"].isin(bad_attributes)]
+        logging.debug(f"[ExcludeDimAttr] removed {init-len(df)} by attrs={bad_attributes}")
+    return df
+
+# ------------------------------------------------------------------------------
+# 4) KEEP Logic (Alfa=AND/OR, Gamma=OR/OR)
+# ------------------------------------------------------------------------------
+def filter_alfa_keep_and_disallow(df: pd.DataFrame,
+                                  keep_rules: List[Tuple[str,str]],
+                                  disallow_rules: List[Tuple[str,str]])->pd.DataFrame:
+    """
+    Alfa => Keep=AND, Disallow=OR
+    """
+    df=df.copy(deep=True)
+    if keep_rules:
+        combined_keep=pd.Series(True,index=df.index)
+        for (col,val_str) in keep_rules:
+            if col not in df.columns:
+                logging.warning(f"[AlfaKeep] col '{col}' missing => skip {val_str}")
+                continue
+            allowed={v.strip() for v in val_str.split(",") if v.strip()}
+            mask=df[col].isin(allowed)
+            combined_keep&=mask
+        df=df[combined_keep].copy(deep=True)
+
+    if disallow_rules:
+        combined_neg=pd.Series(False,index=df.index)
+        for (col,val_str) in disallow_rules:
+            if col not in df.columns:
+                logging.warning(f"[AlfaDisallow] col '{col}' missing => skip {val_str}")
+                continue
+            not_allowed={v.strip() for v in val_str.split(",") if v.strip()}
+            mask=df[col].isin(not_allowed)
+            combined_neg|=mask
+        df=df[~combined_neg].copy(deep=True)
+
+    return df
+
+def filter_gamma_keep_and_disallow(df: pd.DataFrame,
+                                   keep_rules: List[Tuple[str,str]],
+                                   disallow_rules: List[Tuple[str,str]])->pd.DataFrame:
+    """
+    Gamma => Keep=OR, Disallow=OR
+    """
+    df=df.copy(deep=True)
+    if keep_rules:
+        combined_keep=pd.Series(False,index=df.index)
+        for (col,val_str) in keep_rules:
+            if col not in df.columns:
+                logging.warning(f"[GammaKeep] col '{col}' => skip {val_str}")
+                continue
+            allowed={v.strip() for v in val_str.split(",") if v.strip()}
+            mask=df[col].isin(allowed)
+            combined_keep|=mask
+        df=df[combined_keep].copy(deep=True)
+
+    if disallow_rules:
+        combined_neg=pd.Series(False,index=df.index)
+        for (col,val_str) in disallow_rules:
+            if col not in df.columns:
+                logging.warning(f"[GammaNeg] col '{col}' => skip {val_str}")
+                continue
+            not_allowed={v.strip() for v in val_str.split(",") if v.strip()}
+            mask=df[col].isin(not_allowed)
+            combined_neg|=mask
+        df=df[~combined_neg].copy(deep=True)
+
+    return df
+
+# ------------------------------------------------------------------------------
+# 5) TRANSFORM ALFA
+# ------------------------------------------------------------------------------
+def transform_alfa(
+    file_path: Path,
+    alfa_keep_and: List[Tuple[str,str]],
+    alfa_disallow: List[Tuple[str,str]],
+    pre_melt_exclude_rules: Optional[List[Tuple[str, List[str]]]]=None,
+    bad_dimensions: Optional[List[str]]=None,
+    bad_attributes: Optional[List[str]]=None,
+    dimension_rename: Dict[str,str]=None,
+    attribute_rename: Dict[str,str]=None,
+    sheet_name: str="Sheet1",
+    skip_rows: int=3
+)-> pd.DataFrame:
+    if not file_path.is_file():
+        logging.error(f"[Alfa] File not found => {file_path}")
+        return pd.DataFrame()
+    try:
+        df=pd.read_excel(file_path, sheet_name=sheet_name, skiprows=skip_rows)
+        df=df.copy(deep=True)
+        logging.info(f"[Alfa] Loaded {len(df)} from '{file_path.name}'")
+
+        # dimension
+        if "Dimension_Name" in df.columns:
+            df.rename(columns={"Dimension_Name":"Dimension"}, inplace=True)
+        else:
+            third=df.columns[2]
+            df.rename(columns={third:"Dimension"}, inplace=True)
+
+        if "Name" not in df.columns:
+            fourth=df.columns[3]
+            df.rename(columns={fourth:"Name"}, inplace=True)
+
+        df["RecordID"]=df.index.astype(str)
+
+        # keep/disallow
+        df=filter_alfa_keep_and_disallow(df, alfa_keep_and, alfa_disallow)
+        df=filter_pre_melt(df, pre_melt_exclude_rules)
+
+        id_vars=["Dimension","RecordID"]
+        value_vars=[c for c in df.columns if c not in id_vars]
+        melted=df.melt(id_vars=id_vars, value_vars=value_vars,
+                       var_name="Attribute", value_name="Value")
+
+        if dimension_rename:
+            melted["Dimension"]=melted["Dimension"].replace(dimension_rename)
+        if attribute_rename:
+            melted["Attribute"]=melted["Attribute"].replace(attribute_rename)
+
+        melted=exclude_dimension_attribute(melted, bad_dimensions, bad_attributes)
+
+        ref_df=melted[melted["Attribute"]=="Name"][["RecordID","Value"]].drop_duplicates("RecordID")
+        ref_df.rename(columns={"Value":"RefName"}, inplace=True)
+        melted=melted.merge(ref_df, on="RecordID", how="left")
+
+        for col in ("Dimension","Attribute","Value","RefName"):
+            melted[col]=melted[col].fillna("").astype(str)
+
+        melted["GroupKey"]=melted["Dimension"].str.strip()+" | "+melted["RefName"].str.strip()
+        melted["Key"]=(melted["Dimension"].str.strip()
+                       +" | "+melted["RefName"].str.strip()
+                       +" | "+melted["Attribute"].str.strip()
+                       +" | "+melted["Value"].str.strip())
+        melted.drop_duplicates(inplace=True)
+        logging.info(f"[Alfa] Final => {len(melted)} rows.")
+        return melted
+    except Exception as e:
+        logging.exception(f"[Alfa] Error => {e}")
+        return pd.DataFrame()
+
+# ------------------------------------------------------------------------------
+# 6) TRANSFORM GAMMA
+# ------------------------------------------------------------------------------
+def transform_gamma(
+    zip_file_path: Path,
+    gamma_keep_or: List[Tuple[str,str]],
+    gamma_disallow: List[Tuple[str,str]],
+    pre_melt_exclude_rules: Optional[List[Tuple[str,List[str]]]]=None,
+    bad_dimensions: Optional[List[str]]=None,
+    bad_attributes: Optional[List[str]]=None,
+    dimension_rename: Dict[str,str]=None,
+    attribute_rename: Dict[str,str]=None,
+    delimiter: str=",",
+    remove_substring: str="_ceaster.txt",
+    encoding: str="utf-8"
+)-> pd.DataFrame:
+    if not zip_file_path.is_file():
+        logging.error(f"[Gamma] ZIP not found => {zip_file_path}")
+        return pd.DataFrame()
+    all_dfs=[]
+    try:
+        with zipfile.ZipFile(zip_file_path,"r") as z:
+            txt_files=[f for f in z.namelist() if f.lower().endswith(".txt")]
+            if not txt_files:
+                logging.warning("[Gamma] No .txt in ZIP => empty.")
+                return pd.DataFrame()
+
+            for txt_file in txt_files:
+                try:
+                    base_name=os.path.basename(txt_file)
+                    if remove_substring in base_name:
+                        base_name=base_name.replace(remove_substring,"")
+                    else:
+                        base_name,_=os.path.splitext(base_name)
+
+                    dimension=base_name.replace("_"," ").strip()
+
+                    with z.open(txt_file) as fo:
+                        df=pd.read_csv(fo, delimiter=delimiter, encoding=encoding)
+                        df=df.copy(deep=True)
+                    if df.empty:
+                        logging.warning(f"[Gamma] '{txt_file}' empty => skip.")
+                        continue
+
+                    first_col=df.columns[0]
+                    df.rename(columns={first_col:"Name"}, inplace=True)
+                    df["Name"]=df["Name"].fillna("Unknown").astype(str)
+
+                    df=filter_gamma_keep_and_disallow(df, gamma_keep_or, gamma_disallow)
+                    df=filter_pre_melt(df, pre_melt_exclude_rules)
+
+                    df["Dimension"]=dimension
+                    df["RecordID"]=df.index.astype(str)
+
+                    id_vars=["Dimension","RecordID"]
+                    value_vars=[c for c in df.columns if c not in id_vars]
+                    melted=df.melt(id_vars=id_vars, value_vars=value_vars,
+                                   var_name="Attribute", value_name="Value")
+
+                    if dimension_rename:
+                        melted["Dimension"]=melted["Dimension"].replace(dimension_rename)
+                    if attribute_rename:
+                        melted["Attribute"]=melted["Attribute"].replace(attribute_rename)
+
+                    melted=exclude_dimension_attribute(melted, bad_dimensions, bad_attributes)
+
+                    ref_df=melted[melted["Attribute"]=="Name"][["RecordID","Value"]].drop_duplicates("RecordID")
+                    ref_df.rename(columns={"Value":"RefName"}, inplace=True)
+                    melted=melted.merge(ref_df, on="RecordID", how="left")
+
+                    for col in ("Dimension","Attribute","Value","RefName"):
+                        melted[col]=melted[col].fillna("").astype(str)
+
+                    melted["GroupKey"]=melted["Dimension"].str.strip()+" | "+melted["RefName"].str.strip()
+                    melted["Key"]=(melted["Dimension"].str.strip()
+                                   +" | "+melted["RefName"].str.strip()
+                                   +" | "+melted["Attribute"].str.strip()
+                                   +" | "+melted["Value"].str.strip())
+                    melted.drop_duplicates(inplace=True)
+                    logging.info(f"[Gamma] '{txt_file}' => {len(melted)} rows.")
+                    all_dfs.append(melted.copy(deep=True))
+                except Exception as e2:
+                    logging.error(f"[Gamma] Error '{txt_file}' => {e2}")
+                    continue
+
+        if all_dfs:
+            df_gamma=pd.concat(all_dfs, ignore_index=True)
+            logging.info(f"[Gamma] Combined => {len(df_gamma)} total.")
+            return df_gamma
+        else:
+            logging.warning("[Gamma] No valid data => empty.")
+            return pd.DataFrame()
+    except Exception as e:
+        logging.exception(f"[Gamma] ZIP read => {e}")
+        return pd.DataFrame()
+
+# ------------------------------------------------------------------------------
+# 7) CREATE MISSING ITEMS EXCEL
+# ------------------------------------------------------------------------------
+def create_missing_items_excel(
+    df_alfa: pd.DataFrame,
+    df_gamma: pd.DataFrame,
+    df_exceptions: pd.DataFrame,
+    output_path: Path
+)->pd.DataFrame:
+    """
+    Color-blind pastel-coded final Excel, returns df_missing for further charting.
+    Missing in Gamma => #A6D96A
+    Missing in Alfa => #67A9CF
+    """
+    def build_map(df: pd.DataFrame)->Dict[str,Dict[str,str]]:
+        out={}
+        for gk,subdf in df.groupby("GroupKey"):
+            row_dict={}
+            for attr, s_df in subdf.groupby("Attribute"):
+                row_dict[attr]=str(s_df["Value"].iloc[0])
+            out[gk]=row_dict
+        return out
+
+    df_missing=pd.DataFrame()
+    if "GroupKey" not in df_alfa.columns or "GroupKey" not in df_gamma.columns:
+        logging.error("[Missing Items] No 'GroupKey' in Alfa or Gamma => returning empty.")
+        return df_missing
+
+    alfa_map=build_map(df_alfa)
+    gamma_map=build_map(df_gamma)
+    all_keys=set(alfa_map.keys()).union(set(gamma_map.keys()))
+    items=[]
+
+    for group_key in all_keys:
+        a_dict=alfa_map.get(group_key)
+        g_dict=gamma_map.get(group_key)
+        parts=group_key.split(" | ",maxsplit=1)
+        dimension=parts[0] if len(parts)>0 else ""
+        ref_name=parts[1] if len(parts)>1 else ""
+
+        if a_dict is None and g_dict is not None:
+            if "Name" in g_dict:
+                items.append({
+                    "Dimension":dimension,"Name":g_dict["Name"],
+                    "Attribute":"Name","Value":g_dict["Name"],
+                    "Missing In":"Alfa"
+                })
+            continue
+        if g_dict is None and a_dict is not None:
+            if "Name" in a_dict:
+                items.append({
+                    "Dimension":dimension,"Name":a_dict["Name"],
+                    "Attribute":"Name","Value":a_dict["Name"],
+                    "Missing In":"Gamma"
+                })
+            continue
+
+        if a_dict and g_dict:
+            has_name_a=("Name" in a_dict)
+            has_name_g=("Name" in g_dict)
+            if not has_name_a and has_name_g:
+                items.append({
+                    "Dimension":dimension,"Name":g_dict["Name"],
+                    "Attribute":"Name","Value":g_dict["Name"],
+                    "Missing In":"Alfa"
+                })
+                continue
+            if not has_name_g and has_name_a:
+                items.append({
+                    "Dimension":dimension,"Name":a_dict["Name"],
+                    "Attribute":"Name","Value":a_dict["Name"],
+                    "Missing In":"Gamma"
+                })
+                continue
+            all_attrs=set(a_dict.keys()).union(set(g_dict.keys()))
+            if "Name" in all_attrs:
+                all_attrs.remove("Name")
+            for attr in all_attrs:
+                a_val=a_dict.get(attr)
+                g_val=g_dict.get(attr)
+                if a_val is None and g_val is not None:
+                    items.append({
+                        "Dimension":dimension,"Name":g_dict["Name"],
+                        "Attribute":attr,"Value":g_val,
+                        "Missing In":"Alfa"
+                    })
+                elif g_val is None and a_val is not None:
+                    items.append({
+                        "Dimension":dimension,"Name":a_dict["Name"],
+                        "Attribute":attr,"Value":a_val,
+                        "Missing In":"Gamma"
+                    })
+                elif a_val != g_val:
+                    items.append({
+                        "Dimension":dimension,"Name":a_dict["Name"],
+                        "Attribute":attr,"Value":a_val,
+                        "Missing In":"Gamma"
+                    })
+                    items.append({
+                        "Dimension":dimension,"Name":a_dict["Name"],
+                        "Attribute":attr,"Value":g_val,
+                        "Missing In":"Alfa"
+                    })
+
+    df_missing=pd.DataFrame(items)
+    logging.info(f"[Missing Items] Found {len(df_missing)} mismatch rows.")
+
+    if df_missing.empty:
+        logging.info("[Missing Items] no diffs => empty Excel.")
+        cols=["Key","Dimension","Name","Attribute","Value","Comments_1","Comments_2","Action Item","Missing In"]
+        pd.DataFrame(columns=cols).to_excel(output_path, sheet_name="Missing_Items", index=False)
+        return df_missing
+
+    for c in ("Dimension","Name","Attribute","Value"):
+        df_missing[c]=df_missing[c].fillna("")
+
+    df_missing["Key"]=(df_missing["Dimension"].str.strip()
+                       +" | "+ df_missing["Name"].str.strip()
+                       +" | "+ df_missing["Attribute"].str.strip()
+                       +" | "+ df_missing["Value"].str.strip())
+
+    # if df_exceptions has "hide exception"
+    if not df_exceptions.empty:
+        val_cols={"Key","Comments_1","Comments_2","hide exception"}
+        exc=df_exceptions[[x for x in df_exceptions.columns if x in val_cols]].copy()
+        exc["Key"]=exc["Key"].astype(str).str.strip()
+        df_missing=df_missing.merge(exc,on="Key",how="left",suffixes=("","_exc"))
+        df_missing["hide exception"]=df_missing["hide exception"].fillna("no").str.lower()
+        before_len=len(df_missing)
+        df_missing=df_missing[df_missing["hide exception"]!="yes"]
+        after_len=len(df_missing)
+        logging.debug(f"[Missing Items] Excluded {before_len - after_len} hidden except rows")
+
+    if "Action Item" not in df_missing.columns:
+        df_missing["Action Item"]=""
+
+    final_cols=["Key","Dimension","Name","Attribute","Value","Comments_1","Comments_2","Action Item","Missing In"]
+    df_missing=df_missing.reindex(columns=final_cols)
+
+    df_missing.to_excel(output_path, sheet_name="Missing_Items", index=False)
+    logging.info(f"[Missing Items] Wrote {len(df_missing)} => {output_path}")
+
+    # color-coded
+    try:
+        wb=load_workbook(output_path)
+        ws=wb["Missing_Items"]
+        header_font=Font(bold=True)
+        fill_header=PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+        fill_gamma=PatternFill(start_color="A6D96A", end_color="A6D96A", fill_type="solid")
+        fill_alfa=PatternFill(start_color="67A9CF", end_color="67A9CF", fill_type="solid")
+
+        header_row=next(ws.iter_rows(min_row=1, max_row=1))
+        headers={cell.value: cell.column for cell in header_row}
+        for cell in header_row:
+            cell.font=header_font
+            cell.fill=fill_header
+
+        missing_in_col=headers.get("Missing In")
+        if missing_in_col is None:
+            logging.warning("[Missing Items] 'Missing In' col not found => skip color.")
+        else:
+            max_col=ws.max_column
+            for row_idx in range(2, ws.max_row+1):
+                val=str(ws.cell(row=row_idx,column=missing_in_col).value).strip().lower()
+                if val=="gamma":
+                    fill=fill_gamma
+                elif val=="alfa":
+                    fill=fill_alfa
+                else:
+                    fill=None
+                if fill:
+                    for col_idx in range(1, max_col+1):
+                        ws.cell(row=row_idx, column=col_idx).fill=fill
+
+        ws.freeze_panes="A2"
+        wb.save(output_path)
+        logging.info("[Missing Items] Pastel-coded Excel done.")
+    except Exception as e:
+        logging.exception(f"[Missing Items] Excel formatting => {e}")
+
+    return df_missing
+
+
+# ------------------------------------------------------------------------------
+# 8) READ EXCEPTIONS
+# ------------------------------------------------------------------------------
+def read_exception_table(exc_path: Path)-> pd.DataFrame:
+    if not exc_path or not exc_path.is_file():
+        logging.warning(f"[Exception] not found => {exc_path}")
+        return pd.DataFrame()
+    try:
+        df=pd.read_excel(exc_path, sheet_name="Sheet1")
+        return df.copy(deep=True)
+    except Exception as e:
+        logging.exception(f"[Exception] read => {e}")
+        return pd.DataFrame()
+
+# ------------------------------------------------------------------------------
+# 9) MASTER RECON
+# ------------------------------------------------------------------------------
+def run_reconciliation(
+    alfa_path: Path,
+    gamma_path: Path,
+    exc_path: Optional[Path],
+    alfa_keep_and: List[Tuple[str,str]],
+    alfa_disallow: List[Tuple[str,str]],
+    gamma_keep_or: List[Tuple[str,str]],
+    gamma_disallow: List[Tuple[str,str]],
+    alfa_exclude: List[Tuple[str, List[str]]],
+    gamma_exclude: List[Tuple[str, List[str]]],
+    alfa_bad_dims: List[str],
+    alfa_bad_attrs: List[str],
+    gamma_bad_dims: List[str],
+    gamma_bad_attrs: List[str],
+    alfa_dim_renames: Dict[str,str],
+    alfa_attr_renames: Dict[str,str],
+    gamma_dim_renames: Dict[str,str],
+    gamma_attr_renames: Dict[str,str],
+    output_path: Path
+)-> pd.DataFrame:
+    df_exceptions=read_exception_table(exc_path) if exc_path and exc_path.is_file() else pd.DataFrame()
+
+    # Transform Alfa
+    df_alfa=transform_alfa(
+        file_path=alfa_path,
+        alfa_keep_and=alfa_keep_and,
+        alfa_disallow=alfa_disallow,
+        pre_melt_exclude_rules=alfa_exclude,
+        bad_dimensions=alfa_bad_dims,
+        bad_attributes=alfa_bad_attrs,
+        dimension_rename=alfa_dim_renames,
+        attribute_rename=alfa_attr_renames
+    )
+
+    # Transform Gamma
+    df_gamma=transform_gamma(
+        zip_file_path=gamma_path,
+        gamma_keep_or=gamma_keep_or,
+        gamma_disallow=gamma_disallow,
+        pre_melt_exclude_rules=gamma_exclude,
+        bad_dimensions=gamma_bad_dims,
+        bad_attributes=gamma_bad_attrs,
+        dimension_rename=gamma_dim_renames,
+        attribute_rename=gamma_attr_renames
+    )
+
+    # Missing Items
+    df_missing=create_missing_items_excel(df_alfa, df_gamma, df_exceptions, output_path)
+    return df_missing
+
+
+# ------------------------------------------------------------------------------
+# 10) APP
+# ------------------------------------------------------------------------------
+class ReconciliationApp(tk.Tk):
+    """
+    Dark-Mode multi-tab UI with Treeviews for:
+      - "Bad Dims" & "Bad Attrs" (Alfa, Gamma)
+      - Renames (Dim, Attr for Alfa, Gamma)
+      - Keep/Disallow (Alfa=AND/OR, Gamma=OR/OR)
+      - Paths
+      - Run
+      - Charts & Analysis => Interactive bar charts (matplotlib + mplcursors) & Pie charts (Plotly) in same tab
+    """
+    def __init__(self):
+        super().__init__()
+        self.title("ULTRA-MEGA Data Reconciliation (Dark Mode + Interactive Charts)")
+        self.geometry("1400x1000")
+
+        self.style=ttk.Style(self)
+        apply_dark_mode(self.style)
+
+        self.notebook=ttk.Notebook(self)
+        self.notebook.pack(expand=True, fill="both")
+
+        # Tabs
+        self.tab_paths=ScrollableFrame(self.notebook)
+        self.tab_exclusions=ScrollableFrame(self.notebook)
+        self.tab_keep=ScrollableFrame(self.notebook)
+        self.tab_run=ScrollableFrame(self.notebook)
+        self.tab_charts=ScrollableFrame(self.notebook)
+
+        self.notebook.add(self.tab_paths, text="Paths")
+        self.notebook.add(self.tab_exclusions, text="Exclusions & Renames")
+        self.notebook.add(self.tab_keep, text="Keep/DoNotKeep")
+        self.notebook.add(self.tab_run, text="Run & Progress")
+        self.notebook.add(self.tab_charts, text="Charts & Analysis")
+
+        self.build_tab_paths(self.tab_paths.scrollable_area)
+        self.build_tab_exclusions(self.tab_exclusions.scrollable_area)
+        self.build_tab_keep(self.tab_keep.scrollable_area)
+        self.build_tab_run(self.tab_run.scrollable_area)
+        self.build_tab_charts(self.tab_charts.scrollable_area)
+
+        # Logging area
+        log_frame=ttk.Frame(self)
+        log_frame.pack(expand=True, fill="both")
+        ttk.Label(log_frame, text="Log Output:", font=("TkDefaultFont",10,"bold")).pack(anchor="w")
+        self.scrolled_log=scrolledtext.ScrolledText(log_frame, state="disabled", height=10, bg="#2B2B2B", fg="#FFFFFF")
+        self.scrolled_log.pack(expand=True, fill="both", padx=5, pady=5)
+
+        setup_logging()
+        logging.info("[GUI] Dark-Mode app started.")
+
+        self.df_missing=pd.DataFrame()
+        self.populate_defaults()
+
+    # ----------------------
+    # TAB: PATHS
+    # ----------------------
+    def build_tab_paths(self, parent: ttk.Frame):
+        row=0
+        ttk.Label(parent, text="Alfa Excel (.xlsx):").grid(row=row,column=0,sticky="w",padx=5,pady=5)
+        self.entry_alfa=ttk.Entry(parent, width=70)
+        self.entry_alfa.insert(0, "AlfaData.xlsx")
+        self.entry_alfa.grid(row=row,column=1,padx=5,pady=5)
+        ttk.Button(parent, text="Browse", command=self.on_browse_alfa).grid(row=row,column=2,padx=5,pady=5)
+        row+=1
+
+        ttk.Label(parent, text="Gamma ZIP (.zip):").grid(row=row,column=0,sticky="w",padx=5,pady=5)
+        self.entry_gamma=ttk.Entry(parent, width=70)
+        self.entry_gamma.insert(0, "GammaData.zip")
+        self.entry_gamma.grid(row=row,column=1,padx=5,pady=5)
+        ttk.Button(parent, text="Browse", command=self.on_browse_gamma).grid(row=row,column=2,padx=5,pady=5)
+        row+=1
+
+        ttk.Label(parent, text="Exception Table (optional):").grid(row=row,column=0,sticky="w",padx=5,pady=5)
+        self.entry_exc=ttk.Entry(parent, width=70)
+        self.entry_exc.insert(0, "Exception_Table.xlsx")
+        self.entry_exc.grid(row=row,column=1,padx=5,pady=5)
+        ttk.Button(parent, text="Browse", command=self.on_browse_exc).grid(row=row,column=2,padx=5,pady=5)
+        row+=1
+
+        ttk.Label(parent, text="Output Missing Items (.xlsx):").grid(row=row,column=0,sticky="w",padx=5,pady=5)
+        self.entry_out=ttk.Entry(parent, width=70)
+        self.entry_out.insert(0, "Missing_Items.xlsx")
+        self.entry_out.grid(row=row,column=1,padx=5,pady=5)
+        ttk.Button(parent, text="Browse", command=self.on_browse_out).grid(row=row,column=2,padx=5,pady=5)
+
+    # ----------------------
+    # TAB: EXCLUSIONS & RENAMES
+    # ----------------------
+    def build_tab_exclusions(self, parent: ttk.Frame):
+        # We'll do 4 single-col treeviews: AlfaBadDims, AlfaBadAttrs, GammaBadDims, GammaBadAttrs
+        # and 4 two-col treeviews for renames: AlfaDimRen, AlfaAttrRen, GammaDimRen, GammaAttrRen
+        frm_ex=ttk.Frame(parent)
+        frm_ex.pack(expand=True, fill="both", padx=5, pady=5)
+
+        self.tv_alfa_bad_dims= self.create_singlecol_tree(frm_ex, "Alfa Bad Dims", 0)
+        self.tv_alfa_bad_attrs=self.create_singlecol_tree(frm_ex, "Alfa Bad Attrs", 1)
+        self.tv_gamma_bad_dims=self.create_singlecol_tree(frm_ex, "Gamma Bad Dims",2)
+        self.tv_gamma_bad_attrs=self.create_singlecol_tree(frm_ex, "Gamma Bad Attrs",3)
+
+        frm_ren=ttk.Frame(parent)
+        frm_ren.pack(expand=True, fill="both", padx=5, pady=5)
+
+        self.tv_alfa_dim_ren=self.create_twocol_tree(frm_ren, "Alfa Dim Renames",0)
+        self.tv_alfa_attr_ren=self.create_twocol_tree(frm_ren,"Alfa Attr Renames",1)
+        self.tv_gamma_dim_ren=self.create_twocol_tree(frm_ren,"Gamma Dim Renames",2)
+        self.tv_gamma_attr_ren=self.create_twocol_tree(frm_ren,"Gamma Attr Renames",3)
+
+    def create_singlecol_tree(self, parent: ttk.Frame, label_text: str, row_idx: int)->ttk.Treeview:
+        lbl=ttk.Label(parent,text=label_text,font=("TkDefaultFont",9,"bold"))
+        lbl.grid(row=row_idx,column=0,sticky="w",pady=5)
+
+        frm_tree=ttk.Frame(parent)
+        frm_tree.grid(row=row_idx,column=1,sticky="nw",padx=5)
+
+        tv=ttk.Treeview(frm_tree, columns=("Value",), show="headings", height=4)
+        tv.heading("Value", text="Value")
+        tv.column("Value", width=200)
+
+        scroll_y=ttk.Scrollbar(frm_tree, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=scroll_y.set)
+        scroll_y.pack(side="right", fill="y")
+        tv.pack(side="left", fill="both", expand=True)
+
+        frm_btn=ttk.Frame(parent)
+        frm_btn.grid(row=row_idx,column=2,sticky="n",padx=5)
+
+        ttk.Button(frm_btn, text="Add", command=lambda: self.on_add_singlecol(tv)).pack(side="top", fill="x", pady=2)
+        ttk.Button(frm_btn, text="Remove", command=lambda: self.on_remove_item(tv)).pack(side="top", fill="x")
+
+        return tv
+
+    def on_add_singlecol(self, tv: ttk.Treeview):
+        val=tk.simpledialog.askstring("Add Value","Enter new bad value:")
+        if val and val.strip():
+            tv.insert("", tk.END, values=(val.strip(),))
+
+    def create_twocol_tree(self, parent: ttk.Frame, label_text: str, row_idx: int)->ttk.Treeview:
+        lbl=ttk.Label(parent,text=label_text,font=("TkDefaultFont",9,"bold"))
+        lbl.grid(row=row_idx,column=0,sticky="w",pady=5)
+
+        frm_tree=ttk.Frame(parent)
+        frm_tree.grid(row=row_idx, column=1, sticky="nw", padx=5)
+
+        tv=ttk.Treeview(frm_tree, columns=("Old","New"), show="headings", height=4)
+        tv.heading("Old", text="Old")
+        tv.heading("New", text="New")
+        tv.column("Old",width=100)
+        tv.column("New",width=100)
+
+        scroll_y=ttk.Scrollbar(frm_tree, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=scroll_y.set)
+        scroll_y.pack(side="right", fill="y")
+        tv.pack(side="left", fill="both", expand=True)
+
+        frm_btn=ttk.Frame(parent)
+        frm_btn.grid(row=row_idx,column=2,sticky="n",padx=5)
+        ttk.Button(frm_btn, text="Add", command=lambda: self.on_add_rename(tv)).pack(side="top", fill="x", pady=2)
+        ttk.Button(frm_btn, text="Remove", command=lambda: self.on_remove_item(tv)).pack(side="top", fill="x")
+
+        return tv
+
+    def on_add_rename(self, tv: ttk.Treeview):
+        oldval=tk.simpledialog.askstring("Add Rename","Enter OLD name:")
+        if not oldval or not oldval.strip():
+            return
+        newval=tk.simpledialog.askstring("Add Rename",f"Enter NEW name for '{oldval}':")
+        if not newval or not newval.strip():
+            return
+        tv.insert("", tk.END, values=(oldval.strip(), newval.strip()))
+
+    def on_remove_item(self, tv: ttk.Treeview):
+        sel=tv.selection()
+        for s in sel:
+            tv.delete(s)
+
+    # ---------------------
+    # TAB: KEEP
+    # ---------------------
+    def build_tab_keep(self, parent: ttk.Frame):
+        # We'll do 4 Treeviews: Alfa Keep(AND), Alfa Neg(OR), Gamma Keep(OR), Gamma Neg(OR)
+        frm=ttk.Frame(parent)
+        frm.pack(expand=True, fill="both", padx=5, pady=5)
+
+        self.tv_alfa_keep=self.create_keep_tree(frm,"Alfa Keep (AND)",0)
+        self.tv_alfa_neg =self.create_keep_tree(frm,"Alfa DoNotKeep (OR)",1)
+        self.tv_gamma_keep=self.create_keep_tree(frm,"Gamma Keep (OR)",2)
+        self.tv_gamma_neg =self.create_keep_tree(frm,"Gamma DoNotKeep (OR)",3)
+
+    def create_keep_tree(self, parent: ttk.Frame, label_text: str, row_idx:int)->ttk.Treeview:
+        lbl=ttk.Label(parent,text=label_text,font=("TkDefaultFont",9,"bold"))
+        lbl.grid(row=row_idx,column=0,sticky="w",pady=5)
+
+        frm_tree=ttk.Frame(parent)
+        frm_tree.grid(row=row_idx,column=1,sticky="nw",padx=5)
+
+        tv=ttk.Treeview(frm_tree, columns=("Column","Values"), show="headings", height=4)
+        tv.heading("Column", text="Column")
+        tv.heading("Values", text="Allowed Values (comma-sep)")
+        tv.column("Column",width=120)
+        tv.column("Values",width=180)
+
+        scroll_y=ttk.Scrollbar(frm_tree, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=scroll_y.set)
+        scroll_y.pack(side="right", fill="y")
+        tv.pack(side="left", fill="both", expand=True)
+
+        frm_btn=ttk.Frame(parent)
+        frm_btn.grid(row=row_idx,column=2,sticky="n",padx=5)
+
+        ttk.Button(frm_btn, text="Add", command=lambda: self.on_add_keep(tv)).pack(side="top",fill="x",pady=2)
+        ttk.Button(frm_btn, text="Remove", command=lambda: self.on_remove_item(tv)).pack(side="top",fill="x")
+
+        return tv
+
+    def on_add_keep(self, tv: ttk.Treeview):
+        colname=tk.simpledialog.askstring("Keep Rule","Enter column name:")
+        if not colname or not colname.strip():
+            return
+        valstr=tk.simpledialog.askstring("Keep Rule",f"Enter comma-sep values for '{colname}':")
+        if valstr is None:
+            return
+        tv.insert("", tk.END, values=(colname.strip(), valstr.strip()))
+
+    # ---------------------
+    # TAB: RUN
+    # ---------------------
+    def build_tab_run(self, parent: ttk.Frame):
+        ttk.Label(parent, text="Click 'Run' to start the reconciliation.").pack(anchor="w", padx=5, pady=5)
+
+        self.progress_bar=ttk.Progressbar(parent,orient="horizontal",length=600,mode="determinate")
+        self.progress_bar.pack(pady=5)
+        self.progress_bar["maximum"]=5
+
+        frm_btn=ttk.Frame(parent)
+        frm_btn.pack(pady=5)
+        ttk.Button(frm_btn, text="Run", command=self.on_run_clicked).pack(side="left", padx=5)
+        ttk.Button(frm_btn, text="Exit", command=self.destroy).pack(side="left", padx=5)
+
+        self.label_status=ttk.Label(parent, text="", foreground="white")
+        self.label_status.pack(anchor="w", padx=5, pady=5)
+
+    # ---------------------
+    # TAB: CHARTS
+    # ---------------------
+    def build_tab_charts(self, parent: ttk.Frame):
+        # We'll create sub-frames for bar charts (matplotlib) & pie charts (Plotly)
+        self.frm_matplotlib=ttk.Frame(parent)
+        self.frm_matplotlib.pack(fill="both", expand=True, padx=5, pady=5)
+
+        ttk.Label(self.frm_matplotlib, text="Interactive Bar Charts (mplcursors)").pack(anchor="w")
+
+        self.canvas_dim_bar = ttk.Label(self.frm_matplotlib)  # We'll embed a FigureCanvas below
+        self.canvas_dim_bar.pack(anchor="w", padx=5, pady=5)
+
+        self.canvas_missing_bar = ttk.Label(self.frm_matplotlib)
+        self.canvas_missing_bar.pack(anchor="w", padx=5, pady=5)
+
+        self.canvas_attr_bar = ttk.Label(self.frm_matplotlib)
+        self.canvas_attr_bar.pack(anchor="w", padx=5, pady=5)
+
+        self.frm_plotly=ttk.Frame(parent)
+        self.frm_plotly.pack(fill="both", expand=True, padx=5, pady=5)
+
+        ttk.Label(self.frm_plotly, text="Interactive Pie Charts (Plotly)").pack(anchor="w")
+
+        self.html_dim_pie=HTMLLabel(self.frm_plotly, width=80, background="#2B2B2B")
+        self.html_dim_pie.pack(anchor="w", padx=5, pady=5)
+        self.html_missing_pie=HTMLLabel(self.frm_plotly, width=80, background="#2B2B2B")
+        self.html_missing_pie.pack(anchor="w", padx=5, pady=5)
+        self.html_attr_pie=HTMLLabel(self.frm_plotly, width=80, background="#2B2B2B")
+        self.html_attr_pie.pack(anchor="w", padx=5, pady=5)
+
+    # ---------------------
+    # Populate Defaults
+    # ---------------------
+    def populate_defaults(self):
+        # Fill the Treeviews for "bad dims/attrs" & rename with some example data
+        for val in DEFAULT_ALFA_BAD_DIMS:
+            self.tv_alfa_bad_dims.insert("", tk.END, values=(val,))
+        for val in DEFAULT_ALFA_BAD_ATTRS:
+            self.tv_alfa_bad_attrs.insert("", tk.END, values=(val,))
+        for val in DEFAULT_GAMMA_BAD_DIMS:
+            self.tv_gamma_bad_dims.insert("", tk.END, values=(val,))
+        for val in DEFAULT_GAMMA_BAD_ATTRS:
+            self.tv_gamma_bad_attrs.insert("", tk.END, values=(val,))
+
+        for (o,n) in DEFAULT_ALFA_DIM_RENAMES.items():
+            self.tv_alfa_dim_ren.insert("", tk.END, values=(o,n))
+        for (o,n) in DEFAULT_ALFA_ATTR_RENAMES.items():
+            self.tv_alfa_attr_ren.insert("", tk.END, values=(o,n))
+        for (o,n) in DEFAULT_GAMMA_DIM_RENAMES.items():
+            self.tv_gamma_dim_ren.insert("", tk.END, values=(o,n))
+        for (o,n) in DEFAULT_GAMMA_ATTR_RENAMES.items():
+            self.tv_gamma_attr_ren.insert("", tk.END, values=(o,n))
+
+        # Keep/DoNotKeep
+        for (c,v) in DEFAULT_ALFA_KEEP_AND:
+            self.tv_alfa_keep.insert("", tk.END, values=(c,v))
+        for (c,v) in DEFAULT_ALFA_DISALLOW:
+            self.tv_alfa_neg.insert("", tk.END, values=(c,v))
+        for (c,v) in DEFAULT_GAMMA_KEEP_OR:
+            self.tv_gamma_keep.insert("", tk.END, values=(c,v))
+        for (c,v) in DEFAULT_GAMMA_DISALLOW:
+            self.tv_gamma_neg.insert("", tk.END, values=(c,v))
+
+    # ---------------------
+    # Treeview => gather
+    # ---------------------
+    def gather_singlecol(self, tv: ttk.Treeview)->List[str]:
+        out=[]
+        for child in tv.get_children():
+            row=tv.item(child,"values")
+            if row:
+                out.append(row[0])
+        return out
+
+    def gather_rename_pairs(self, tv: ttk.Treeview)->Dict[str,str]:
+        out={}
+        for child in tv.get_children():
+            row=tv.item(child,"values")
+            if row and len(row)==2:
+                old=row[0].strip()
+                new=row[1].strip()
+                out[old]=new
+        return out
+
+    def gather_keep_rules(self, tv: ttk.Treeview)->List[Tuple[str,str]]:
+        out=[]
+        for child in tv.get_children():
+            row=tv.item(child,"values")
+            if row and len(row)==2:
+                col=row[0].strip()
+                val=row[1].strip()
+                if col:
+                    out.append((col,val))
+        return out
+
+    # ---------------------
+    # Browsers
+    # ---------------------
+    def on_browse_alfa(self):
+        path=filedialog.askopenfilename(filetypes=[("Excel Files","*.xlsx"),("All Files","*.*")])
+        if path:
+            self.entry_alfa.delete(0, tk.END)
+            self.entry_alfa.insert(0, path)
+
+    def on_browse_gamma(self):
+        path=filedialog.askopenfilename(filetypes=[("ZIP Files","*.zip"),("All Files","*.*")])
+        if path:
+            self.entry_gamma.delete(0, tk.END)
+            self.entry_gamma.insert(0, path)
+
+    def on_browse_exc(self):
+        path=filedialog.askopenfilename(filetypes=[("Excel Files","*.xlsx"),("All Files","*.*")])
+        if path:
+            self.entry_exc.delete(0, tk.END)
+            self.entry_exc.insert(0, path)
+
+    def on_browse_out(self):
+        path=filedialog.asksaveasfilename(defaultextension=".xlsx",filetypes=[("Excel Files","*.xlsx"),("All Files","*.*")])
+        if path:
+            self.entry_out.delete(0, tk.END)
+            self.entry_out.insert(0, path)
+
+    # ---------------------
+    # RUN
+    # ---------------------
+    def on_run_clicked(self):
+        logging.info("[GUI] 'Run' clicked")
+        self.progress_bar["value"]=0
+        self.label_status.configure(text="", foreground="white")
+        self.update_idletasks()
+
+        alfa_path_str=self.entry_alfa.get().strip()
+        gamma_path_str=self.entry_gamma.get().strip()
+        exc_path_str=self.entry_exc.get().strip()
+        out_path_str=self.entry_out.get().strip()
+
+        if not alfa_path_str or not os.path.isfile(alfa_path_str):
+            self.label_status.configure(text="Error: invalid Alfa path", foreground="red")
+            return
+        if not gamma_path_str or not os.path.isfile(gamma_path_str):
+            self.label_status.configure(text="Error: invalid Gamma path", foreground="red")
+            return
+        if not out_path_str.lower().endswith(".xlsx"):
+            out_path_str+=".xlsx"
+
+        # Gather data from Treeviews
+        alfa_bd = self.gather_singlecol(self.tv_alfa_bad_dims)
+        alfa_ba = self.gather_singlecol(self.tv_alfa_bad_attrs)
+        gamma_bd= self.gather_singlecol(self.tv_gamma_bad_dims)
+        gamma_ba= self.gather_singlecol(self.tv_gamma_bad_attrs)
+
+        alfa_dim_ren= self.gather_rename_pairs(self.tv_alfa_dim_ren)
+        alfa_attr_ren=self.gather_rename_pairs(self.tv_alfa_attr_ren)
+        gamma_dim_ren=self.gather_rename_pairs(self.tv_gamma_dim_ren)
+        gamma_attr_ren=self.gather_rename_pairs(self.tv_gamma_attr_ren)
+
+        alfa_keep = self.gather_keep_rules(self.tv_alfa_keep)
+        alfa_neg  = self.gather_keep_rules(self.tv_alfa_neg)
+        gamma_keep= self.gather_keep_rules(self.tv_gamma_keep)
+        gamma_neg = self.gather_keep_rules(self.tv_gamma_neg)
+
+        def progress_callback(step:int):
+            self.progress_bar["value"]=step
+            self.update_idletasks()
+
+        self.label_status.configure(text="Processing... please wait", foreground="white")
+        self.update_idletasks()
+
+        try:
+            from pathlib import Path
+            df_missing=run_reconciliation(
+                alfa_path=Path(alfa_path_str),
+                gamma_path=Path(gamma_path_str),
+                exc_path=Path(exc_path_str) if exc_path_str and os.path.isfile(exc_path_str) else None,
+                alfa_keep_and=alfa_keep,
+                alfa_disallow=alfa_neg,
+                gamma_keep_or=gamma_keep,
+                gamma_disallow=gamma_neg,
+                alfa_exclude=[], # if needed
+                gamma_exclude=[],
+                alfa_bad_dims=alfa_bd,
+                alfa_bad_attrs=alfa_ba,
+                gamma_bad_dims=gamma_bd,
+                gamma_bad_attrs=gamma_ba,
+                alfa_dim_renames=alfa_dim_ren,
+                alfa_attr_renames=alfa_attr_ren,
+                gamma_dim_renames=gamma_dim_ren,
+                gamma_attr_renames=gamma_attr_ren,
+                output_path=Path(out_path_str)
+            )
+            self.df_missing=df_missing
+            self.label_status.configure(
+                text=f"Done! Missing items => '{out_path_str}'. See Charts & Analysis tab.",
+                foreground="green"
+            )
+            # Generate bar charts w/ mplcursors
+            # Generate pie charts w/ plotly => embed
+            self.generate_bar_charts()
+            self.generate_pie_charts()
+        except Exception as e:
+            logging.exception(f"[GUI] run error => {e}")
+            self.label_status.configure(text=f"Error => {e}", foreground="red")
+
+    # ---------------------
+    # CHARTS - Matplotlib + mplcursors
+    # ---------------------
+    def generate_bar_charts(self):
+        """
+        We'll create 3 bar charts => Dimension, 'Missing In', Attribute
+        using normal MatPlotLib. Then embed them with FigureCanvasTkAgg.
+        We'll add mplcursors for interactive tooltips.
+        """
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        import mplcursors
+
+        # We'll remove any old children from self.canvas_dim_bar, etc.
+        for widget in (self.canvas_dim_bar, self.canvas_missing_bar, self.canvas_attr_bar):
+            for child in widget.winfo_children():
+                child.destroy()
+            widget.config(image="", text="")  # Clear previous
+
+        df=self.df_missing
+        if df.empty:
+            logging.info("[Charts] df_missing is empty => no bar charts.")
+            return
+
+        # 1) Dimension bar
+        by_dim=df.groupby("Dimension").size().reset_index(name="Count")
+        fig_dim, ax_dim=plt.subplots(figsize=(6,4))
+        bars_dim=ax_dim.bar(by_dim["Dimension"], by_dim["Count"], color="#5698c4")
+        ax_dim.set_title("Bar Chart: Missing by Dimension", fontsize=12)
+        ax_dim.tick_params(axis='x', rotation=45)
+        for i, v in enumerate(by_dim["Count"]):
+            ax_dim.text(i, v+0.05, str(v), ha="center", va="bottom", color="white")
+
+        cursor_dim=mplcursors.cursor(bars_dim, hover=True)
+        @cursor_dim.connect("add")
+        def on_add_dim(sel):
+            index=sel.target.index
+            dim_val=by_dim["Dimension"].iloc[index]
+            count=by_dim["Count"].iloc[index]
+            sel.annotation.set(text=f"{dim_val}: {count}", position=(0,20), anncoords="offset points")
+
+        fig_dim.tight_layout()
+
+        # embed
+        canvas_dim=FigureCanvasTkAgg(fig_dim, master=self.canvas_dim_bar)
+        canvas_dim.draw()
+        canvas_dim.get_tk_widget().pack()
+
+        # 2) Missing In bar
+        by_miss=df.groupby("Missing In").size().reset_index(name="Count")
+        fig_miss, ax_miss=plt.subplots(figsize=(6,4))
+        bars_miss=ax_miss.bar(by_miss["Missing In"], by_miss["Count"], color="#a6d96a")
+        ax_miss.set_title("Bar Chart: Missing In", fontsize=12)
+        for i,v in enumerate(by_miss["Count"]):
+            ax_miss.text(i, v+0.05, str(v), ha="center", va="bottom", color="white")
+
+        cursor_miss=mplcursors.cursor(bars_miss, hover=True)
+        @cursor_miss.connect("add")
+        def on_add_miss(sel):
+            idx=sel.target.index
+            val=by_miss["Missing In"].iloc[idx]
+            count=by_miss["Count"].iloc[idx]
+            sel.annotation.set(text=f"{val}: {count}", position=(0,20), anncoords="offset points")
+
+        fig_miss.tight_layout()
+
+        canvas_miss=FigureCanvasTkAgg(fig_miss, master=self.canvas_missing_bar)
+        canvas_miss.draw()
+        canvas_miss.get_tk_widget().pack()
+
+        # 3) Attribute bar
+        by_attr=df.groupby("Attribute").size().reset_index(name="Count")
+        fig_attr, ax_attr=plt.subplots(figsize=(6,4))
+        bars_attr=ax_attr.bar(by_attr["Attribute"], by_attr["Count"], color="#fdb863")
+        ax_attr.set_title("Bar Chart: Missing by Attribute", fontsize=12)
+        ax_attr.tick_params(axis='x', rotation=45)
+        for i,v in enumerate(by_attr["Count"]):
+            ax_attr.text(i, v+0.05, str(v), ha="center", va="bottom", color="white")
+
+        cursor_attr=mplcursors.cursor(bars_attr, hover=True)
+        @cursor_attr.connect("add")
+        def on_add_attr(sel):
+            idx=sel.target.index
+            val=by_attr["Attribute"].iloc[idx]
+            count=by_attr["Count"].iloc[idx]
+            sel.annotation.set(text=f"{val}: {count}", position=(0,20), anncoords="offset points")
+
+        fig_attr.tight_layout()
+
+        canvas_attr=FigureCanvasTkAgg(fig_attr, master=self.canvas_attr_bar)
+        canvas_attr.draw()
+        canvas_attr.get_tk_widget().pack()
+
+    # ---------------------
+    # CHARTS - PIE (Plotly)
+    # ---------------------
+    def generate_pie_charts(self):
+        """
+        We'll create interactive Plotly pies for dimension, 'Missing In', attribute.
+        Embed them via HTML in a tkhtmlview HTMLLabel.
+        """
+        df=self.df_missing
+        if df.empty:
+            logging.info("[Charts] df_missing empty => no pies.")
+            return
+
+        # dimension pie
+        fig_dim = px.pie(df, names="Dimension", title="Dimension Distribution (Missing)", color_discrete_sequence=px.colors.sequential.Blues)
+        html_dim=fig_dim.to_html(include_plotlyjs="cdn", full_html=False)
+        self.html_dim_pie.set_html(html_dim)
+
+        # missing in
+        fig_miss=px.pie(df, names="Missing In", title="'Missing In' Distribution", color_discrete_sequence=px.colors.sequential.Greens)
+        html_miss=fig_miss.to_html(include_plotlyjs="cdn", full_html=False)
+        self.html_missing_pie.set_html(html_miss)
+
+        # attribute
+        fig_attr=px.pie(df, names="Attribute", title="Attribute Distribution (Missing)", color_discrete_sequence=px.colors.sequential.OrRd)
+        html_attr=fig_attr.to_html(include_plotlyjs="cdn", full_html=False)
+        self.html_attr_pie.set_html(html_attr)
+
+    # ---------------------
+    # BROWSE
+    # ---------------------
+    def on_browse_alfa(self):
+        path=filedialog.askopenfilename(filetypes=[("Excel Files","*.xlsx"),("All Files","*.*")])
+        if path:
+            self.entry_alfa.delete(0, tk.END)
+            self.entry_alfa.insert(0, path)
+
+    def on_browse_gamma(self):
+        path=filedialog.askopenfilename(filetypes=[("ZIP Files","*.zip"),("All Files","*.*")])
+        if path:
+            self.entry_gamma.delete(0, tk.END)
+            self.entry_gamma.insert(0, path)
+
+    def on_browse_exc(self):
+        path=filedialog.askopenfilename(filetypes=[("Excel Files","*.xlsx"),("All Files","*.*")])
+        if path:
+            self.entry_exc.delete(0, tk.END)
+            self.entry_exc.insert(0, path)
+
+    def on_browse_out(self):
+        path=filedialog.asksaveasfilename(defaultextension=".xlsx",filetypes=[("Excel Files","*.xlsx"),("All Files","*.*")])
+        if path:
+            self.entry_out.delete(0, tk.END)
+            self.entry_out.insert(0, path)
+
+
+def main():
+    app=ReconciliationApp()
+    app.mainloop()
+
+if __name__=="__main__":
+    main()

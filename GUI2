@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+Ultra-Best Data Reconciliation Script with Multi-Tab PySimpleGUI UI + Progress Bar
+
+Features:
+  - All default paths and "bad dims/attrs" specified at the top for easy editing.
+  - Multiple tabs in the UI:
+       * Tab 1: File Paths (Alfa, Gamma, Exception, Output)
+       * Tab 2: Exclusions & Renames (bad dims/attrs, dimension rename, attribute rename)
+       * Tab 3: Run & Progress (button to run, progress bar, status logs)
+  - Fills missing fields with "" so no "NaN" in final Key.
+  - Logs detailed debugging info to "script.log".
+  - Color-coded Missing_Items.xlsx for mismatches.
+
+"""
+
+import logging
+import os
+import zipfile
+import PySimpleGUI as sg  # pip install PySimpleGUI
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font
+
+# =============================================================================
+# 0) DEFAULT CONFIG / PATHS (EDIT HERE!)
+# =============================================================================
+
+# Default file paths (you can overwrite them in the GUI)
+DEFAULT_ALFA_PATH = "AlfaData.xlsx"
+DEFAULT_GAMMA_PATH = "GammaData.zip"
+DEFAULT_EXCEPTION_PATH = "Exception_Table.xlsx"
+DEFAULT_OUTPUT_PATH = "Missing_Items.xlsx"
+
+# Default lists for "bad" dimensions & attributes
+DEFAULT_BAD_DIMS = ["UnwantedDim"]
+DEFAULT_BAD_ATTRS = ["Debug"]
+
+# Default rename mappings for dimension & attribute
+# Format: {"OldName": "NewName", "AnotherOld": "AnotherNew"}
+DEFAULT_DIMENSION_RENAME = {"DimOld": "DimNew"}
+DEFAULT_ATTRIBUTE_RENAME = {"First": "Name"}
+
+# =============================================================================
+# 1) SETUP LOGGING
+# =============================================================================
+def setup_logging(log_file: Path) -> None:
+    """
+    Sets up logging to both console (INFO) and file (DEBUG).
+    """
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_format = logging.Formatter("%(levelname)s: %(message)s")
+    console_handler.setFormatter(console_format)
+
+    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_format = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    file_handler.setFormatter(file_format)
+
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    logging.debug("Logging initialized.")
+
+
+# =============================================================================
+# 2) HELPER: PRE-MELT FILTER
+# =============================================================================
+def filter_pre_melt(
+    df: pd.DataFrame,
+    exclude_rules: Optional[List[Tuple[str, List[str]]]] = None
+) -> pd.DataFrame:
+    """
+    Excludes rows based on (column_name, [bad_values]) before melting.
+    """
+    df = df.copy(deep=True)
+    if not exclude_rules:
+        return df
+
+    combined_mask = pd.Series(False, index=df.index)
+    for col, bad_vals in exclude_rules:
+        if col in df.columns:
+            mask = df[col].isin(bad_vals)
+            logging.debug(f"[Pre-Melt] Excluding {mask.sum()} rows in '{col}' with {bad_vals}")
+            combined_mask |= mask
+        else:
+            logging.warning(f"[Pre-Melt] Column '{col}' not found. Skipping rule {bad_vals}.")
+
+    return df[~combined_mask].copy(deep=True)
+
+
+# =============================================================================
+# 3) HELPER: POST-MELT FILTER (BAD DIMS / ATTRS)
+# =============================================================================
+def exclude_dimension_attribute(
+    df: pd.DataFrame,
+    bad_dimensions: Optional[List[str]] = None,
+    bad_attributes: Optional[List[str]] = None
+) -> pd.DataFrame:
+    """
+    Excludes rows whose 'Dimension' or 'Attribute' is in a list of 'bad' values.
+    """
+    df = df.copy(deep=True)
+    if bad_dimensions:
+        initial = len(df)
+        df = df[~df["Dimension"].isin(bad_dimensions)]
+        logging.debug(f"[Post-Melt] Removed {initial - len(df)} rows with bad dims={bad_dimensions}")
+
+    if bad_attributes:
+        initial = len(df)
+        df = df[~df["Attribute"].isin(bad_attributes)]
+        logging.debug(f"[Post-Melt] Removed {initial - len(df)} rows with bad attrs={bad_attributes}")
+
+    return df
+
+
+# =============================================================================
+# 4) TRANSFORM ALFA (EXCEL)
+# =============================================================================
+def transform_alfa(
+    file_path: Path,
+    pre_melt_exclude_rules: Optional[List[Tuple[str, List[str]]]] = None,
+    bad_dimensions: Optional[List[str]] = None,
+    bad_attributes: Optional[List[str]] = None,
+    dimension_rename: Optional[Dict[str, str]] = None,
+    attribute_rename: Optional[Dict[str, str]] = None,
+    sheet_name: str = "Sheet1",
+    skip_rows: int = 3
+) -> pd.DataFrame:
+    """
+    Reads & transforms Alfa Excel data -> melted DataFrame.
+    No 'NaN' in final Key (we fill missing).
+    """
+    if not file_path.is_file():
+        logging.error(f"[Alfa] File not found: {file_path}")
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=skip_rows)
+        df = df.copy(deep=True)
+        logging.info(f"[Alfa] Loaded {len(df)} rows from '{file_path.name}'")
+
+        # Identify dimension column
+        if "Dimension_Name" in df.columns:
+            df.rename(columns={"Dimension_Name": "Dimension"}, inplace=True)
+        else:
+            third_col = df.columns[2]
+            df.rename(columns={third_col: "Dimension"}, inplace=True)
+
+        # Ensure 'Name' col
+        if "Name" not in df.columns:
+            fourth_col = df.columns[3]
+            df.rename(columns={fourth_col: "Name"}, inplace=True)
+
+        df["RecordID"] = df.index.astype(str)
+
+        # Pre-melt exclude
+        df = filter_pre_melt(df, pre_melt_exclude_rules)
+
+        # Melt
+        id_vars = ["Dimension", "RecordID"]
+        value_vars = [c for c in df.columns if c not in id_vars]
+        melted = df.melt(id_vars=id_vars, value_vars=value_vars,
+                         var_name="Attribute", value_name="Value")
+
+        # Renames
+        if dimension_rename:
+            melted["Dimension"] = melted["Dimension"].replace(dimension_rename)
+        if attribute_rename:
+            melted["Attribute"] = melted["Attribute"].replace(attribute_rename)
+
+        # Exclude bad dims/attrs
+        melted = exclude_dimension_attribute(melted, bad_dimensions, bad_attributes)
+
+        # Extract "Name" => 'RefName'
+        ref_df = melted[melted["Attribute"] == "Name"][["RecordID", "Value"]].drop_duplicates("RecordID")
+        ref_df.rename(columns={"Value": "RefName"}, inplace=True)
+        melted = melted.merge(ref_df, on="RecordID", how="left")
+
+        # Fill missing => no "NaN"
+        for col in ["Dimension", "Attribute", "Value", "RefName"]:
+            melted[col] = melted[col].fillna("").astype(str)
+
+        # Build GroupKey & Key
+        melted["GroupKey"] = melted["Dimension"].str.strip() + " | " + melted["RefName"].str.strip()
+        melted["Key"] = (melted["Dimension"].str.strip()
+                         + " | " + melted["RefName"].str.strip()
+                         + " | " + melted["Attribute"].str.strip()
+                         + " | " + melted["Value"].str.strip())
+
+        melted.drop_duplicates(inplace=True)
+        logging.info(f"[Alfa] Final row count: {len(melted)}")
+        return melted
+
+    except Exception as e:
+        logging.exception(f"[Alfa] Error reading/transforming '{file_path}': {e}")
+        return pd.DataFrame()
+
+
+# =============================================================================
+# 5) TRANSFORM GAMMA (ZIP OF .txt)
+# =============================================================================
+def transform_gamma(
+    zip_file_path: Path,
+    pre_melt_exclude_rules: Optional[List[Tuple[str, List[str]]]] = None,
+    bad_dimensions: Optional[List[str]] = None,
+    bad_attributes: Optional[List[str]] = None,
+    dimension_rename: Optional[Dict[str, str]] = None,
+    attribute_rename: Optional[Dict[str, str]] = None,
+    delimiter: str = ",",
+    remove_substring: str = "_ceaster.txt",
+    encoding: str = "utf-8"
+) -> pd.DataFrame:
+    """
+    Reads Gamma data from a ZIP of .txt files. Each .txt is CSV with 1st col => Name,
+    filename => Dimension.
+    """
+    if not zip_file_path.is_file():
+        logging.error(f"[Gamma] ZIP file not found: {zip_file_path}")
+        return pd.DataFrame()
+
+    all_dfs: List[pd.DataFrame] = []
+    try:
+        with zipfile.ZipFile(zip_file_path, "r") as z:
+            txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+            if not txt_files:
+                logging.warning("[Gamma] No .txt found in ZIP.")
+                return pd.DataFrame()
+
+            for txt_file in txt_files:
+                try:
+                    base_name = os.path.basename(txt_file)
+                    if remove_substring in base_name:
+                        base_name = base_name.replace(remove_substring, "")
+                    else:
+                        base_name, _ = os.path.splitext(base_name)
+
+                    dimension = base_name.replace("_", " ").strip()
+
+                    with z.open(txt_file) as fo:
+                        df = pd.read_csv(fo, delimiter=delimiter, encoding=encoding)
+                        df = df.copy(deep=True)
+
+                    if df.empty:
+                        logging.warning(f"[Gamma] '{txt_file}' is empty, skipping.")
+                        continue
+
+                    # First col => Name
+                    first_col = df.columns[0]
+                    df.rename(columns={first_col: "Name"}, inplace=True)
+                    df["Name"] = df["Name"].fillna("Unknown").astype(str)
+
+        

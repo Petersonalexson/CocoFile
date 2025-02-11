@@ -1,0 +1,941 @@
+#!/usr/bin/env python3
+"""
+Excel-like UI for ERP (ALFA) and Master (GAMMA) with full Reconciliation
+-------------------------------------------------------------------------
+Features:
+- Reads ERP data from Excel (skip first 3 rows).
+- Reads Master data from a ZIP of .txt files (dimension derived from filename).
+- Each data source is shown in an Excel-like grid for:
+  * Column toggling, renaming, reordering
+  * Row filtering by checkboxes
+- "Enabled_Flag" filtering for ERP data (optional).
+- On "Run Comparison":
+  * We melt each data source into (Dimension, RefName, Attribute, Value)
+  * Compare using one of 3 modes
+  * Merge an Exception Table for comments/hiding
+  * Output to Excel
+
+Stores UI config (column states, filters, renames, etc.) in JSON so next run has the same settings.
+
+Author: ChatGPT
+Date: 2025
+"""
+
+import os
+import json
+import logging
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+from datetime import datetime
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+import customtkinter as ctk
+import pandas as pd
+import numpy as np
+
+# For Excel output formatting
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+
+# Optional encoding detection for .txt inside ZIP
+try:
+    import chardet
+except ImportError:
+    chardet = None
+
+# --------------- LOGGING ---------------
+def setup_logger():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s"
+    )
+setup_logger()
+
+# --------------- DEFAULT PATHS AND CONFIG ---------------
+DEFAULT_PATHS = {
+    "ERP_EXCEL_PATH": "data/ERP_Config.xlsx",
+    "MASTER_ZIP_PATH": "data/Master_Config.zip",
+    "EXCEPTION_PATH": "data/Exception_Table.xlsx",
+    "OUTPUT_PATH": "output/Reconciliation.xlsx",
+    "CONFIG_PATH": "config/ui_config.json"
+}
+
+def default_config() -> Dict:
+    """
+    Return a dictionary representing the default UI config:
+     - columns for ERP
+     - columns for Master
+     - initial filters
+     - etc.
+    """
+    return {
+        "paths": {
+            "ERP_EXCEL_PATH": DEFAULT_PATHS["ERP_EXCEL_PATH"],
+            "MASTER_ZIP_PATH": DEFAULT_PATHS["MASTER_ZIP_PATH"],
+            "EXCEPTION_PATH": DEFAULT_PATHS["EXCEPTION_PATH"],
+            "OUTPUT_PATH": DEFAULT_PATHS["OUTPUT_PATH"]
+        },
+        # Each "Grid" keeps track of columns, filters, etc.
+        "erp_grid": {
+            "columns": [
+                # Example for ERP (ALFA):
+                # col_id, display_name, locked, visible, renameable, ...
+                {
+                    "id": "Col1", "name": "Col1",
+                    "locked": False, "visible": True, "renameable": True
+                },
+                {
+                    "id": "Col2", "name": "Col2",
+                    "locked": False, "visible": True, "renameable": True
+                },
+                {
+                    "id": "Enabled_Flag", "name": "Enabled_Flag",
+                    "locked": False, "visible": True, "renameable": True
+                },
+                {
+                    "id": "Dimension_Name", "name": "Dimension_Name",
+                    "locked": True, "visible": True, "renameable": False
+                },
+                {
+                    "id": "Value", "name": "Value",
+                    "locked": True, "visible": True, "renameable": False
+                },
+                # The rest are your attributes
+                # We won't list them all. We'll dynamically handle columns that appear in the data but not in config.
+            ],
+            "filters": {}  # e.g. "Col1": {"A", "B"} means we keep only those
+        },
+        "master_grid": {
+            "columns": [
+                {
+                    "id": "Name", "name": "Name",
+                    "locked": True, "visible": True, "renameable": False
+                },
+                {
+                    "id": "Dimension", "name": "Dimension",
+                    "locked": True, "visible": True, "renameable": False
+                },
+                # The rest are attributes...
+            ],
+            "filters": {}
+        },
+        # Comparison mode
+        "comparison_option": 1
+    }
+
+def load_config(path: Path) -> Dict:
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load config from {path}: {e}")
+    return default_config()
+
+def save_config(config: Dict, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        logging.info(f"Config saved to {path}")
+    except Exception as e:
+        logging.error(f"Error saving config to {path}: {e}")
+
+# --------------- EXCEL-LIKE GRID IMPLEMENTATION ---------------
+class TextHandler(logging.Handler):
+    """
+    Optional: a handler to show log messages in a CTkTextbox or a widget.
+    """
+    def __init__(self, widget: ctk.CTkTextbox):
+        super().__init__()
+        self.widget = widget
+
+    def emit(self, record):
+        msg = self.format(record) + "\n"
+        self.widget.after(0, self._append, msg)
+
+    def _append(self, msg):
+        self.widget.configure(state="normal")
+        self.widget.insert("end", msg)
+        self.widget.see("end")
+        self.widget.configure(state="disabled")
+
+
+class ExcelGrid(ctk.CTkFrame):
+    """
+    An Excel-like grid with:
+      - column definitions (id, name, visible, locked, renameable)
+      - a treeview
+      - right-click filter popup with checkboxes
+      - column manager for toggling visibility, reordering, renaming
+    We keep a "df" for the raw data. The user sees only "visible columns", filtered rows.
+    The user can rename columns, toggle them. We store those changes in self.col_defs.
+    We also store filter states in self.filters.
+    """
+    def __init__(self, parent, config_block: Dict, name: str):
+        """
+        config_block is something like:
+            {
+                "columns": [ {id, name, locked, visible, renameable}, ... ],
+                "filters": { "col_id": set_of_allowed_values }
+            }
+        name is just "ERP" or "MASTER" for reference
+        """
+        super().__init__(parent)
+        self.name = name
+        self.col_defs: List[Dict] = config_block.get("columns", [])
+        self.filters: Dict[str, Set] = config_block.get("filters", {})
+        self.df = pd.DataFrame()
+        
+        self.create_toolbar()
+        self.create_table()
+        self.create_statusbar()
+
+    # --------------------------
+    # Public methods
+    # --------------------------
+    def set_data(self, df: pd.DataFrame):
+        """
+        Assign df as the raw data. We then attempt to unify columns with col_defs:
+        If new columns appear in df, add them to col_defs (visible by default).
+        If col_defs references columns not in df, we keep them (maybe they won't show up).
+        """
+        self.df = df.copy(deep=True)
+        existing_ids = [c["id"] for c in self.col_defs]
+        for col in self.df.columns:
+            if col not in existing_ids:
+                self.col_defs.append({
+                    "id": col,
+                    "name": col,
+                    "locked": False,
+                    "visible": True,
+                    "renameable": True
+                })
+        self.refresh_table()
+
+    def get_config_block(self) -> Dict:
+        """
+        Return the updated config block for saving:
+        {
+           "columns": [...],
+           "filters": {...}
+        }
+        """
+        return {
+            "columns": self.col_defs,
+            "filters": {k: sorted(list(v)) for k, v in self.filters.items()}  # convert set to list
+        }
+
+    def get_filtered_df(self) -> pd.DataFrame:
+        """
+        Return the *currently filtered* data, with *currently visible* columns, but
+        preserving column *ids*. That is, we do not rename them here; renaming is only for the UI headings.
+        """
+        if self.df.empty:
+            return self.df
+        # apply row filters
+        df_filtered = self.df.copy()
+        for col_id, allowed in self.filters.items():
+            if col_id in df_filtered.columns and allowed:
+                df_filtered = df_filtered[df_filtered[col_id].isin(allowed)]
+        # keep only visible columns
+        visible_ids = [c["id"] for c in self.col_defs if c.get("visible", True)]
+        visible_ids = [col for col in visible_ids if col in df_filtered.columns]
+        return df_filtered[visible_ids]
+
+    # --------------------------
+    # UI BUILD
+    # --------------------------
+    def create_toolbar(self):
+        toolbar = ctk.CTkFrame(self)
+        toolbar.pack(fill="x", padx=5, pady=5)
+        
+        ctk.CTkButton(toolbar, text="Manage Columns", command=self.show_column_manager).pack(side="left", padx=5)
+        ctk.CTkButton(toolbar, text="Clear Filters", command=self.clear_filters).pack(side="left", padx=5)
+
+    def create_table(self):
+        frame = ctk.CTkFrame(self)
+        frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.tree = ttk.Treeview(frame, show="headings")
+        self.tree["columns"] = []
+
+        # scrollbars
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        # Bind heading click for filter menu
+        self.tree.bind("<Button-3>", self.on_right_click)  # Windows typically right-click
+        self.tree.bind("<Button-2>", self.on_right_click)  # Mac middle-click or so
+        # Alternatively, could do heading click with a motion binding.
+
+    def create_statusbar(self):
+        self.status_label = ctk.CTkLabel(self, text="Ready")
+        self.status_label.pack(fill="x", padx=5, pady=5)
+
+    # --------------------------
+    # Refresh
+    # --------------------------
+    def refresh_table(self):
+        """Apply the col_defs to the treeview (visible columns, headings) + fill data from self.get_filtered_df()."""
+        # 1) Remove all items
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        # 2) Rebuild columns
+        visible_cols = [c for c in self.col_defs if c.get("visible", True)]
+        self.tree["columns"] = [c["id"] for c in visible_cols]
+        for col in visible_cols:
+            self.tree.heading(col["id"], text=col["name"], anchor="w", command=lambda c=col: self.show_filter_popup(c))
+            width = col.get("width", 150)
+            self.tree.column(col["id"], width=width, anchor="w")
+        # 3) Insert data
+        df_filtered = self.get_filtered_df()
+        for idx, row in df_filtered.iterrows():
+            rowvals = [row[c["id"]] for c in visible_cols]
+            self.tree.insert("", "end", values=rowvals)
+        self.status_label.configure(text=f"{len(df_filtered)} rows")
+
+    # --------------------------
+    # Column Manager
+    # --------------------------
+    def show_column_manager(self):
+        win = tk.Toplevel(self)
+        win.title(f"{self.name} Column Manager")
+        frm = ctk.CTkScrollableFrame(win, width=500, height=400)
+        frm.pack(fill="both", expand=True)
+        
+        # We'll create rows for each col_def
+        for i, col in enumerate(self.col_defs):
+            rowf = ctk.CTkFrame(frm)
+            rowf.pack(fill="x", pady=2)
+            # checkbox for visible
+            var_vis = tk.BooleanVar(value=col.get("visible", True))
+            ctk.CTkCheckBox(rowf, text="", variable=var_vis,
+                command=lambda c=col, v=var_vis: self.on_toggle_col_visibility(c, v.get())).pack(side="left")
+            
+            # label or rename
+            if col.get("renameable", True):
+                btn_name = ctk.CTkButton(rowf, text=col["name"][:25], command=lambda c=col: self.rename_column(c))
+                btn_name.pack(side="left", padx=5)
+            else:
+                ctk.CTkLabel(rowf, text=col["name"]).pack(side="left", padx=5)
+            
+            # if not locked, up/down reorder
+            if not col.get("locked", False):
+                ctk.CTkButton(rowf, text="↑", width=30,
+                              command=lambda idx=i: self.move_column(idx, -1)).pack(side="right", padx=2)
+                ctk.CTkButton(rowf, text="↓", width=30,
+                              command=lambda idx=i: self.move_column(idx, 1)).pack(side="right", padx=2)
+
+    def on_toggle_col_visibility(self, col: Dict, visible: bool):
+        col["visible"] = visible
+        self.refresh_table()
+
+    def rename_column(self, col: Dict):
+        new_name = simpledialog.askstring("Rename Column", f"New name for {col['name']}:", initialvalue=col['name'])
+        if new_name:
+            col["name"] = new_name
+            self.refresh_table()
+
+    def move_column(self, index: int, delta: int):
+        new_idx = index + delta
+        if 0 <= new_idx < len(self.col_defs):
+            self.col_defs[index], self.col_defs[new_idx] = self.col_defs[new_idx], self.col_defs[index]
+            self.refresh_table()
+
+    # --------------------------
+    # Filter Popup
+    # --------------------------
+    def on_right_click(self, event):
+        # Possibly show a context menu with "Filter Column" if the user right-clicks heading
+        pass  # You can implement a real heading right-click if you want
+
+    def show_filter_popup(self, col_def: Dict):
+        """
+        Show a Toplevel with a checklist of unique values in that column.
+        The user can select which ones to keep.
+        """
+        col_id = col_def["id"]
+        if self.df.empty or col_id not in self.df.columns:
+            return
+        
+        popup = tk.Toplevel(self)
+        popup.title(f"Filter: {col_def['name']}")
+        popup.geometry("300x400")
+
+        # Potentially a "select all" checkbox
+        frame = ctk.CTkFrame(popup)
+        frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Unique values
+        df_unique = self.df[col_id].dropna().unique()
+        # Sort them as strings
+        unique_vals = sorted(df_unique, key=lambda x: str(x))
+        
+        var_dict = {}
+        current_filter = self.filters.get(col_id, set())
+        if not current_filter:
+            # If no filter set, default is "all selected"
+            current_filter = set(unique_vals)
+
+        # "Select All" var
+        select_all_var = tk.BooleanVar(value=True)
+
+        def on_toggle_select_all():
+            # If we uncheck "Select All", everything becomes unchecked
+            check = select_all_var.get()
+            for v in var_dict.values():
+                v.set(check)
+
+        ctk.CTkCheckBox(frame, text="Select All", variable=select_all_var, command=on_toggle_select_all).pack(anchor="w")
+
+        scroll = ctk.CTkScrollableFrame(frame, width=250, height=250)
+        scroll.pack(fill="both", expand=True, padx=5, pady=5)
+
+        for val in unique_vals:
+            var = tk.BooleanVar(value=(val in current_filter))
+            var_dict[val] = var
+            ctk.CTkCheckBox(scroll, text=str(val), variable=var).pack(anchor="w")
+
+        # Buttons
+        btnf = ctk.CTkFrame(frame)
+        btnf.pack(fill="x", pady=5)
+        def apply_filter():
+            selected = {v for v, boolvar in var_dict.items() if boolvar.get()}
+            self.filters[col_id] = selected
+            popup.destroy()
+            self.refresh_table()
+
+        ctk.CTkButton(btnf, text="Apply", command=apply_filter).pack(side="left", padx=5)
+        ctk.CTkButton(btnf, text="Cancel", command=popup.destroy).pack(side="left", padx=5)
+
+    def clear_filters(self):
+        self.filters.clear()
+        self.refresh_table()
+
+
+# --------------- DATA READING FUNCTIONS ---------------
+def read_erp_data(xlsx_path: Path) -> pd.DataFrame:
+    """Read ERP (ALFA-like) Excel, skipping first 3 rows, returning a DataFrame."""
+    if not xlsx_path.is_file():
+        logging.warning(f"ERP Excel not found: {xlsx_path}")
+        return pd.DataFrame()
+    try:
+        df = pd.read_excel(xlsx_path, skiprows=3)
+        df.columns = df.columns.str.strip()
+        return df
+    except Exception as e:
+        logging.error(f"Error reading ERP Excel: {e}")
+        return pd.DataFrame()
+
+def read_master_data(zip_path: Path) -> pd.DataFrame:
+    """Read Master (GAMMA-like) from .zip of .txt files. Derive dimension from filename minus '_ceaster.txt'."""
+    if not zip_path.is_file():
+        logging.warning(f"Master ZIP not found: {zip_path}")
+        return pd.DataFrame()
+    all_dfs = []
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+            for txt_file in txt_files:
+                try:
+                    base_name = os.path.basename(txt_file)
+                    if "_ceaster.txt" in base_name.lower():
+                        base_dim = base_name.lower().replace("_ceaster.txt", "")
+                    else:
+                        base_dim, _ = os.path.splitext(base_name)
+                    dimension = base_dim.replace("_", " ").title()
+
+                    with z.open(txt_file) as fo:
+                        if chardet is not None:
+                            sample = fo.read(1024)
+                            encoding = chardet.detect(sample)["encoding"] or "utf-8"
+                            fo.seek(0)
+                        else:
+                            encoding = "utf-8"
+                        df_part = pd.read_csv(fo, encoding=encoding, delimiter=",")
+                    
+                    df_part.columns = df_part.columns.str.strip()
+                    first_col = df_part.columns[0]
+                    df_part.rename(columns={first_col: "Name"}, inplace=True)
+                    df_part["Dimension"] = dimension
+                    all_dfs.append(df_part)
+                except Exception as e2:
+                    logging.error(f"Error reading {txt_file}: {e2}")
+    except Exception as e:
+        logging.error(f"Error opening ZIP {zip_path}: {e}")
+    if all_dfs:
+        return pd.concat(all_dfs, ignore_index=True)
+    else:
+        return pd.DataFrame()
+
+# --------------- COMPARISON LOGIC ---------------
+def meltdown_erp(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    From ERP DataFrame, we assume:
+      - 'Dimension_Name' is the dimension column
+      - 'Value' is the RefName
+      - 'Enabled_Flag' might exist, not included in meltdown
+      - 'Col1'/'Col2' might exist for filtering but not in meltdown
+      - Everything else is an attribute
+    We'll produce (Dimension, RefName, Attribute, Value).
+    """
+    if df.empty:
+        return df
+    keep_cols = [c for c in df.columns if c not in ["Col1", "Col2", "Enabled_Flag"]]
+    # dimension col = Dimension_Name, name col = Value
+    # we do a melt, but let's do a custom approach:
+    id_vars = ["Dimension_Name", "Value"]
+    id_vars = [c for c in id_vars if c in keep_cols]  # ensure they exist
+    value_vars = [c for c in keep_cols if c not in id_vars]
+    df_melted = df.melt(id_vars=id_vars, value_vars=value_vars,
+                        var_name="Attribute", value_name="MeltedValue")
+    df_melted.rename(columns={
+        "Dimension_Name": "Dimension",
+        "Value": "RefName",
+        "MeltedValue": "Value"
+    }, inplace=True)
+    return df_melted[["Dimension", "RefName", "Attribute", "Value"]].copy()
+
+def meltdown_master(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For Master data:
+      - 'Dimension' column is dimension
+      - 'Name' is RefName
+      - Everything else is attribute
+    """
+    if df.empty:
+        return df
+    keep_cols = df.columns.tolist()
+    id_vars = ["Dimension", "Name"]
+    id_vars = [c for c in id_vars if c in keep_cols]
+    value_vars = [c for c in keep_cols if c not in id_vars]
+    df_melted = df.melt(id_vars=id_vars, value_vars=value_vars,
+                        var_name="Attribute", value_name="Value")
+    df_melted.rename(columns={"Name": "RefName"}, inplace=True)
+    return df_melted[["Dimension", "RefName", "Attribute", "Value"]].copy()
+
+def build_keys(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in ["Dimension", "RefName", "Attribute", "Value"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+    df["GroupKey"] = df["Dimension"] + " | " + df["RefName"]
+    df["Key"] = df["Dimension"] + " | " + df["RefName"] + " | " + df["Attribute"] + " | " + df["Value"]
+    df["Comments_1"] = ""
+    df["Comments_2"] = ""
+    df["Action Item"] = ""
+    df["Missing In"] = ""
+    return df
+
+def compare_data(df_erp: pd.DataFrame, df_master: pd.DataFrame, mode: int) -> pd.DataFrame:
+    """
+    3 modes, simplified:
+     1) Show everything missing
+     2) If 'Name' missing in one side, don't show attributes, else show missing attributes
+     3) Show missing + matching
+    We'll do an example approach similar to earlier code.
+    """
+    erp_lookup = build_lookup_dict(df_erp)
+    master_lookup = build_lookup_dict(df_master)
+    all_keys = set(erp_lookup.keys()) | set(master_lookup.keys())
+    results = []
+    for gk in all_keys:
+        dim = gk.split(" | ")[0]
+        a_data = erp_lookup.get(gk, {})
+        b_data = master_lookup.get(gk, {})
+        name_a = a_data.get("Name", a_data.get("RefName", ""))
+        name_b = b_data.get("Name", b_data.get("RefName", ""))
+
+        if mode == 1:
+            results.extend(compare_mode_1(dim, name_a, name_b, a_data, b_data))
+        elif mode == 2:
+            results.extend(compare_mode_2(dim, name_a, name_b, a_data, b_data))
+        else:
+            results.extend(compare_mode_3(dim, name_a, name_b, a_data, b_data))
+    df_diff = pd.DataFrame(results)
+    if not df_diff.empty:
+        df_diff["Key"] = df_diff["Dimension"].str.strip() + " | " + df_diff["Name"].str.strip() \
+                         + " | " + df_diff["Attribute"].str.strip() + " | " + df_diff["Value"].str.strip()
+    return df_diff
+
+def build_lookup_dict(df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+    """
+    For each GroupKey, build an attribute->value dict + store 'Name' attribute from RefName
+    """
+    lookup = {}
+    for gk, sub in df.groupby("GroupKey"):
+        record = {}
+        # store 'Name' = first RefName, in case we need it
+        ref_name = sub["RefName"].iloc[0] if not sub.empty else ""
+        record["Name"] = ref_name
+        for _, row in sub.iterrows():
+            record[row["Attribute"]] = row["Value"]
+        lookup[gk] = record
+    return lookup
+
+# --- 3 Comparison Mode examples:
+def compare_mode_1(dimension, name_a, name_b, a_data, b_data):
+    results = []
+    all_attrs = set(a_data.keys()) | set(b_data.keys())
+    for attr in all_attrs:
+        va = a_data.get(attr, "")
+        vb = b_data.get(attr, "")
+        if va != vb:
+            if va and not vb:
+                results.append({
+                    "Dimension": dimension, "Name": name_a,
+                    "Attribute": attr, "Value": va, "Missing In": "MASTER"
+                })
+            elif vb and not va:
+                results.append({
+                    "Dimension": dimension, "Name": name_b,
+                    "Attribute": attr, "Value": vb, "Missing In": "ERP"
+                })
+            else:
+                # both exist but differ
+                results.append({
+                    "Dimension": dimension, "Name": name_a,
+                    "Attribute": attr, "Value": va, "Missing In": "MASTER"
+                })
+                results.append({
+                    "Dimension": dimension, "Name": name_b,
+                    "Attribute": attr, "Value": vb, "Missing In": "ERP"
+                })
+    return results
+
+def compare_mode_2(dimension, name_a, name_b, a_data, b_data):
+    results = []
+    if name_a and name_b and (name_a == name_b):
+        # Name matched, compare attributes
+        all_attrs = set(a_data.keys()) | set(b_data.keys())
+        all_attrs.discard("Name")
+        for attr in all_attrs:
+            va = a_data.get(attr, "")
+            vb = b_data.get(attr, "")
+            if va != vb:
+                if va and not vb:
+                    results.append({
+                        "Dimension": dimension, "Name": name_a,
+                        "Attribute": attr, "Value": va, "Missing In": "MASTER"
+                    })
+                elif vb and not va:
+                    results.append({
+                        "Dimension": dimension, "Name": name_a,
+                        "Attribute": attr, "Value": vb, "Missing In": "ERP"
+                    })
+                else:
+                    results.append({
+                        "Dimension": dimension, "Name": name_a,
+                        "Attribute": attr, "Value": va, "Missing In": "MASTER"
+                    })
+                    results.append({
+                        "Dimension": dimension, "Name": name_a,
+                        "Attribute": attr, "Value": vb, "Missing In": "ERP"
+                    })
+    else:
+        # if name missing on one side, just show that name is missing (skip attributes)
+        if name_a and not name_b:
+            results.append({
+                "Dimension": dimension, "Name": name_a,
+                "Attribute": "Name", "Value": name_a, "Missing In": "MASTER"
+            })
+        elif name_b and not name_a:
+            results.append({
+                "Dimension": dimension, "Name": name_b,
+                "Attribute": "Name", "Value": name_b, "Missing In": "ERP"
+            })
+    return results
+
+def compare_mode_3(dimension, name_a, name_b, a_data, b_data):
+    results = []
+    # Show missing + matching
+    all_attrs = set(a_data.keys()) | set(b_data.keys())
+    for attr in all_attrs:
+        va = a_data.get(attr, "")
+        vb = b_data.get(attr, "")
+        if va == vb:
+            # If you want to *exclude* identical, skip. If you want to show, add a row:
+            results.append({
+                "Dimension": dimension, "Name": name_a if name_a else name_b,
+                "Attribute": attr, "Value": va, "Missing In": ""
+            })
+        else:
+            # difference
+            if va and not vb:
+                results.append({
+                    "Dimension": dimension, "Name": name_a,
+                    "Attribute": attr, "Value": va, "Missing In": "MASTER"
+                })
+            elif vb and not va:
+                results.append({
+                    "Dimension": dimension, "Name": name_b,
+                    "Attribute": attr, "Value": vb, "Missing In": "ERP"
+                })
+            else:
+                results.append({
+                    "Dimension": dimension, "Name": name_a,
+                    "Attribute": attr, "Value": va, "Missing In": "MASTER"
+                })
+                results.append({
+                    "Dimension": dimension, "Name": name_a if name_a else name_b,
+                    "Attribute": attr, "Value": vb, "Missing In": "ERP"
+                })
+    return results
+
+# --------------- EXCEPTIONS ---------------
+def read_exception_table(exc_path: Path) -> pd.DataFrame:
+    if exc_path.is_file():
+        try:
+            return pd.read_excel(exc_path, sheet_name=0)
+        except Exception as e:
+            logging.error(f"Error reading exception table: {e}")
+    return pd.DataFrame()
+
+def merge_exceptions(df_diff: pd.DataFrame, df_exc: pd.DataFrame) -> pd.DataFrame:
+    if df_diff.empty or df_exc.empty or "Key" not in df_diff.columns:
+        return df_diff
+    keep_cols = [c for c in df_exc.columns if c in ["Key", "Comments_1", "Comments_2", "hide exception"]]
+    if not keep_cols:
+        return df_diff
+    exc = df_exc[keep_cols].copy()
+    exc["Key"] = exc["Key"].astype(str).str.strip()
+    merged = df_diff.merge(exc, on="Key", how="left", suffixes=("", "_exc"))
+    # apply hide
+    merged["hide exception"] = merged.get("hide exception", "").fillna("").str.lower()
+    final = merged[merged["hide exception"] != "yes"].copy()
+    # override comments
+    if "Comments_1_exc" in final.columns:
+        final["Comments_1"] = final["Comments_1_exc"].where(final["Comments_1_exc"].notna(), final["Comments_1"])
+        final.drop(columns=["Comments_1_exc"], inplace=True)
+    if "Comments_2_exc" in final.columns:
+        final["Comments_2"] = final["Comments_2_exc"].where(final["Comments_2_exc"].notna(), final["Comments_2"])
+        final.drop(columns=["Comments_2_exc"], inplace=True)
+    if "hide exception" in final.columns:
+        final.drop(columns=["hide exception"], inplace=True)
+    return final
+
+# --------------- OUTPUT ---------------
+def write_results(df: pd.DataFrame, out_path: Path, mode: int):
+    if df.empty:
+        logging.info("No differences to write.")
+        return
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # final columns
+    final_cols = ["Key", "Dimension", "Name", "Attribute", "Value", "Comments_1", "Comments_2", "Action Item", "Missing In"]
+    for c in final_cols:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[final_cols]
+    
+    # If mode=3 is big, break into multiple sheets
+    max_rows_per_sheet = 30000 if mode == 3 else 1000000
+    wb = Workbook()
+    sheet_count = 1
+    start = 0
+    while start < len(df):
+        end = min(start + max_rows_per_sheet, len(df))
+        chunk = df.iloc[start:end]
+        if sheet_count == 1:
+            ws = wb.active
+            ws.title = f"Results{sheet_count}"
+        else:
+            ws = wb.create_sheet(f"Results{sheet_count}")
+        ws.append(final_cols)
+        for row in chunk.itertuples(index=False):
+            ws.append(row)
+        
+        # format
+        header_font = Font(bold=True)
+        fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = fill
+            cell.alignment = Alignment(horizontal="center")
+        for col in ws.columns:
+            max_len = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                val = str(cell.value) if cell.value else ""
+                max_len = max(max_len, len(val))
+            ws.column_dimensions[col_letter].width = max_len + 2
+        ws.freeze_panes = "A2"
+        
+        sheet_count += 1
+        start = end
+
+    wb.save(out_path)
+    logging.info(f"Wrote results to {out_path}")
+
+# --------------- MAIN GUI ---------------
+class MainApp(ctk.CTk):
+    def __init__(self, config_path: Path):
+        super().__init__()
+        self.title("ERP vs Master Config - Excel-like UI")
+        self.geometry("1500x900")
+        
+        self.config_path = config_path
+        self.config = load_config(config_path)
+
+        # Create Notebook
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
+
+        # Tab 1: ERP
+        self.erp_tab = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.erp_tab, text="ERP Config")
+        self.erp_grid = ExcelGrid(self.erp_tab, self.config["erp_grid"], name="ERP")
+        self.erp_grid.pack(fill="both", expand=True)
+
+        # Tab 2: Master
+        self.master_tab = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.master_tab, text="Master Config")
+        self.master_grid = ExcelGrid(self.master_tab, self.config["master_grid"], name="Master")
+        self.master_grid.pack(fill="both", expand=True)
+
+        # Tab 3: Exceptions & Compare
+        self.compare_tab = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.compare_tab, text="Exceptions & Compare")
+        self.build_compare_tab(self.compare_tab)
+
+        # Logging box (optional)
+        self.log_box = ctk.CTkTextbox(self, height=120)
+        self.log_box.pack(fill="both", expand=False, padx=5, pady=5)
+        self.log_box.configure(state="disabled")
+        # Hook logging to the box
+        handler = TextHandler(self.log_box)
+        handler.setLevel(logging.INFO)
+        logging.getLogger().addHandler(handler)
+
+        # Load initial data
+        self.refresh_erp_data()
+        self.refresh_master_data()
+
+    def build_compare_tab(self, parent):
+        frame = ctk.CTkFrame(parent)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Paths for exception, output
+        row1 = ctk.CTkFrame(frame)
+        row1.pack(fill="x", pady=5)
+        ctk.CTkLabel(row1, text="Exception Table:").pack(side="left", padx=5)
+        self.exc_var = tk.StringVar(value=self.config["paths"].get("EXCEPTION_PATH", DEFAULT_PATHS["EXCEPTION_PATH"]))
+        exc_entry = ctk.CTkEntry(row1, textvariable=self.exc_var, width=400)
+        exc_entry.pack(side="left", padx=5)
+        ctk.CTkButton(row1, text="Browse", command=lambda: self.browse_file(self.exc_var)).pack(side="left")
+
+        row2 = ctk.CTkFrame(frame)
+        row2.pack(fill="x", pady=5)
+        ctk.CTkLabel(row2, text="Output Path:").pack(side="left", padx=5)
+        self.out_var = tk.StringVar(value=self.config["paths"].get("OUTPUT_PATH", DEFAULT_PATHS["OUTPUT_PATH"]))
+        out_entry = ctk.CTkEntry(row2, textvariable=self.out_var, width=400)
+        out_entry.pack(side="left", padx=5)
+        ctk.CTkButton(row2, text="Browse", command=lambda: self.browse_file(self.out_var)).pack(side="left")
+
+        # Comparison options
+        self.mode_var = tk.IntVar(value=self.config.get("comparison_option", 1))
+        for i, txt in enumerate([
+            "Option 1 - Show missing in ERP or MASTER",
+            "Option 2 - If Name missing, hide attributes, else show missing attributes",
+            "Option 3 - Show missing + matching (splits large data)"
+        ], start=1):
+            ctk.CTkRadioButton(frame, text=txt, variable=self.mode_var, value=i).pack(anchor="w", padx=20, pady=2)
+
+        # Buttons
+        btn_frame = ctk.CTkFrame(frame)
+        btn_frame.pack(fill="x", pady=10)
+        ctk.CTkButton(btn_frame, text="Run Comparison", command=self.run_comparison).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Save Config", command=self.on_save_config).pack(side="left", padx=5)
+
+    def browse_file(self, var: tk.StringVar):
+        path = filedialog.askopenfilename()
+        if path:
+            var.set(path)
+
+    def refresh_erp_data(self):
+        """Load ERP data from self.config paths, set in ERP grid."""
+        erp_path = Path(self.config["paths"].get("ERP_EXCEL_PATH", DEFAULT_PATHS["ERP_EXCEL_PATH"]))
+        df = read_erp_data(erp_path)
+        self.erp_grid.set_data(df)
+
+    def refresh_master_data(self):
+        master_path = Path(self.config["paths"].get("MASTER_ZIP_PATH", DEFAULT_PATHS["MASTER_ZIP_PATH"]))
+        df = read_master_data(master_path)
+        self.master_grid.set_data(df)
+
+    def run_comparison(self):
+        """
+        Gather the currently filtered/visible ERP & Master data from the grids.
+        Melt them down, compare, merge exceptions, output.
+        """
+        # Update config with new paths
+        self.config["paths"]["EXCEPTION_PATH"] = self.exc_var.get().strip()
+        self.config["paths"]["OUTPUT_PATH"] = self.out_var.get().strip()
+        self.config["comparison_option"] = self.mode_var.get()
+
+        # 1) Grab final filtered data from grids
+        df_erp_filt = self.erp_grid.get_filtered_df()
+        df_master_filt = self.master_grid.get_filtered_df()
+        if df_erp_filt.empty:
+            messagebox.showwarning("Warning", "ERP data is empty after filtering.")
+        if df_master_filt.empty:
+            messagebox.showwarning("Warning", "Master data is empty after filtering.")
+
+        # 2) Melt
+        df_erp_melt = meltdown_erp(df_erp_filt)
+        df_erp_melt = build_keys(df_erp_melt)
+        df_master_melt = meltdown_master(df_master_filt)
+        df_master_melt = build_keys(df_master_melt)
+
+        # 3) Compare
+        mode = self.mode_var.get()
+        df_diff = compare_data(df_erp_melt, df_master_melt, mode)
+
+        # 4) Merge exceptions
+        exc_path = Path(self.exc_var.get().strip())
+        df_exc = read_exception_table(exc_path)
+        final = merge_exceptions(df_diff, df_exc)
+
+        # 5) Output
+        out_path = Path(self.out_var.get().strip())
+        write_results(final, out_path, mode)
+        messagebox.showinfo("Done", f"Comparison complete. Output: {out_path}")
+
+    def on_save_config(self):
+        """
+        Save the entire UI config (columns, filters) from both grids + paths + comparison mode.
+        """
+        # Update self.config with current states
+        self.config["erp_grid"] = self.erp_grid.get_config_block()
+        self.config["master_grid"] = self.master_grid.get_config_block()
+
+        self.config["paths"]["ERP_EXCEL_PATH"] = self.config["paths"].get("ERP_EXCEL_PATH", DEFAULT_PATHS["ERP_EXCEL_PATH"])
+        self.config["paths"]["MASTER_ZIP_PATH"] = self.config["paths"].get("MASTER_ZIP_PATH", DEFAULT_PATHS["MASTER_ZIP_PATH"])
+        self.config["paths"]["EXCEPTION_PATH"] = self.exc_var.get().strip()
+        self.config["paths"]["OUTPUT_PATH"] = self.out_var.get().strip()
+
+        self.config["comparison_option"] = self.mode_var.get()
+
+        save_config(self.config, self.config_path)
+
+
+# ---------------- MAIN ----------------
+def main():
+    app = MainApp(Path(DEFAULT_PATHS["CONFIG_PATH"]))
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()

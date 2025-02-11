@@ -1,0 +1,958 @@
+x-r-p-v-1
+
+"""
+Mega Reconciliation UI with daily-run "history" for trend.
+- Each "Run Comparison" stamps the mismatch rows with today's date.
+- The Dashboard line chart groups by date to show how many mismatches occurred each day.
+"""
+
+import os
+import json
+import logging
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Set, Tuple
+from datetime import datetime
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+import customtkinter as ctk
+import pandas as pd
+import numpy as np
+
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# Optional encoding detection
+try:
+    import chardet
+except ImportError:
+    chardet = None
+
+# -------------- LOGGING --------------
+def setup_logger():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s"
+    )
+setup_logger()
+
+# -------------- DEFAULTS & CONFIG --------------
+DEFAULT_PATHS = {
+    "XRP_EXCEL_PATH": "data/XRP_Config.xlsx",
+    "MASTER_ZIP_PATH": "data/Master_Config.zip",
+    "EXCEPTION_PATH": "data/Exception_Table.xlsx",
+    "OUTPUT_PATH": "output/Reconciliation.xlsx",
+    "CONFIG_PATH": "config/ui_config.json"
+}
+
+def default_config() -> Dict:
+    return {
+        "paths": {
+            "XRP_EXCEL_PATH": DEFAULT_PATHS["XRP_EXCEL_PATH"],
+            "MASTER_ZIP_PATH": DEFAULT_PATHS["MASTER_ZIP_PATH"],
+            "EXCEPTION_PATH": DEFAULT_PATHS["EXCEPTION_PATH"],
+            "OUTPUT_PATH": DEFAULT_PATHS["OUTPUT_PATH"],
+            "CONFIG_PATH": DEFAULT_PATHS["CONFIG_PATH"]
+        },
+        "XRP_grid": {
+            "columns": [
+                {"id": "Col1",           "name": "Col1",           "locked": False, "visible": True,  "renameable": True},
+                {"id": "Col2",           "name": "Col2",           "locked": False, "visible": True,  "renameable": True},
+                {"id": "Enabled_Flag",   "name": "Enabled_Flag",   "locked": False, "visible": True,  "renameable": True},
+                {"id": "Dimension_Name", "name": "Dimension_Name", "locked": True,  "visible": True,  "renameable": False},
+                {"id": "Value",          "name": "Value",          "locked": True,  "visible": True,  "renameable": False},
+            ],
+            "filters": {}
+        },
+        "master_grid": {
+            "columns": [
+                {"id": "Name",       "name": "Name",       "locked": True,  "visible": True, "renameable": False},
+                {"id": "Dimension",  "name": "Dimension",  "locked": True,  "visible": True, "renameable": False},
+            ],
+            "filters": {}
+        },
+        "dimension_renames": {},
+        "comparison_option": 1
+    }
+
+def load_config(path: Path) -> Dict:
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load config from {path}: {e}")
+    return default_config()
+
+def save_config(cfg: Dict, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        logging.info(f"Saved config to {path}")
+    except Exception as e:
+        logging.error(f"Error saving config: {e}")
+
+# -------------- LOG HANDLER --------------
+class TextHandler(logging.Handler):
+    def __init__(self, widget: ctk.CTkTextbox):
+        super().__init__()
+        self.widget = widget
+
+    def emit(self, record):
+        msg = self.format(record) + "\n"
+        self.widget.after(0, self._append, msg)
+
+    def _append(self, msg):
+        self.widget.configure(state="normal")
+        self.widget.insert("end", msg)
+        self.widget.see("end")
+        self.widget.configure(state="disabled")
+
+# -------------- EXCEL-LIKE GRID --------------
+class ExcelGrid(ctk.CTkFrame):
+    def __init__(self, parent, config_block: Dict, name: str):
+        super().__init__(parent)
+        self.name = name
+        self.col_defs = config_block.get("columns", [])
+        filter_block = config_block.get("filters", {})
+        self.filters = {}
+        for col_id, val_list in filter_block.items():
+            self.filters[col_id] = set(val_list) if isinstance(val_list, list) else set()
+
+        self.df = pd.DataFrame()
+
+        self.create_toolbar()
+        self.create_table()
+        self.create_statusbar()
+
+    def create_toolbar(self):
+        bar = ctk.CTkFrame(self)
+        bar.pack(fill="x", padx=5, pady=5)
+        ctk.CTkButton(bar, text="Manage Columns", command=self.show_column_manager).pack(side="left", padx=5)
+        ctk.CTkButton(bar, text="Clear Filters", command=self.clear_filters).pack(side="left", padx=5)
+
+    def create_table(self):
+        container = ctk.CTkFrame(self)
+        container.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.tree = ttk.Treeview(container, show="headings")
+        vsb = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(container, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+    def create_statusbar(self):
+        self.status_label = ctk.CTkLabel(self, text="Ready")
+        self.status_label.pack(fill="x", padx=5, pady=2)
+
+    def set_data(self, df: pd.DataFrame):
+        self.df = df.copy(deep=True)
+        existing_ids = [c["id"] for c in self.col_defs]
+        for col in self.df.columns:
+            if col not in existing_ids:
+                self.col_defs.append({
+                    "id": col,
+                    "name": col,
+                    "locked": False,
+                    "visible": True,
+                    "renameable": True
+                })
+        self.refresh_table()
+
+    def get_config_block(self) -> Dict:
+        return {
+            "columns": self.col_defs,
+            "filters": {col_id: sorted(list(vals)) for col_id, vals in self.filters.items()}
+        }
+
+    def get_filtered_df(self) -> pd.DataFrame:
+        if self.df.empty:
+            return self.df
+        df_f = self.df.copy()
+        for col_id, allowed_vals in self.filters.items():
+            if col_id in df_f.columns and allowed_vals:
+                df_f = df_f[df_f[col_id].isin(allowed_vals)]
+        visible_ids = [c["id"] for c in self.col_defs if c.get("visible", True)]
+        visible_ids = [c for c in visible_ids if c in df_f.columns]
+        return df_f[visible_ids]
+
+    def refresh_table(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        visible_cols = [c for c in self.col_defs if c.get("visible", True)]
+        self.tree["columns"] = [c["id"] for c in visible_cols]
+        for col in visible_cols:
+            self.tree.heading(
+                col["id"],
+                text=col["name"],
+                anchor="w",
+                command=lambda c=col: self.show_filter_popup(c)
+            )
+            self.tree.column(col["id"], anchor="w", width=col.get("width", 150))
+
+        df_f = self.get_filtered_df()
+        for idx, row in df_f.iterrows():
+            vals = [row[c["id"]] for c in visible_cols]
+            self.tree.insert("", "end", values=vals)
+        self.status_label.configure(text=f"{len(df_f)} rows")
+
+    def show_filter_popup(self, col_def: Dict):
+        col_id = col_def["id"]
+        if self.df.empty or col_id not in self.df.columns:
+            return
+        popup = tk.Toplevel(self)
+        popup.title(f"Filter: {col_def['name']}")
+        popup.geometry("300x400")
+
+        frame = ctk.CTkFrame(popup)
+        frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        series = self.df[col_id].dropna().unique()
+        unique_vals = sorted(series, key=lambda x: str(x))
+        current_filter = self.filters.get(col_id, set())
+        if not current_filter:
+            current_filter = set(unique_vals)
+
+        select_all_var = tk.BooleanVar(value=True)
+        def toggle_select_all():
+            new_val = select_all_var.get()
+            for vb in var_dict.values():
+                vb.set(new_val)
+
+        ctk.CTkCheckBox(frame, text="Select All", variable=select_all_var, command=toggle_select_all).pack(anchor="w")
+
+        scroll = ctk.CTkScrollableFrame(frame, width=250, height=250)
+        scroll.pack(fill="both", expand=True, padx=5, pady=5)
+
+        var_dict = {}
+        for val in unique_vals:
+            var = tk.BooleanVar(value=(val in current_filter))
+            var_dict[val] = var
+            ctk.CTkCheckBox(scroll, text=str(val), variable=var).pack(anchor="w")
+
+        def apply_filter():
+            selected = {v for v, vb in var_dict.items() if vb.get()}
+            self.filters[col_id] = selected
+            popup.destroy()
+            self.refresh_table()
+
+        btn_frame = ctk.CTkFrame(frame)
+        btn_frame.pack(fill="x", pady=5)
+        ctk.CTkButton(btn_frame, text="Apply", command=apply_filter).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", command=popup.destroy).pack(side="left", padx=5)
+
+    def show_column_manager(self):
+        cm = tk.Toplevel(self)
+        cm.title(f"{self.name} Column Manager")
+        scrolled = ctk.CTkScrollableFrame(cm, width=500, height=400)
+        scrolled.pack(fill="both", expand=True)
+
+        for i, col in enumerate(self.col_defs):
+            rowf = ctk.CTkFrame(scrolled)
+            rowf.pack(fill="x", pady=2)
+
+            if col.get("locked", False):
+                ctk.CTkLabel(rowf, text=f"[LOCKED] {col['name']}").pack(side="left", padx=5)
+                continue
+
+            var_vis = tk.BooleanVar(value=col.get("visible", True))
+            def toggler(c=col, v=var_vis):
+                c["visible"] = v.get()
+                self.refresh_table()
+
+            ctk.CTkCheckBox(rowf, text="", variable=var_vis, command=toggler).pack(side="left")
+
+            if col.get("renameable", True):
+                ctk.CTkButton(rowf, text=col["name"][:20], command=lambda c=col: self.rename_column(c)).pack(side="left", padx=5)
+            else:
+                ctk.CTkLabel(rowf, text=col["name"]).pack(side="left", padx=5)
+
+            ctk.CTkButton(rowf, text="↑", width=30, command=lambda idx=i: self.move_column(idx, -1)).pack(side="right", padx=2)
+            ctk.CTkButton(rowf, text="↓", width=30, command=lambda idx=i: self.move_column(idx, 1)).pack(side="right", padx=2)
+
+    def rename_column(self, col: Dict):
+        new_name = simpledialog.askstring("Rename Column", f"New name for {col['name']}", initialvalue=col["name"])
+        if new_name:
+            col["name"] = new_name
+            self.refresh_table()
+
+    def move_column(self, idx: int, delta: int):
+        new_idx = idx + delta
+        if 0 <= new_idx < len(self.col_defs):
+            self.col_defs[idx], self.col_defs[new_idx] = self.col_defs[new_idx], self.col_defs[idx]
+            self.refresh_table()
+
+    def clear_filters(self):
+        self.filters.clear()
+        self.refresh_table()
+
+# -------------- DATA READING --------------
+def read_XRP_data(xlsx_path: Path) -> pd.DataFrame:
+    if not xlsx_path.is_file():
+        logging.warning(f"XRP path not found: {xlsx_path}")
+        return pd.DataFrame()
+    try:
+        df = pd.read_excel(xlsx_path, skiprows=3)
+        df.columns = df.columns.str.strip()
+        return df
+    except Exception as e:
+        logging.error(f"Error reading XRP Excel: {e}")
+        return pd.DataFrame()
+
+def read_master_data(zip_path: Path) -> pd.DataFrame:
+    if not zip_path.is_file():
+        logging.warning(f"Master ZIP not found: {zip_path}")
+        return pd.DataFrame()
+    all_dfs = []
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+            for txt_file in txt_files:
+                try:
+                    base_name = os.path.basename(txt_file)
+                    if "_ceaster.txt" in base_name.lower():
+                        base_dim = base_name.lower().replace("_ceaster.txt", "")
+                    else:
+                        base_dim, _ = os.path.splitext(base_name)
+                    dimension = base_dim.replace("_", " ").title()
+
+                    with z.open(txt_file) as fo:
+                        if chardet:
+                            sample = fo.read(1024)
+                            encoding = chardet.detect(sample)["encoding"] or "utf-8"
+                            fo.seek(0)
+                        else:
+                            encoding = "utf-8"
+                        try:
+                            df_part = pd.read_csv(
+                                fo,
+                                encoding=encoding,
+                                delimiter=",",
+                                on_bad_lines="skip",
+                                errors="replace"
+                            )
+                        except Exception:
+                            fo.seek(0)
+                            df_part = pd.read_csv(
+                                fo,
+                                encoding="latin-1",
+                                delimiter=",",
+                                on_bad_lines="skip",
+                                errors="replace"
+                            )
+                    df_part.columns = df_part.columns.str.strip()
+                    first_col = df_part.columns[0]
+                    df_part.rename(columns={first_col: "Name"}, inplace=True)
+                    df_part["Dimension"] = dimension
+                    all_dfs.append(df_part)
+                except Exception as e2:
+                    logging.error(f"Error reading {txt_file}: {e2}")
+    except Exception as e:
+        logging.error(f"Error opening zip: {e}")
+    if all_dfs:
+        return pd.concat(all_dfs, ignore_index=True)
+    return pd.DataFrame()
+
+# -------------- MELTDOWN & KEYS --------------
+def meltdown_XRP(df: pd.DataFrame, dim_renames: Dict[str,str]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    skip_cols = {"Col1","Col2","Enabled_Flag"}
+    keep_cols = [c for c in df.columns if c not in skip_cols]
+    id_vars = []
+    if "Dimension_Name" in keep_cols:
+        id_vars.append("Dimension_Name")
+    if "Value" in keep_cols:
+        id_vars.append("Value")
+    value_vars = [c for c in keep_cols if c not in id_vars]
+
+    melted = df.melt(
+        id_vars=id_vars,
+        value_vars=value_vars,
+        var_name="Attribute",
+        value_name="Value"
+    )
+    melted.rename(columns={"Dimension_Name":"Dimension","Value":"RefName"}, inplace=True)
+    if dim_renames:
+        melted["Dimension"] = melted["Dimension"].replace(dim_renames)
+    return melted[["Dimension","RefName","Attribute","Value"]].copy()
+
+def meltdown_master(df: pd.DataFrame, dim_renames: Dict[str,str]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    keep_cols = df.columns.tolist()
+    id_vars = [c for c in ["Dimension","Name"] if c in keep_cols]
+    value_vars = [c for c in keep_cols if c not in id_vars]
+    melted = df.melt(
+        id_vars=id_vars,
+        value_vars=value_vars,
+        var_name="Attribute",
+        value_name="Value"
+    )
+    melted.rename(columns={"Name":"RefName"}, inplace=True)
+    if dim_renames:
+        melted["Dimension"] = melted["Dimension"].replace(dim_renames)
+    return melted[["Dimension","RefName","Attribute","Value"]].copy()
+
+def build_keys(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in ["Dimension","RefName","Attribute","Value"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+    df["GroupKey"] = df["Dimension"] + " | " + df["RefName"]
+    df["Key"] = df["Dimension"] + " | " + df["RefName"] + " | " + df["Attribute"] + " | " + df["Value"]
+    df["Comments_1"] = ""
+    df["Comments_2"] = ""
+    df["Action Item"] = ""
+    df["Missing In"] = ""
+    return df
+
+# -------------- COMPARISON --------------
+def compare_data(df_XRP: pd.DataFrame, df_master: pd.DataFrame, mode: int) -> pd.DataFrame:
+    XRP_dict = build_lookup_dict(df_XRP)
+    mst_dict = build_lookup_dict(df_master)
+    all_keys = set(XRP_dict.keys()) | set(mst_dict.keys())
+    results = []
+    for gk in all_keys:
+        dim = gk.split(" | ")[0]
+        a_data = XRP_dict.get(gk, {})
+        b_data = mst_dict.get(gk, {})
+        name_a = a_data.get("Name", a_data.get("RefName", ""))
+        name_b = b_data.get("Name", b_data.get("RefName", ""))
+
+        if mode == 1:
+            results.extend(compare_mode_1(dim, name_a, name_b, a_data, b_data))
+        elif mode == 2:
+            results.extend(compare_mode_2(dim, name_a, name_b, a_data, b_data))
+        else:
+            results.extend(compare_mode_3(dim, name_a, name_b, a_data, b_data))
+    df_diff = pd.DataFrame(results)
+    if not df_diff.empty:
+        df_diff["Key"] = (
+            df_diff["Dimension"] + " | " +
+            df_diff["Name"] + " | " +
+            df_diff["Attribute"] + " | " +
+            df_diff["Value"]
+        )
+    return df_diff
+
+def build_lookup_dict(df: pd.DataFrame) -> Dict[str,Dict[str,str]]:
+    lookup = {}
+    for gk,grp in df.groupby("GroupKey"):
+        rec = {}
+        ref = grp["RefName"].iloc[0] if not grp.empty else ""
+        rec["Name"] = ref
+        for _, row in grp.iterrows():
+            rec[row["Attribute"]] = row["Value"]
+        lookup[gk] = rec
+    return lookup
+
+def compare_mode_1(dim, name_a, name_b, a_data, b_data):
+    results = []
+    all_attrs = set(a_data.keys()) | set(b_data.keys())
+    for attr in all_attrs:
+        va = a_data.get(attr, "")
+        vb = b_data.get(attr, "")
+        if va != vb:
+            if va and not vb:
+                results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
+            elif vb and not va:
+                results.append({"Dimension": dim, "Name": name_b, "Attribute": attr, "Value": vb, "Missing In": "XRP"})
+            else:
+                results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
+                results.append({"Dimension": dim, "Name": name_b, "Attribute": attr, "Value": vb, "Missing In": "XRP"})
+    return results
+
+def compare_mode_2(dim, name_a, name_b, a_data, b_data):
+    results = []
+    if name_a and name_b and (name_a == name_b):
+        all_attrs = (set(a_data.keys()) | set(b_data.keys())) - {"Name"}
+        for attr in all_attrs:
+            va = a_data.get(attr, "")
+            vb = b_data.get(attr, "")
+            if va != vb:
+                if va and not vb:
+                    results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
+                elif vb and not va:
+                    results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": vb, "Missing In": "XRP"})
+                else:
+                    results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
+                    results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": vb, "Missing In": "XRP"})
+    else:
+        if name_a and not name_b:
+            results.append({"Dimension": dim, "Name": name_a, "Attribute": "Name", "Value": name_a, "Missing In": "MASTER"})
+        elif name_b and not name_a:
+            results.append({"Dimension": dim, "Name": name_b, "Attribute": "Name", "Value": name_b, "Missing In": "XRP"})
+    return results
+
+def compare_mode_3(dim, name_a, name_b, a_data, b_data):
+    results = []
+    all_attrs = set(a_data.keys()) | set(b_data.keys())
+    for attr in all_attrs:
+        va = a_data.get(attr, "")
+        vb = b_data.get(attr, "")
+        if va == vb:
+            results.append({"Dimension": dim, "Name": name_a if name_a else name_b, "Attribute": attr, "Value": va, "Missing In": ""})
+        else:
+            if va and not vb:
+                results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
+            elif vb and not va:
+                results.append({"Dimension": dim, "Name": name_b, "Attribute": attr, "Value": vb, "Missing In": "XRP"})
+            else:
+                results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
+                results.append({"Dimension": dim, "Name": name_a if name_a else name_b, "Attribute": attr, "Value": vb, "Missing In": "XRP"})
+    return results
+
+# -------------- EXCEPTIONS --------------
+def read_exception_table(exc_path: Path) -> pd.DataFrame:
+    if exc_path.is_file():
+        try:
+            return pd.read_excel(exc_path, sheet_name=0)
+        except Exception as e:
+            logging.error(f"Error reading exception: {e}")
+    return pd.DataFrame()
+
+def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or df_exc.empty or "Key" not in df.columns:
+        return df
+    keep = [c for c in df_exc.columns if c in ["Key","Comments_1","Comments_2","hide exception"]]
+    if not keep:
+        return df
+    exc = df_exc[keep].copy()
+    exc["Key"] = exc["Key"].astype(str).str.strip()
+    merged = df.merge(exc, on="Key", how="left", suffixes=("", "_exc"))
+    merged["hide exception"] = merged.get("hide exception", "").fillna("").str.lower()
+    final = merged[merged["hide exception"]!="yes"].copy()
+    if "Comments_1_exc" in final.columns:
+        final["Comments_1"] = final["Comments_1_exc"].where(final["Comments_1_exc"].notna(), final["Comments_1"])
+        final.drop(columns=["Comments_1_exc"], inplace=True)
+    if "Comments_2_exc" in final.columns:
+        final["Comments_2"] = final["Comments_2_exc"].where(final["Comments_2_exc"].notna(), final["Comments_2"])
+        final.drop(columns=["Comments_2_exc"], inplace=True)
+    if "hide exception" in final.columns:
+        final.drop(columns=["hide exception"], inplace=True)
+    return final
+
+# -------------- OUTPUT --------------
+def write_results(df: pd.DataFrame, out_path: Path, mode: int):
+    if df.empty:
+        logging.info("No differences to write.")
+        return
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    final_cols = ["Key","Dimension","Name","Attribute","Value","Comments_1","Comments_2","Action Item","Missing In"]
+    for c in final_cols:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[final_cols]
+
+    max_rows_per_sheet = 30000 if mode==3 else 999999
+    wb = Workbook()
+    sheet_count = 1
+    start = 0
+    while start < len(df):
+        end = min(start+max_rows_per_sheet, len(df))
+        chunk = df.iloc[start:end]
+        if sheet_count == 1:
+            ws = wb.active
+            ws.title = f"Results{sheet_count}"
+        else:
+            ws = wb.create_sheet(title=f"Results{sheet_count}")
+        ws.append(final_cols)
+        for row in chunk.itertuples(index=False):
+            ws.append(row)
+        # format
+        header_font = Font(bold=True)
+        fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = fill
+            cell.alignment = Alignment(horizontal="center")
+        for col in ws.columns:
+            max_len = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                val = str(cell.value) if cell.value is not None else ""
+                max_len = max(max_len, len(val))
+            ws.column_dimensions[col_letter].width = max_len + 2
+        ws.freeze_panes = "A2"
+        sheet_count += 1
+        start = end
+    wb.save(out_path)
+    logging.info(f"Results saved to {out_path}")
+
+# -------------- DASHBOARD --------------
+class Dashboard(ctk.CTkFrame):
+    """
+    We store mismatch data from the most recent run (df_current)
+    and a history of all runs (df_history). We group by date in the final line chart.
+    """
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.df_current = pd.DataFrame()
+        self.df_history = pd.DataFrame()
+        self.create_widgets()
+
+    def create_widgets(self):
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
+
+        self.frame_heatmap = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.frame_heatmap, text="Discrepancy Heatmap")
+
+        self.frame_status = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.frame_status, text="Status Distribution")
+
+        self.frame_dimension = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.frame_dimension, text="Dimension Analysis")
+
+        self.frame_attribute = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.frame_attribute, text="Attribute Comparison")
+
+        self.frame_linechart = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.frame_linechart, text="Trend Over Days")
+
+    def update_data(self, df_current: pd.DataFrame, df_history: pd.DataFrame):
+        self.df_current = df_current.copy()
+        self.df_history = df_history.copy()
+        self.plot_heatmap()
+        self.plot_status_distribution()
+        self.plot_dimension_analysis()
+        self.plot_attribute_comparison()
+        self.plot_run_trend()
+
+    def plot_heatmap(self):
+        for w in self.frame_heatmap.winfo_children():
+            w.destroy()
+        if self.df_current.empty:
+            return
+
+        mismatch_df = self.df_current[self.df_current["Missing In"] != ""]
+        pivot_df = mismatch_df.groupby(["Dimension","Attribute"]).size().unstack(fill_value=0)
+        if pivot_df.empty:
+            return
+
+        fig, ax = plt.subplots(figsize=(6,5))
+        cax = ax.imshow(pivot_df, cmap="Reds", aspect="auto")
+        ax.set_xticks(range(len(pivot_df.columns)))
+        ax.set_yticks(range(len(pivot_df.index)))
+        ax.set_xticklabels(pivot_df.columns, rotation=90)
+        ax.set_yticklabels(pivot_df.index)
+        ax.set_title("Discrepancy Heatmap")
+
+        fig.colorbar(cax, ax=ax)
+
+        canvas = FigureCanvasTkAgg(fig, master=self.frame_heatmap)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def plot_status_distribution(self):
+        for w in self.frame_status.winfo_children():
+            w.destroy()
+        if self.df_current.empty:
+            return
+        dist_counts = self.df_current["Missing In"].fillna("").value_counts()
+        data_labels = dist_counts.index.tolist()
+        data_values = dist_counts.values.tolist()
+
+        fig, ax = plt.subplots(figsize=(5,5))
+        ax.pie(data_values, labels=data_labels, autopct="%.1f%%", startangle=140)
+        ax.set_title("Status Distribution (Current Run)")
+
+        canvas = FigureCanvasTkAgg(fig, master=self.frame_status)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def plot_dimension_analysis(self):
+        for w in self.frame_dimension.winfo_children():
+            w.destroy()
+        if self.df_current.empty:
+            return
+        dim_counts = self.df_current.groupby("Dimension")["Key"].count().sort_values(ascending=False)
+
+        fig, ax = plt.subplots(figsize=(6,4))
+        dim_counts.plot(kind="bar", ax=ax, color="blue")
+        ax.set_ylabel("Count of Rows")
+        ax.set_title("Records per Dimension (Current Run)")
+
+        canvas = FigureCanvasTkAgg(fig, master=self.frame_dimension)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def plot_attribute_comparison(self):
+        for w in self.frame_attribute.winfo_children():
+            w.destroy()
+        if self.df_current.empty:
+            return
+        attr_counts = self.df_current.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
+
+        fig, ax = plt.subplots(figsize=(6,4))
+        attr_counts.plot(kind="bar", ax=ax, color="red")
+        ax.set_ylabel("# of Mismatches")
+        ax.set_title("Top 10 Mismatched Attributes (Current Run)")
+
+        canvas = FigureCanvasTkAgg(fig, master=self.frame_attribute)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def plot_run_trend(self):
+        """Line chart grouping by the date (in 'RunDate')."""
+        for w in self.frame_linechart.winfo_children():
+            w.destroy()
+        if self.df_history.empty or "RunDate" not in self.df_history.columns:
+            return
+
+        # We only consider mismatch rows (Missing In != "")
+        mismatch_df = self.df_history[self.df_history["Missing In"] != ""].copy()
+        if mismatch_df.empty:
+            return
+        
+        # Group by RunDate
+        date_counts = mismatch_df.groupby("RunDate")["Key"].count().reset_index()  # columns: RunDate, Key
+
+        fig, ax = plt.subplots(figsize=(6,4))
+        ax.plot(date_counts["RunDate"], date_counts["Key"], marker="o", color="green")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Mismatch Count")
+        ax.set_title("Mismatch Trend Over Days")
+        plt.xticks(rotation=45)
+
+        # Optionally annotate each point
+        for i, row in date_counts.iterrows():
+            ax.text(row["RunDate"], row["Key"], str(row["Key"]), ha="center", va="bottom")
+
+        canvas = FigureCanvasTkAgg(fig, master=self.frame_linechart)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+# -------------- MAIN APP --------------
+class MainApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Mega Reconciliation UI - With Date-based Trend")
+        self.geometry("1600x900")
+
+        # Load config
+        self.config_dict = load_config(Path(DEFAULT_PATHS["CONFIG_PATH"]))
+
+        # We'll track multiple runs in a single "history_df"
+        self.history_df = pd.DataFrame()  # accumulates mismatch rows from each run
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
+
+        # Tab 1: Paths
+        self.tab_paths = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.tab_paths, text="Paths")
+        self.build_paths_tab(self.tab_paths)
+
+        # Tab 2: XRP
+        self.tab_XRP = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.tab_XRP, text="XRP Config")
+        self.XRP_grid = ExcelGrid(self.tab_XRP, self.config_dict["XRP_grid"], "XRP")
+        self.XRP_grid.pack(fill="both", expand=True)
+
+        # Tab 3: Master
+        self.tab_master = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.tab_master, text="Master Config")
+        self.master_grid = ExcelGrid(self.tab_master, self.config_dict["master_grid"], "Master")
+        self.master_grid.pack(fill="both", expand=True)
+
+        # Tab 4: Dimension Renames
+        self.tab_dim = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.tab_dim, text="Dimension Renames")
+        self.build_dimension_tab(self.tab_dim)
+
+        # Tab 5: Compare & Exceptions
+        self.tab_compare = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.tab_compare, text="Compare & Exceptions")
+        self.build_compare_tab(self.tab_compare)
+
+        # Tab 6: Dashboard
+        self.tab_dashboard = Dashboard(self.notebook)
+        self.notebook.add(self.tab_dashboard, text="Dashboard")
+
+        # Logging box
+        self.log_box = ctk.CTkTextbox(self, height=100)
+        self.log_box.pack(fill="both", expand=False)
+        self.log_box.configure(state="disabled")
+
+        # Hook logging
+        handler = TextHandler(self.log_box)
+        handler.setLevel(logging.INFO)
+        logging.getLogger().addHandler(handler)
+
+        # Load initial data
+        self.refresh_XRP_data()
+        self.refresh_master_data()
+
+    def build_paths_tab(self, parent):
+        frm = ctk.CTkFrame(parent)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.XRP_path_var = tk.StringVar(value=self.config_dict["paths"].get("XRP_EXCEL_PATH", DEFAULT_PATHS["XRP_EXCEL_PATH"]))
+        self.master_path_var = tk.StringVar(value=self.config_dict["paths"].get("MASTER_ZIP_PATH", DEFAULT_PATHS["MASTER_ZIP_PATH"]))
+        self.exc_path_var = tk.StringVar(value=self.config_dict["paths"].get("EXCEPTION_PATH", DEFAULT_PATHS["EXCEPTION_PATH"]))
+        self.out_path_var = tk.StringVar(value=self.config_dict["paths"].get("OUTPUT_PATH", DEFAULT_PATHS["OUTPUT_PATH"]))
+        self.cfg_path_var = tk.StringVar(value=self.config_dict["paths"].get("CONFIG_PATH", DEFAULT_PATHS["CONFIG_PATH"]))
+
+        def mkrow(lbl, var):
+            rowf = ctk.CTkFrame(frm)
+            rowf.pack(fill="x", pady=5)
+            ctk.CTkLabel(rowf, text=lbl, width=150).pack(side="left", padx=5)
+            ent = ctk.CTkEntry(rowf, textvariable=var, width=600)
+            ent.pack(side="left", padx=5)
+            def br():
+                path = filedialog.askopenfilename()
+                if path:
+                    var.set(path)
+            ctk.CTkButton(rowf, text="Browse", command=br).pack(side="left", padx=5)
+
+        mkrow("XRP Excel Path:", self.XRP_path_var)
+        mkrow("Master ZIP Path:", self.master_path_var)
+        mkrow("Exception Path:", self.exc_path_var)
+        mkrow("Output Excel Path:", self.out_path_var)
+        mkrow("JSON Config Path:", self.cfg_path_var)
+
+    def refresh_XRP_data(self):
+        df = read_XRP_data(Path(self.XRP_path_var.get()))
+        self.XRP_grid.set_data(df)
+
+    def refresh_master_data(self):
+        df = read_master_data(Path(self.master_path_var.get()))
+        self.master_grid.set_data(df)
+
+    def build_dimension_tab(self, parent):
+        frm = ctk.CTkFrame(parent)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.dim_rename_map = self.config_dict.get("dimension_renames", {})
+
+        ctk.CTkLabel(frm, text="Old Dimension -> New Dimension").pack(pady=5)
+
+        self.rename_rows = []
+        self.list_frame = ctk.CTkScrollableFrame(frm, width=600, height=300)
+        self.list_frame.pack(fill="both", expand=True)
+
+        for old_dim, new_dim in self.dim_rename_map.items():
+            self.add_dim_rename_row(old_dim, new_dim)
+
+        ctk.CTkButton(frm, text="Add New Mapping", command=lambda: self.add_dim_rename_row("", "")).pack(pady=5)
+        ctk.CTkButton(frm, text="Save Dimension Renames", command=self.save_dim_renames).pack(pady=5)
+
+    def add_dim_rename_row(self, old_val: str, new_val: str):
+        row = ctk.CTkFrame(self.list_frame)
+        row.pack(fill="x", pady=2)
+        tk_old = tk.StringVar(value=old_val)
+        tk_new = tk.StringVar(value=new_val)
+        ctk.CTkLabel(row, text="Old:").pack(side="left", padx=5)
+        ctk.CTkEntry(row, textvariable=tk_old, width=200).pack(side="left", padx=5)
+        ctk.CTkLabel(row, text=" -> ").pack(side="left")
+        ctk.CTkEntry(row, textvariable=tk_new, width=200).pack(side="left", padx=5)
+        self.rename_rows.append((tk_old, tk_new))
+
+    def save_dim_renames(self):
+        new_map = {}
+        for (tk_old, tk_new) in self.rename_rows:
+            oldv = tk_old.get().strip()
+            newv = tk_new.get().strip()
+            if oldv and newv and oldv != newv:
+                new_map[oldv] = newv
+        self.dim_rename_map = new_map
+        self.config_dict["dimension_renames"] = self.dim_rename_map
+        messagebox.showinfo("Saved", "Dimension renames saved in memory.")
+
+    def build_compare_tab(self, parent):
+        frm = ctk.CTkFrame(parent)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.mode_var = tk.IntVar(value=self.config_dict.get("comparison_option", 1))
+        for i, label in enumerate([
+            "Option 1 - Show everything missing in XRP or Master",
+            "Option 2 - If Name missing, do not show attributes, else show missing attributes",
+            "Option 3 - Show missing + matching (can be large)"
+        ], start=1):
+            ctk.CTkRadioButton(frm, text=label, variable=self.mode_var, value=i).pack(anchor="w", padx=5, pady=2)
+
+        btnf = ctk.CTkFrame(frm)
+        btnf.pack(fill="x", pady=10)
+        ctk.CTkButton(btnf, text="Run Comparison", command=self.run_comparison).pack(side="left", padx=5)
+        ctk.CTkButton(btnf, text="Save Config", command=self.save_all_config).pack(side="left", padx=5)
+
+    def run_comparison(self):
+        self.config_dict["paths"]["XRP_EXCEL_PATH"] = self.XRP_path_var.get().strip()
+        self.config_dict["paths"]["MASTER_ZIP_PATH"] = self.master_path_var.get().strip()
+        self.config_dict["paths"]["EXCEPTION_PATH"] = self.exc_path_var.get().strip()
+        self.config_dict["paths"]["OUTPUT_PATH"] = self.out_path_var.get().strip()
+        self.config_dict["paths"]["CONFIG_PATH"] = self.cfg_path_var.get().strip()
+
+        self.config_dict["comparison_option"] = self.mode_var.get()
+
+        df_XRP = self.XRP_grid.get_filtered_df()
+        df_master = self.master_grid.get_filtered_df()
+
+        dim_map = self.config_dict.get("dimension_renames", {})
+        XRP_melt = meltdown_XRP(df_XRP, dim_map)
+        XRP_ready = build_keys(XRP_melt)
+        mast_melt = meltdown_master(df_master, dim_map)
+        mast_ready = build_keys(mast_melt)
+
+        mode = self.config_dict["comparison_option"]
+        df_diff = compare_data(XRP_ready, mast_ready, mode)
+
+        exc_path = Path(self.exc_path_var.get().strip())
+        df_exc = read_exception_table(exc_path)
+        final = merge_exceptions(df_diff, df_exc)
+
+        out_path = Path(self.out_path_var.get().strip())
+        write_results(final, out_path, mode)
+
+        # We stamp today's date on each row
+        run_date = datetime.now().strftime("%Y-%m-%d")
+        final = final.copy()
+        final["RunDate"] = run_date
+
+        # Append to self.history_df
+        self.history_df = pd.concat([self.history_df, final], ignore_index=True)
+
+        # Update dashboard with the current mismatch + entire history
+        self.notebook.select(self.tab_dashboard)
+        self.tab_dashboard.update_data(final, self.history_df)
+
+        messagebox.showinfo("Done", f"Comparison for {run_date} complete. Results in {out_path}")
+
+    def save_all_config(self):
+        self.config_dict["XRP_grid"] = self.XRP_grid.get_config_block()
+        self.config_dict["master_grid"] = self.master_grid.get_config_block()
+        self.config_dict["dimension_renames"] = self.dim_rename_map
+
+        self.config_dict["paths"]["XRP_EXCEL_PATH"] = self.XRP_path_var.get().strip()
+        self.config_dict["paths"]["MASTER_ZIP_PATH"] = self.master_path_var.get().strip()
+        self.config_dict["paths"]["EXCEPTION_PATH"] = self.exc_path_var.get().strip()
+        self.config_dict["paths"]["OUTPUT_PATH"] = self.out_path_var.get().strip()
+        self.config_dict["paths"]["CONFIG_PATH"] = self.cfg_path_var.get().strip()
+
+        self.config_dict["comparison_option"] = self.mode_var.get()
+        save_config(self.config_dict, Path(self.cfg_path_var.get().strip()))
+        messagebox.showinfo("Saved", "All config saved successfully.")
+
+def main():
+    app = MainApp()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()

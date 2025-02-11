@@ -4,18 +4,18 @@ ULTRA-MEGA Data Reconciliation Tool
 ----------------------------------------------
 Advanced Data Reconciliation Tool with Modern UI
 
-Features and Improvements:
-  - Explicit filter rule dataclasses with value validation and management.
-  - Robust data validation in processing functions (including chunk processing for large Excel files).
-  - Auto-detection of file encoding for text files.
-  - Comparison functions with normalization and pre-check validation.
+Key Improvements Implemented:
+  - Explicit FilterRule/FilterRules classes with value validation.
+  - Robust validation in process_alfa_data (including chunk processing for large files)
+    and process_gamma_data (with encoding detection).
+  - Comparison functions that validate and normalize data.
   - Excel output formatting with conditional formatting.
-  - Enhanced logging (including structured logging with structlog if installed) and audit trails.
-  - GUI improvements: tooltips, keyboard shortcuts, and progress indicators.
+  - Enhanced logging: structured logging (using structlog if available) and audit trails.
+  - GUI enhancements: tooltips, keyboard shortcuts, and progress indicators.
   - Configuration management with validation and backup.
-  - Performance optimizations (DataFrame optimizations and caching for frequent operations).
+  - Performance optimizations (DataFrame downcasting and caching for frequent operations).
   - Custom error classes for improved error handling.
-
+  
 Author: Al Pacino Dan
 Last Updated: February 2025
 """
@@ -77,12 +77,14 @@ class FilterRule:
         self.values = set(v.strip() for v in values if v.strip())
 
     def add_value(self, value: str):
+        """Add value validation and cleaning."""
         cleaned = value.strip()
         if not cleaned:
             raise ValueError("Empty values not allowed")
         self.values.add(cleaned)
 
     def remove_value(self, value: str):
+        """Handle removal of non-existent values gracefully."""
         try:
             self.values.remove(value.strip())
         except KeyError:
@@ -192,7 +194,7 @@ def load_initial_config() -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 config = json.load(f)
             logging.info(f"Loaded configuration from {config_path}")
         except Exception as e:
-            logging.error(f"Error loading configuration: {e}")
+            logging.error(f"Error loading configuration from {config_path}: {e}")
     else:
         logging.info("Configuration file not found; using defaults.")
     paths = config.get("DEFAULT_PATHS", {})
@@ -471,6 +473,34 @@ def process_gamma_data(zip_path: Path, rules_config: RulesConfig) -> pd.DataFram
         return pd.DataFrame()
 
 # =============================================================================
+# EXCEPTION TABLE HANDLING
+# =============================================================================
+
+def read_exception_table(exc_path: Path) -> pd.DataFrame:
+    if not exc_path or not exc_path.is_file():
+        logging.warning(f"[Exception] Exception file not found: {exc_path}")
+        return pd.DataFrame()
+    try:
+        df = pd.read_excel(exc_path, sheet_name="Sheet1")
+        return df.copy(deep=True)
+    except Exception as e:
+        logging.exception(f"[Exception] Error reading exception table: {e}")
+        return pd.DataFrame()
+
+def merge_exceptions(df_diff: pd.DataFrame, df_exceptions: pd.DataFrame) -> pd.DataFrame:
+    if df_exceptions.empty:
+        return df_diff
+    exc_cols = [col for col in df_exceptions.columns if col in {"Key", "Comments_1", "Comments_2", "hide exception"}]
+    exc = df_exceptions[exc_cols].copy()
+    exc["Key"] = exc["Key"].astype(str).str.strip()
+    df_diff = df_diff.merge(exc, on="Key", how="left", suffixes=("", "_exc"))
+    df_diff["hide exception"] = df_diff.get("hide exception", "no").fillna("no").str.lower()
+    before_len = len(df_diff)
+    df_diff = df_diff[df_diff["hide exception"] != "yes"]
+    logging.debug(f"[Exception] Excluded {before_len - len(df_diff)} rows due to hidden exception.")
+    return df_diff
+
+# =============================================================================
 # COMPARISON FUNCTIONS & NORMALIZATION
 # =============================================================================
 
@@ -703,7 +733,7 @@ def generate_test_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
 def validate_results(df: pd.DataFrame):
     if df.duplicated().any():
         logging.warning("Duplicates found in the result data")
-    # Further validations can be added.
+    # Additional validations can be added here.
 
 # =============================================================================
 # CUSTOM SCROLLABLE FRAME (Modern)
@@ -834,7 +864,6 @@ class ReconciliationGUI(ctk.CTk):
         tv.pack(fill="both", expand=True)
         btn_frame = ctk.CTkFrame(frame)
         btn_frame.pack(pady=2)
-        # Use a custom dialog to add multi-line values
         ctk.CTkButton(btn_frame, text="Add", command=lambda: self.on_add_keep_rule(tv),
                       font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"])).pack(side="left", padx=2)
         ctk.CTkButton(btn_frame, text="Edit", command=lambda: self.on_edit_item(tv, 2),
@@ -906,7 +935,6 @@ class ReconciliationGUI(ctk.CTk):
                 tv.item(item_id, values=(new_val1.strip(), new_val2.strip()))
 
     def populate_defaults(self):
-        # Populate ALFA cleaning and filter rules.
         for val in self.rules_config.alfa_cleaning.bad_dimensions:
             self.tv_alfa_bad_dims.insert("", "end", values=(val,))
         for val in self.rules_config.alfa_cleaning.bad_attributes:
@@ -1109,14 +1137,13 @@ class ReconciliationGUI(ctk.CTk):
             logging.error(f"Error loading configuration: {e}")
 
     def create_tooltips(self):
-        # Example tooltips for controls; expand as needed.
         self.tooltip_text = {
             'keep_rules': 'Specify the rules to keep rows based on column values.',
             'exclude_rules': 'Specify the rules to exclude rows based on column values.',
             'Run Reconciliation': 'Start the reconciliation process.',
             'Save Results': 'Save the processed results to an Excel file.'
         }
-        # You can use a tooltip library or custom implementation here.
+        # (Implementation of tooltip display is left as an exercise.)
 
     def add_keyboard_shortcuts(self):
         self.bind('<Control-s>', lambda e: self.save_results())

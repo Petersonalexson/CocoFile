@@ -231,13 +231,11 @@ class TextHandler(logging.Handler):
     
     def emit(self, record: logging.LogRecord):
         msg = self.format(record) + "\n"
-        
         # Use after() to make thread-safe
         self.text_widget.after(0, self._write_to_widget, msg, record.levelname)
     
     def _write_to_widget(self, msg: str, level: str):
         self.text_widget.configure(state="normal")
-        
         # Color-code based on log level
         color = {
             "DEBUG": "gray",
@@ -246,7 +244,6 @@ class TextHandler(logging.Handler):
             "ERROR": "red",
             "CRITICAL": "red"
         }.get(level, "black")
-        
         # Insert message with color
         self.text_widget.insert("end", msg, color)
         self.text_widget.see("end")
@@ -297,8 +294,8 @@ def save_config(config: Dict[str, Any], config_path: Path) -> None:
 # =============================================================================
 
 def filter_alfa_pre_merge(df: pd.DataFrame,
-                         keep_rules: List[Tuple[str, str]],
-                         disallow_rules: List[Tuple[str, str]]) -> pd.DataFrame:
+                          keep_rules: List[Tuple[str, str]],
+                          disallow_rules: List[Tuple[str, str]]) -> pd.DataFrame:
     """
     Apply filtering to ALFA data before merge operations.
     
@@ -327,7 +324,7 @@ def filter_alfa_pre_merge(df: pd.DataFrame,
             rows_after = len(df)
             rows_filtered = initial_rows - rows_after
             logging.info(f"[ALFA Keep] Filter {column}: removed {rows_filtered} rows "
-                        f"({rows_filtered/initial_rows:.1%})")
+                         f"({rows_filtered/initial_rows:.1%})")
     
     # Apply DISALLOW rules (OR logic)
     if disallow_rules:
@@ -342,26 +339,26 @@ def filter_alfa_pre_merge(df: pd.DataFrame,
             rows_after = len(df)
             rows_filtered = initial_rows - rows_after
             logging.info(f"[ALFA Disallow] Filter {column}: removed {rows_filtered} rows "
-                        f"({rows_filtered/initial_rows:.1%})")
+                         f"({rows_filtered/initial_rows:.1%})")
     
     final_rows = len(df)
     total_filtered = initial_rows - final_rows
     logging.info(f"ALFA pre-merge filtering complete: {total_filtered} rows removed "
-                f"({total_filtered/initial_rows:.1%})")
+                 f"({total_filtered/initial_rows:.1%})")
     
     return df
 
-    # =============================================================================
+# =============================================================================
 # Data Processing Functions (continued)
 # =============================================================================
 
 def process_alfa_data(file_path: Path,
-                     keep_rules: List[Tuple[str, str]],
-                     disallow_rules: List[Tuple[str, str]],
-                     bad_dimensions: List[str],
-                     bad_attributes: List[str],
-                     dimension_renames: Dict[str, str],
-                     attribute_renames: Dict[str, str]) -> pd.DataFrame:
+                      keep_rules: List[Tuple[str, str]],
+                      disallow_rules: List[Tuple[str, str]],
+                      bad_dimensions: List[str],
+                      bad_attributes: List[str],
+                      dimension_renames: Dict[str, str],
+                      attribute_renames: Dict[str, str]) -> pd.DataFrame:
     """
     Process ALFA Excel data with comprehensive filtering and transformations.
     
@@ -405,9 +402,9 @@ def process_alfa_data(file_path: Path,
         value_vars = [c for c in df.columns if c not in id_vars]
         
         df_melted = df.melt(id_vars=id_vars,
-                           value_vars=value_vars,
-                           var_name="Attribute",
-                           value_name="Value")
+                            value_vars=value_vars,
+                            var_name="Attribute",
+                            value_name="Value")
         
         # Apply renames
         if dimension_renames:
@@ -439,12 +436,12 @@ def process_alfa_data(file_path: Path,
             df_final[col] = df_final[col].fillna("").astype(str)
         
         df_final["GroupKey"] = (df_final["Dimension"].str.strip() + " | " + 
-                               df_final["RefName"].str.strip())
+                                df_final["RefName"].str.strip())
         
         df_final["Key"] = (df_final["Dimension"].str.strip() + " | " +
-                          df_final["RefName"].str.strip() + " | " +
-                          df_final["Attribute"].str.strip() + " | " +
-                          df_final["Value"].str.strip())
+                           df_final["RefName"].str.strip() + " | " +
+                           df_final["Attribute"].str.strip() + " | " +
+                           df_final["Value"].str.strip())
         
         # Remove duplicates
         df_final = df_final.drop_duplicates()
@@ -457,12 +454,12 @@ def process_alfa_data(file_path: Path,
         raise
 
 def process_gamma_data(zip_path: Path,
-                      keep_rules: List[Tuple[str, str]],
-                      disallow_rules: List[Tuple[str, str]],
-                      bad_dimensions: List[str],
-                      bad_attributes: List[str],
-                      dimension_renames: Dict[str, str],
-                      attribute_renames: Dict[str, str]) -> pd.DataFrame:
+                       keep_rules: List[Tuple[str, str]],
+                       disallow_rules: List[Tuple[str, str]],
+                       bad_dimensions: List[str],
+                       bad_attributes: List[str],
+                       dimension_renames: Dict[str, str],
+                       attribute_renames: Dict[str, str]) -> pd.DataFrame:
     """
     Process GAMMA ZIP data containing multiple text files.
     
@@ -522,9 +519,9 @@ def process_gamma_data(zip_path: Path,
                         value_vars = [c for c in df.columns if c not in id_vars]
                         
                         df_melted = df.melt(id_vars=id_vars,
-                                          value_vars=value_vars,
-                                          var_name="Attribute",
-                                          value_name="Value")
+                                            value_vars=value_vars,
+                                            var_name="Attribute",
+                                            value_name="Value")
                         
                         all_data.append(df_melted)
                         logging.info(f"[GAMMA] Processed {txt_file}: {len(df_melted)} rows")
@@ -570,12 +567,12 @@ def process_gamma_data(zip_path: Path,
             df_final[col] = df_final[col].fillna("").astype(str)
         
         df_final["GroupKey"] = (df_final["Dimension"].str.strip() + " | " + 
-                               df_final["RefName"].str.strip())
+                                df_final["RefName"].str.strip())
         
         df_final["Key"] = (df_final["Dimension"].str.strip() + " | " +
-                          df_final["RefName"].str.strip() + " | " +
-                          df_final["Attribute"].str.strip() + " | " +
-                          df_final["Value"].str.strip())
+                           df_final["RefName"].str.strip() + " | " +
+                           df_final["Attribute"].str.strip() + " | " +
+                           df_final["Value"].str.strip())
         
         # Remove duplicates
         df_final = df_final.drop_duplicates()
@@ -588,8 +585,8 @@ def process_gamma_data(zip_path: Path,
         raise
 
 def filter_gamma_rules(df: pd.DataFrame,
-                      keep_rules: List[Tuple[str, str]],
-                      disallow_rules: List[Tuple[str, str]]) -> pd.DataFrame:
+                       keep_rules: List[Tuple[str, str]],
+                       disallow_rules: List[Tuple[str, str]]) -> pd.DataFrame:
     """
     Apply GAMMA-specific filtering rules.
     
@@ -642,8 +639,8 @@ def filter_gamma_rules(df: pd.DataFrame,
 # =============================================================================
 
 def compare_data(df_alfa: pd.DataFrame,
-                df_gamma: pd.DataFrame,
-                comparison_mode: int = 2) -> pd.DataFrame:
+                 df_gamma: pd.DataFrame,
+                 comparison_mode: int = 2) -> pd.DataFrame:
     """
     Compare ALFA and GAMMA data using the specified comparison mode.
     
@@ -697,8 +694,8 @@ def build_lookup_dict(df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
     return lookup
 
 def compare_mode_1(dimension: str, group_key: str, 
-                  alfa_data: Dict[str, str], 
-                  gamma_data: Dict[str, str]) -> List[Dict[str, str]]:
+                   alfa_data: Dict[str, str], 
+                   gamma_data: Dict[str, str]) -> List[Dict[str, str]]:
     """Implement comparison mode 1 (All Missing)."""
     differences = []
     
@@ -750,8 +747,8 @@ def compare_mode_1(dimension: str, group_key: str,
     return differences
 
 def compare_mode_2(dimension: str, group_key: str,
-                  alfa_data: Dict[str, str],
-                  gamma_data: Dict[str, str]) -> List[Dict[str, str]]:
+                   alfa_data: Dict[str, str],
+                   gamma_data: Dict[str, str]) -> List[Dict[str, str]]:
     """Implement comparison mode 2 (Missing - Name Special)."""
     differences = []
     
@@ -823,12 +820,11 @@ def compare_mode_2(dimension: str, group_key: str,
     return differences
 
 def compare_mode_3(dimension: str, group_key: str,
-                  alfa_data: Dict[str, str],
-                  gamma_data: Dict[str, str]) -> List[Dict[str, str]]:
+                   alfa_data: Dict[str, str],
+                   gamma_data: Dict[str, str]) -> List[Dict[str, str]]:
     """Implement comparison mode 3 (Full Comparison)."""
     differences = []
-    matches = []
-    
+    # You could collect matches if needed; here we only return differences.
     all_attrs = set(alfa_data.keys()) | set(gamma_data.keys())
     
     for attr in all_attrs:
@@ -836,13 +832,7 @@ def compare_mode_3(dimension: str, group_key: str,
         gamma_val = gamma_data.get(attr, "").strip()
         
         if alfa_val == gamma_val:
-            matches.append({
-                "Dimension": dimension,
-                "GroupKey": group_key,
-                "Attribute": attr,
-                "Value": alfa_val,
-                "Missing_In": ""
-            })
+            continue  # No difference
         else:
             if not alfa_val and gamma_val:
                 differences.append({
@@ -896,13 +886,13 @@ class ModernScrollableFrame(ctk.CTkFrame):
         
         # Add scrollbars
         self.vsb = ctk.CTkScrollbar(self, orientation="vertical",
-                                   command=self.canvas.yview)
+                                    command=self.canvas.yview)
         self.hsb = ctk.CTkScrollbar(self, orientation="horizontal",
-                                   command=self.canvas.xview)
+                                    command=self.canvas.xview)
         
         # Configure canvas
         self.canvas.configure(yscrollcommand=self.vsb.set,
-                            xscrollcommand=self.hsb.set)
+                              xscrollcommand=self.hsb.set)
         
         # Grid layout
         self.canvas.grid(row=0, column=0, sticky="nsew")
@@ -910,7 +900,7 @@ class ModernScrollableFrame(ctk.CTkFrame):
         self.hsb.grid(row=1, column=0, sticky="ew")
         
         self.canvas.create_window((0, 0), window=self.scrollable_frame,
-                                anchor="nw")
+                                  anchor="nw")
         
         # Configure grid weights
         self.grid_rowconfigure(0, weight=1)
@@ -950,7 +940,7 @@ class ReconciliationGUI(ctk.CTk):
         # Initialize logging
         self.setup_logging()
         
-        # Load configuration
+        # Load configuration (stub method)
         self.load_saved_config()
     
     def setup_tabs(self):
@@ -986,18 +976,18 @@ class ReconciliationGUI(ctk.CTk):
                 frame.pack(fill="x", pady=5)
                 
                 label = ctk.CTkLabel(frame, text=f"{key.replace('_', ' ')}:",
-                                   font=(UI_CONFIG["FONT_FAMILY"], 
-                                        UI_CONFIG["FONT_SIZES"]["NORMAL"]))
+                                     font=(UI_CONFIG["FONT_FAMILY"], 
+                                           UI_CONFIG["FONT_SIZES"]["NORMAL"]))
                 label.pack(side="left", padx=5)
                 
                 entry = ctk.CTkEntry(frame, width=400,
-                                   font=(UI_CONFIG["FONT_FAMILY"],
-                                        UI_CONFIG["FONT_SIZES"]["NORMAL"]))
+                                     font=(UI_CONFIG["FONT_FAMILY"],
+                                           UI_CONFIG["FONT_SIZES"]["NORMAL"]))
                 entry.insert(0, default)
                 entry.pack(side="left", padx=5)
                 
                 btn = ctk.CTkButton(frame, text="Browse",
-                                  command=lambda k=key: self.browse_file(k))
+                                    command=lambda k=key: self.browse_file(k))
                 btn.pack(side="left", padx=5)
                 
                 self.path_entries[key] = entry
@@ -1010,7 +1000,7 @@ class ReconciliationGUI(ctk.CTk):
         scroll_frame = ModernScrollableFrame(tab)
         scroll_frame.pack(fill="both", expand=True, padx=10, pady=5)
         
-        # Create sections for different rule types
+        # Create sections for different rule types (stub implementations)
         self.create_dimension_rules(scroll_frame.scrollable_frame)
         self.create_attribute_rules(scroll_frame.scrollable_frame)
         self.create_filter_rules(scroll_frame.scrollable_frame)
@@ -1024,8 +1014,8 @@ class ReconciliationGUI(ctk.CTk):
         mode_frame.pack(fill="x", padx=10, pady=5)
         
         ctk.CTkLabel(mode_frame, text="Comparison Mode:",
-                    font=(UI_CONFIG["FONT_FAMILY"],
-                          UI_CONFIG["FONT_SIZES"]["HEADER"])).pack(pady=5)
+                     font=(UI_CONFIG["FONT_FAMILY"],
+                           UI_CONFIG["FONT_SIZES"]["HEADER"])).pack(pady=5)
         
         modes = [
             ("All Missing", 1),
@@ -1035,11 +1025,11 @@ class ReconciliationGUI(ctk.CTk):
         
         for text, value in modes:
             ctk.CTkRadioButton(mode_frame, text=text,
-                              variable=self.comparison_mode,
-                              value=value,
-                              font=(UI_CONFIG["FONT_FAMILY"],
-                                    UI_CONFIG["FONT_SIZES"]["NORMAL"])).pack(pady=2)
-# Progress indicators 
+                               variable=self.comparison_mode,
+                               value=value,
+                               font=(UI_CONFIG["FONT_FAMILY"],
+                                     UI_CONFIG["FONT_SIZES"]["NORMAL"])).pack(pady=2)
+        # Progress indicators 
         progress_frame = ctk.CTkFrame(tab)
         progress_frame.pack(fill="x", padx=10, pady=10)
         
@@ -1048,9 +1038,9 @@ class ReconciliationGUI(ctk.CTk):
         self.progress_bar.set(0)
         
         self.progress_label = ctk.CTkLabel(progress_frame, 
-                                         text="Ready to process",
-                                         font=(UI_CONFIG["FONT_FAMILY"],
-                                               UI_CONFIG["FONT_SIZES"]["NORMAL"]))
+                                           text="Ready to process",
+                                           font=(UI_CONFIG["FONT_FAMILY"],
+                                                 UI_CONFIG["FONT_SIZES"]["NORMAL"]))
         self.progress_label.pack(pady=5)
         
         # Control buttons
@@ -1058,16 +1048,16 @@ class ReconciliationGUI(ctk.CTk):
         button_frame.pack(fill="x", padx=10, pady=5)
         
         ctk.CTkButton(button_frame,
-                     text="Run Reconciliation",
-                     command=self.run_reconciliation,
-                     font=(UI_CONFIG["FONT_FAMILY"],
-                           UI_CONFIG["FONT_SIZES"]["NORMAL"])).pack(side="left", padx=5)
+                      text="Run Reconciliation",
+                      command=self.run_reconciliation,
+                      font=(UI_CONFIG["FONT_FAMILY"],
+                            UI_CONFIG["FONT_SIZES"]["NORMAL"])).pack(side="left", padx=5)
         
         ctk.CTkButton(button_frame,
-                     text="Save Results",
-                     command=self.save_results,
-                     font=(UI_CONFIG["FONT_FAMILY"],
-                           UI_CONFIG["FONT_SIZES"]["NORMAL"])).pack(side="left", padx=5)
+                      text="Save Results",
+                      command=self.save_results,
+                      font=(UI_CONFIG["FONT_FAMILY"],
+                            UI_CONFIG["FONT_SIZES"]["NORMAL"])).pack(side="left", padx=5)
     
     def build_results_tab(self):
         """Build the results tab with visualizations and analysis."""
@@ -1204,7 +1194,7 @@ class ReconciliationGUI(ctk.CTk):
         
         # Create bars
         bars = ax.bar(range(len(data)), data.values,
-                     color=UI_CONFIG["COLORS"]["PRIMARY"])
+                      color=UI_CONFIG["COLORS"]["PRIMARY"])
         
         # Customize appearance
         ax.set_xticks(range(len(data)))
@@ -1218,8 +1208,8 @@ class ReconciliationGUI(ctk.CTk):
         for bar in bars:
             height = bar.get_height()
             ax.text(bar.get_x() + bar.get_width()/2., height,
-                   f'{int(height):,}',
-                   ha='center', va='bottom')
+                    f'{int(height):,}',
+                    ha='center', va='bottom')
         
         # Create canvas
         canvas = FigureCanvasTkAgg(fig, master=container)
@@ -1263,15 +1253,15 @@ class ReconciliationGUI(ctk.CTk):
             
             # Define styles
             header_font = Font(name=UI_CONFIG["FONT_FAMILY"],
-                             size=UI_CONFIG["FONT_SIZES"]["NORMAL"],
-                             bold=True)
+                               size=UI_CONFIG["FONT_SIZES"]["NORMAL"],
+                               bold=True)
             
             data_font = Font(name=UI_CONFIG["FONT_FAMILY"],
-                           size=UI_CONFIG["FONT_SIZES"]["NORMAL"])
+                             size=UI_CONFIG["FONT_SIZES"]["NORMAL"])
             
             header_fill = PatternFill(start_color="E0E0E0",
-                                    end_color="E0E0E0",
-                                    fill_type="solid")
+                                      end_color="E0E0E0",
+                                      fill_type="solid")
             
             # Apply header styles
             for cell in ws[1]:
@@ -1308,6 +1298,93 @@ class ReconciliationGUI(ctk.CTk):
             logging.exception("Error formatting Excel output")
             raise
 
+    # -------------------------------------------------------------------------
+    # Helper methods for missing functionality
+    # -------------------------------------------------------------------------
+    
+    def browse_file(self, key: str):
+        """Open a file dialog to select a file and update the corresponding entry."""
+        initial_dir = os.path.dirname(self.path_entries[key].get())
+        file_path = filedialog.askopenfilename(initialdir=initial_dir)
+        if file_path:
+            self.path_entries[key].delete(0, tk.END)
+            self.path_entries[key].insert(0, file_path)
+    
+    def load_saved_config(self):
+        """Load configuration from file (stub implementation)."""
+        config_path = Path(DEFAULT_PATHS["CONFIG_PATH"])
+        config = load_config(config_path)
+        if config:
+            self.current_config = config
+            logging.info("Configuration loaded from file")
+        else:
+            logging.info("No configuration file found; using defaults")
+    
+    def setup_logging(self):
+        """Setup logging. Extend this if you want to add a GUI log widget."""
+        setup_logging()
+    
+    def get_rules(self, rule_type_prefix: str) -> List[Tuple[str, str]]:
+        """Return rule list based on type."""
+        if rule_type_prefix == "ALFA_KEEP":
+            return FILTER_RULES.get("ALFA_KEEP_RULES", [])
+        elif rule_type_prefix == "ALFA_DONOTKEEP":
+            return FILTER_RULES.get("ALFA_DONOTKEEP_RULES", [])
+        elif rule_type_prefix == "GAMMA_KEEP":
+            return FILTER_RULES.get("GAMMA_KEEP_RULES", [])
+        elif rule_type_prefix == "GAMMA_DONOTKEEP":
+            return FILTER_RULES.get("GAMMA_DONOTKEEP_RULES", [])
+        return []
+    
+    def get_dimensions(self, key_prefix: str) -> List[str]:
+        """Return list of bad dimensions based on type."""
+        if key_prefix == "ALFA_BAD":
+            return DIMENSION_CONFIG.get("ALFA_BAD_DIMS", [])
+        elif key_prefix == "GAMMA_BAD":
+            return DIMENSION_CONFIG.get("GAMMA_BAD_DIMS", [])
+        return []
+    
+    def get_attributes(self, key_prefix: str) -> List[str]:
+        """Return list of bad attributes based on type."""
+        if key_prefix == "ALFA_BAD":
+            return ATTRIBUTE_CONFIG.get("ALFA_BAD_ATTRS", [])
+        elif key_prefix == "GAMMA_BAD":
+            return ATTRIBUTE_CONFIG.get("GAMMA_BAD_ATTRS", [])
+        return []
+    
+    def get_renames(self, key_prefix: str) -> Dict[str, str]:
+        """Return renaming mapping based on type."""
+        if key_prefix == "ALFA_DIM":
+            return DIMENSION_CONFIG.get("ALFA_DIM_RENAMES", {})
+        elif key_prefix == "ALFA_ATTR":
+            return ATTRIBUTE_CONFIG.get("ALFA_ATTR_RENAMES", {})
+        elif key_prefix == "GAMMA_DIM":
+            return DIMENSION_CONFIG.get("GAMMA_DIM_RENAMES", {})
+        elif key_prefix == "GAMMA_ATTR":
+            return ATTRIBUTE_CONFIG.get("GAMMA_ATTR_RENAMES", {})
+        return {}
+    
+    def create_dimension_rules(self, container):
+        """Stub: Create UI elements for dimension rules."""
+        lbl = ctk.CTkLabel(container, text="Dimension Rules (to be implemented)",
+                           font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["HEADER"]))
+        lbl.pack(pady=5)
+        # Here you could add detailed UI elements to allow editing the dimension rules.
+    
+    def create_attribute_rules(self, container):
+        """Stub: Create UI elements for attribute rules."""
+        lbl = ctk.CTkLabel(container, text="Attribute Rules (to be implemented)",
+                           font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["HEADER"]))
+        lbl.pack(pady=5)
+        # Add UI elements for attribute rules if needed.
+    
+    def create_filter_rules(self, container):
+        """Stub: Create UI elements for filter rules."""
+        lbl = ctk.CTkLabel(container, text="Filter Rules (to be implemented)",
+                           font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["HEADER"]))
+        lbl.pack(pady=5)
+        # Add UI elements for filter rules if needed.
+
 def main():
     """Main entry point for the application."""
     try:
@@ -1316,7 +1393,7 @@ def main():
     except Exception as e:
         logging.exception("Critical error in main application")
         messagebox.showerror("Critical Error",
-                           f"Application encountered a critical error: {str(e)}")
+                             f"Application encountered a critical error: {str(e)}")
 
 if __name__ == "__main__":
     main()

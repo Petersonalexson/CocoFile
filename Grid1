@@ -1,0 +1,855 @@
+TEST
+"""
+ULTRA-MEGA Data Reconciliation Tool (Interactive Excel-like UI)
+-------------------------------------------------------------------------
+This tool processes ALFA Excel files and GAMMA ZIP files according to the following:
+
+For ALFA:
+  - Reads an Excel file (skipping the first 3 rows so that the header starts at row 4).
+  - The first two columns ("Col1" and "Col2") are used exclusively for filtering.
+    Two OptionMenus let you select which values to include.
+  - Only rows with "Enabled_Flag" equal to "Enabled" are processed.
+  - "Dimension_Name" denotes the dimension and is used solely for filtering (locked; cannot be renamed).
+  - "Value" (the RefName column) is locked.
+  - Other attribute columns can be toggled on/off and renamed via the UI.
+
+For GAMMA:
+  - Reads .txt files from a ZIP file; each file’s dimension is derived from its filename
+    (by removing "_ceaster.txt" and replacing underscores with spaces).
+  - The first column "Name" is locked (used as RefName).
+  - An OptionMenu lets you filter by dimension.
+
+All customization (filtering out unwanted values, toggling columns, renaming columns) is done in the UI.
+When you click "Run Reconciliation," the UI selections are applied to the raw data, which is then melted,
+a GroupKey is computed as "Dimension | RefName," and (if provided) an exception table is merged to omit rows where 
+"hide exception" is "yes." The final output DataFrame has these columns:
+    Key, Dimension, Name, Attribute, Value, Comments_1, Comments_2, Action Item, Missing In
+
+Author: Al Pacino Dan
+Last Updated: February 2025
+"""
+
+import os, json, logging, zipfile
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional, Any, Set
+
+import pandas as pd
+import numpy as np
+
+import tkinter as tk
+from tkinter import ttk, filedialog, simpledialog, messagebox
+
+import customtkinter as ctk
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import mplcursors
+
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+
+# ----------------------------
+# DEFAULT PATHS & UI CONFIGURATION
+# ----------------------------
+DEFAULT_PATHS = {
+    "ALFA_PATH": "data/AlfaData.xlsx",
+    "GAMMA_PATH": "data/GammaData.zip",
+    "EXCEPTION_PATH": "data/Exception_Table.xlsx",
+    "OUTPUT_PATH": "output/Missing_Items.xlsx",
+    "CONFIG_PATH": "config/reconciliation_config.json",
+    "LOG_PATH": "logs/reconciliation.log"
+}
+
+UI_CONFIG = {
+    "WINDOW_SIZE": "1400x1000",
+    "FONT_FAMILY": "Arial",
+    "FONT_SIZES": {"HEADER": 16, "NORMAL": 14, "SMALL": 12},
+    "COLORS": {"PRIMARY": "#2E86C1", "SECONDARY": "#85C1E9", "SUCCESS": "#58D68D",
+                "WARNING": "#F4D03F", "ERROR": "#E74C3C"}
+}
+
+# ----------------------------
+# LOGGING CONFIGURATION
+# ----------------------------
+def setup_logging(log_widget: Optional[ctk.CTkTextbox] = None) -> None:
+    log_dir = Path(DEFAULT_PATHS["LOG_PATH"]).parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"reconciliation_{timestamp}.log"
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    fh = logging.FileHandler(log_file, mode="w", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s"))
+    logger.addHandler(fh)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(ch)
+    if log_widget:
+        gui_handler = TextHandler(log_widget)
+        gui_handler.setLevel(logging.INFO)
+        gui_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        logger.addHandler(gui_handler)
+    logging.info("Logging system initialized")
+
+class TextHandler(logging.Handler):
+    def __init__(self, text_widget: ctk.CTkTextbox):
+        super().__init__()
+        self.text_widget = text_widget
+    def emit(self, record: logging.LogRecord):
+        msg = self.format(record) + "\n"
+        self.text_widget.after(0, self._append, msg)
+    def _append(self, msg: str):
+        self.text_widget.configure(state="normal")
+        self.text_widget.insert("end", msg)
+        self.text_widget.see("end")
+        self.text_widget.configure(state="disabled")
+
+# ----------------------------
+# DATA PROCESSING FUNCTIONS (No backend RULES customization)
+# ----------------------------
+def process_alfa_data(raw_df: pd.DataFrame,
+                      ui_columns: List[Dict[str, Any]],
+                      col1_filter: Optional[str] = None,
+                      col2_filter: Optional[str] = None) -> pd.DataFrame:
+    logging.info("[ALFA] Processing raw data based solely on UI selections")
+    try:
+        df = raw_df.copy()
+        # Filter by Enabled_Flag (only "Enabled" rows)
+        if "Enabled_Flag" in df.columns:
+            df = df[df["Enabled_Flag"].astype(str).str.lower() == "enabled"]
+        # Apply filtering on the first two columns ("Col1" and "Col2") via UI dropdowns
+        if col1_filter and col1_filter != "All":
+            df = df[df["Col1"].astype(str) == col1_filter]
+        if col2_filter and col2_filter != "All":
+            df = df[df["Col2"].astype(str) == col2_filter]
+        # Keep only the columns that are visible in the UI
+        visible = [col["id"] for col in ui_columns if col.get("visible", True)]
+        df = df[visible]
+        # Rename columns according to UI settings.
+        # Force "Dimension_Name" to become "Dimension" (and lock it) and "Value" remains as is.
+        rename_map = {}
+        for col in ui_columns:
+            if col["id"] == "Dimension_Name":
+                rename_map[col["id"]] = "Dimension"
+            elif col["id"] == "Value":
+                rename_map[col["id"]] = "Value"
+            elif col.get("renameable", True):
+                rename_map[col["id"]] = col["name"]
+        df.rename(columns=rename_map, inplace=True)
+        if "Dimension" not in df.columns:
+            raise ValueError("Missing required column 'Dimension'")
+        if "Value" not in df.columns:
+            raise ValueError("Missing required column 'Value'")
+        df["RecordID"] = df.index.astype(str)
+        id_vars = ["Dimension", "RecordID"]
+        value_vars = [col for col in df.columns if col not in id_vars]
+        df_melted = df.melt(id_vars=id_vars, value_vars=value_vars,
+                            var_name="Attribute", value_name="MeltedValue")
+        # No backend rules applied here – all filtering and renaming is UI-based.
+        # Build RefName from rows where Attribute == "Value"
+        ref_df = df_melted[df_melted["Attribute"] == "Value"][["RecordID", "MeltedValue"]].drop_duplicates("RecordID")
+        ref_df.rename(columns={"MeltedValue": "RefName"}, inplace=True)
+        df_final = df_melted.merge(ref_df, on="RecordID", how="left")
+        for col in ["Dimension", "Attribute", "MeltedValue", "RefName"]:
+            df_final[col] = df_final[col].fillna("").astype(str)
+        df_final["Name"] = df_final["RefName"]
+        df_final["GroupKey"] = df_final["Dimension"].str.strip() + " | " + df_final["RefName"].str.strip()
+        df_final["Key"] = (df_final["Dimension"].str.strip() + " | " +
+                           df_final["Name"].str.strip() + " | " +
+                           df_final["Attribute"].str.strip() + " | " +
+                           df_final["MeltedValue"].str.strip())
+        for col in ["Comments_1", "Comments_2", "Action Item", "Missing In"]:
+            df_final[col] = ""
+        df_final.drop_duplicates(inplace=True)
+        logging.info(f"[ALFA] Processing complete: {len(df_final)} rows")
+        return df_final
+    except Exception as e:
+        logging.exception(f"[ALFA] Error during processing: {e}")
+        raise
+
+def process_gamma_data(zip_path: Path,
+                       ui_columns: List[Dict[str, Any]],
+                       delimiter: str = ",",
+                       remove_substring: str = "_ceaster.txt",
+                       encoding: str = "utf-8") -> pd.DataFrame:
+    logging.info(f"[GAMMA] Processing data from {zip_path}")
+    all_dfs = []
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+            if not txt_files:
+                logging.warning("[GAMMA] No .txt files found in ZIP")
+                return pd.DataFrame()
+            for txt_file in txt_files:
+                try:
+                    base_name = os.path.basename(txt_file)
+                    if remove_substring in base_name:
+                        base_name = base_name.replace(remove_substring, "")
+                    else:
+                        base_name, _ = os.path.splitext(base_name)
+                    dimension = base_name.replace("_", " ").strip()
+                    with z.open(txt_file) as fo:
+                        sample = fo.read(1024)
+                        try:
+                            import chardet
+                            file_encoding = chardet.detect(sample)['encoding'] or encoding
+                        except ImportError:
+                            file_encoding = encoding
+                        fo.seek(0)
+                        df = pd.read_csv(fo, delimiter=delimiter, encoding=file_encoding).copy(deep=True)
+                    if df.empty:
+                        logging.warning(f"[GAMMA] '{txt_file}' is empty; skipping")
+                        continue
+                    first_col = df.columns[0]
+                    df.rename(columns={first_col: "Name"}, inplace=True)
+                    df["Name"] = df["Name"].fillna("Unknown").astype(str)
+                    df["Dimension"] = dimension
+                    df["RecordID"] = df.index.astype(str)
+                    id_vars = ["Dimension", "RecordID"]
+                    value_vars = [col for col in df.columns if col not in id_vars]
+                    df_melted = df.melt(id_vars=id_vars, value_vars=value_vars,
+                                        var_name="Attribute", value_name="MeltedValue")
+                    # For GAMMA, no backend rules – all customization is via UI.
+                    ref_df = df_melted[df_melted["Attribute"] == "Name"][["RecordID", "MeltedValue"]].drop_duplicates("RecordID")
+                    ref_df.rename(columns={"MeltedValue": "RefName"}, inplace=True)
+                    df_final = df_melted.merge(ref_df, on="RecordID", how="left")
+                    for col in ["Dimension", "Attribute", "MeltedValue", "RefName"]:
+                        df_final[col] = df_final[col].fillna("").astype(str)
+                    df_final["Name"] = df_final["RefName"]
+                    df_final["GroupKey"] = df_final["Dimension"].str.strip() + " | " + df_final["RefName"].str.strip()
+                    df_final["Key"] = (df_final["Dimension"].str.strip() + " | " +
+                                       df_final["Name"].str.strip() + " | " +
+                                       df_final["Attribute"].str.strip() + " | " +
+                                       df_final["MeltedValue"].str.strip())
+                    for col in ["Comments_1", "Comments_2", "Action Item", "Missing In"]:
+                        df_final[col] = ""
+                    df_final.drop_duplicates(inplace=True)
+                    logging.info(f"[GAMMA] Processed '{txt_file}' with {len(df_final)} rows")
+                    all_dfs.append(df_final.copy(deep=True))
+                except Exception as e2:
+                    logging.error(f"[GAMMA] Error processing '{txt_file}': {e2}")
+                    continue
+            if all_dfs:
+                df_combined = pd.concat(all_dfs, ignore_index=True)
+                logging.info(f"[GAMMA] Combined data has {len(df_combined)} rows")
+                return df_combined
+            else:
+                logging.warning("[GAMMA] No valid data found; returning empty DataFrame")
+                return pd.DataFrame()
+    except Exception as e:
+        logging.exception(f"[GAMMA] Error reading ZIP file: {e}")
+        return pd.DataFrame()
+
+def build_lookup_dict(df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+    lookup = {}
+    for group_key, group_df in df.groupby("GroupKey"):
+        lookup[group_key] = dict(zip(group_df["Attribute"], group_df["Value"]))
+    return lookup
+
+def compare_data(df_alfa: pd.DataFrame,
+                 df_gamma: pd.DataFrame,
+                 comparison_mode: int = 2) -> pd.DataFrame:
+    logging.info(f"Starting data comparison (Mode {comparison_mode})")
+    alfa_lookup = build_lookup_dict(df_alfa)
+    gamma_lookup = build_lookup_dict(df_gamma)
+    all_keys = set(alfa_lookup.keys()) | set(gamma_lookup.keys())
+    differences = []
+    for key in all_keys:
+        parts = key.split(" | ")
+        dimension = parts[0] if parts else ""
+        a_data = alfa_lookup.get(key, {})
+        g_data = gamma_lookup.get(key, {})
+        if comparison_mode == 1:
+            differences.extend(compare_mode_1(dimension, key, a_data, g_data))
+        elif comparison_mode == 2:
+            differences.extend(compare_mode_2(dimension, key, a_data, g_data))
+        elif comparison_mode == 3:
+            differences.extend(compare_mode_3(dimension, key, a_data, g_data))
+    df_diff = pd.DataFrame(differences)
+    if not df_diff.empty:
+        df_diff["Key"] = (df_diff["Dimension"].str.strip() + " | " +
+                          df_diff["Name"].str.strip() + " | " +
+                          df_diff["Attribute"].str.strip() + " | " +
+                          df_diff["Value"].str.strip())
+    logging.info(f"Comparison complete: {len(df_diff)} differences found")
+    return df_diff
+
+def compare_mode_1(dimension: str, group_key: str, 
+                   alfa_data: Dict[str, str], 
+                   gamma_data: Dict[str, str]) -> List[Dict[str, str]]:
+    differences = []
+    all_attrs = set(alfa_data.keys()) | set(gamma_data.keys())
+    for attr in all_attrs:
+        a_val = alfa_data.get(attr, "").strip()
+        g_val = gamma_data.get(attr, "").strip()
+        if a_val != g_val:
+            if not a_val and g_val:
+                differences.append({
+                    "Dimension": dimension,
+                    "Name": gamma_data.get("Name", "").strip(),
+                    "Attribute": attr,
+                    "Value": g_val,
+                    "Missing In": "ALFA"
+                })
+            elif a_val and not g_val:
+                differences.append({
+                    "Dimension": dimension,
+                    "Name": alfa_data.get("Name", "").strip(),
+                    "Attribute": attr,
+                    "Value": a_val,
+                    "Missing In": "GAMMA"
+                })
+            else:
+                differences.extend([
+                    {"Dimension": dimension, "Name": alfa_data.get("Name", "").strip(), "Attribute": attr, "Value": a_val, "Missing In": "GAMMA"},
+                    {"Dimension": dimension, "Name": alfa_data.get("Name", "").strip(), "Attribute": attr, "Value": g_val, "Missing In": "ALFA"}
+                ])
+    return differences
+
+def compare_mode_2(dimension: str, group_key: str,
+                   alfa_data: Dict[str, str],
+                   gamma_data: Dict[str, str]) -> List[Dict[str, str]]:
+    differences = []
+    a_name = alfa_data.get("Name", "").strip()
+    g_name = gamma_data.get("Name", "").strip()
+    if a_name and g_name:
+        if a_name != g_name:
+            differences.extend([
+                {"Dimension": dimension, "Name": a_name, "Attribute": "Name", "Value": a_name, "Missing In": "GAMMA"},
+                {"Dimension": dimension, "Name": g_name, "Attribute": "Name", "Value": g_name, "Missing In": "ALFA"}
+            ])
+        else:
+            for attr in set(alfa_data.keys()) | set(gamma_data.keys()):
+                if attr == "Name":
+                    continue
+                a_val = alfa_data.get(attr, "").strip()
+                g_val = gamma_data.get(attr, "").strip()
+                if a_val != g_val:
+                    if not a_val and g_val:
+                        differences.append({"Dimension": dimension, "Name": a_name, "Attribute": attr, "Value": g_val, "Missing In": "ALFA"})
+                    elif a_val and not g_val:
+                        differences.append({"Dimension": dimension, "Name": a_name, "Attribute": attr, "Value": a_val, "Missing In": "GAMMA"})
+                    else:
+                        differences.extend([
+                            {"Dimension": dimension, "Name": a_name, "Attribute": attr, "Value": a_val, "Missing In": "GAMMA"},
+                            {"Dimension": dimension, "Name": a_name, "Attribute": attr, "Value": g_val, "Missing In": "ALFA"}
+                        ])
+    else:
+        if not a_name and g_name:
+            differences.append({"Dimension": dimension, "Name": g_name, "Attribute": "Name", "Value": g_name, "Missing In": "ALFA"})
+        elif a_name and not g_name:
+            differences.append({"Dimension": dimension, "Name": a_name, "Attribute": "Name", "Value": a_name, "Missing In": "GAMMA"})
+        else:
+            differences.append({"Dimension": dimension, "Name": "", "Attribute": "Name", "Value": "", "Missing In": "Both"})
+    return differences
+
+def compare_mode_3(dimension: str, group_key: str,
+                   alfa_data: Dict[str, str],
+                   gamma_data: Dict[str, str]) -> List[Dict[str, str]]:
+    differences = []
+    all_attrs = set(alfa_data.keys()) | set(gamma_data.keys())
+    for attr in all_attrs:
+        a_val = alfa_data.get(attr, "").strip()
+        g_val = gamma_data.get(attr, "").strip()
+        if a_val == g_val:
+            continue
+        if not a_val and g_val:
+            differences.append({"Dimension": dimension, "Name": alfa_data.get("Name", "").strip(), "Attribute": attr, "Value": g_val, "Missing In": "ALFA"})
+        elif a_val and not g_val:
+            differences.append({"Dimension": dimension, "Name": alfa_data.get("Name", "").strip(), "Attribute": attr, "Value": a_val, "Missing In": "GAMMA"})
+        else:
+            differences.extend([
+                {"Dimension": dimension, "Name": alfa_data.get("Name", "").strip(), "Attribute": attr, "Value": a_val, "Missing In": "GAMMA"},
+                {"Dimension": dimension, "Name": alfa_data.get("Name", "").strip(), "Attribute": attr, "Value": g_val, "Missing In": "ALFA"}
+            ])
+    return differences
+
+def compare_data(df_alfa: pd.DataFrame,
+                 df_gamma: pd.DataFrame,
+                 comparison_mode: int = 2) -> pd.DataFrame:
+    logging.info(f"Starting data comparison (Mode {comparison_mode})")
+    alfa_lookup = build_lookup_dict(df_alfa)
+    gamma_lookup = build_lookup_dict(df_gamma)
+    all_keys = set(alfa_lookup.keys()) | set(gamma_lookup.keys())
+    differences = []
+    for key in all_keys:
+        parts = key.split(" | ")
+        dimension = parts[0] if parts else ""
+        a_data = alfa_lookup.get(key, {})
+        g_data = gamma_lookup.get(key, {})
+        if comparison_mode == 1:
+            differences.extend(compare_mode_1(dimension, key, a_data, g_data))
+        elif comparison_mode == 2:
+            differences.extend(compare_mode_2(dimension, key, a_data, g_data))
+        elif comparison_mode == 3:
+            differences.extend(compare_mode_3(dimension, key, a_data, g_data))
+    df_diff = pd.DataFrame(differences)
+    if not df_diff.empty:
+        df_diff["Key"] = (df_diff["Dimension"].str.strip() + " | " +
+                          df_diff["Name"].str.strip() + " | " +
+                          df_diff["Attribute"].str.strip() + " | " +
+                          df_diff["Value"].str.strip())
+    logging.info(f"Comparison complete: {len(df_diff)} differences found")
+    return df_diff
+
+def read_exception_table(exc_path: Path) -> pd.DataFrame:
+    if not exc_path or not exc_path.is_file():
+        logging.warning(f"[Exception] Exception file not found: {exc_path}")
+        return pd.DataFrame()
+    try:
+        df = pd.read_excel(exc_path, sheet_name="Sheet1")
+        return df.copy(deep=True)
+    except Exception as e:
+        logging.exception(f"[Exception] Error reading exception table: {e}")
+        return pd.DataFrame()
+
+def merge_exceptions(df_diff: pd.DataFrame, df_exceptions: pd.DataFrame) -> pd.DataFrame:
+    if df_exceptions.empty:
+        return df_diff
+    exc_cols = [col for col in df_exceptions.columns if col in {"Key", "Comments_1", "Comments_2", "hide exception"}]
+    exc = df_exceptions[exc_cols].copy()
+    exc["Key"] = exc["Key"].astype(str).str.strip()
+    df_diff = df_diff.merge(exc, on="Key", how="left", suffixes=("", "_exc"))
+    df_diff["hide exception"] = df_diff.get("hide exception", "no").fillna("no").str.lower()
+    before_len = len(df_diff)
+    df_diff = df_diff[df_diff["hide exception"] != "yes"]
+    logging.debug(f"[Exception] Excluded {before_len - len(df_diff)} rows due to hidden exception.")
+    return df_diff
+
+# ----------------------------
+# Excel-like Grid UI using customtkinter
+# ----------------------------
+def create_ui_column(col_id: str, name: str, locked: bool=False, visible: bool=True, renameable: bool=True) -> Dict[str, Any]:
+    return {
+        "id": col_id,
+        "name": name,
+        "original": col_id,
+        "width": 100,
+        "locked": locked,
+        "visible": visible,
+        "renameable": renameable,
+    }
+
+class ExcelGrid(ctk.CTkFrame):
+    """
+    An Excel-like grid for displaying data with interactive column management.
+    Supports toggling column visibility, renaming columns (except locked ones), and filtering.
+    """
+    def __init__(self, parent, data: pd.DataFrame, columns: List[Dict[str, Any]]):
+        super().__init__(parent)
+        self.df = data
+        self.columns_def = columns
+        self.visible_columns = [col for col in columns if col.get("visible", True)]
+        self.filters: Dict[str, Set[Any]] = {}  # Map column id to set of allowed values
+        self.create_toolbar()
+        self.create_table()
+
+    def create_toolbar(self):
+        toolbar = ctk.CTkFrame(self)
+        toolbar.pack(fill="x", padx=5, pady=5)
+        self.col_btn = ctk.CTkButton(toolbar, text="Manage Columns", command=self.show_column_manager)
+        self.col_btn.pack(side="left", padx=5)
+        self.clear_btn = ctk.CTkButton(toolbar, text="Clear Filters", command=self.clear_filters)
+        self.clear_btn.pack(side="left", padx=5)
+
+    def create_table(self):
+        table_frame = ctk.CTkFrame(self)
+        table_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        self.tree = ttk.Treeview(table_frame, columns=[col["id"] for col in self.visible_columns],
+                                 show="headings")
+        for col in self.visible_columns:
+            self.tree.heading(col["id"], text=col.get("name", col["id"]),
+                              command=lambda c=col["id"]: self.show_header_menu(c))
+            self.tree.column(col["id"], width=col.get("width", 100))
+        y_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        x_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+        self.refresh_table()
+
+    def refresh_table(self):
+        df_filtered = self.df.copy()
+        for col_id, allowed in self.filters.items():
+            if allowed:
+                df_filtered = df_filtered[df_filtered[col_id].isin(allowed)]
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        for _, row in df_filtered.iterrows():
+            values = [row.get(col["id"], "") for col in self.visible_columns]
+            self.tree.insert("", "end", values=values)
+
+    def show_header_menu(self, col_id: str):
+        menu = tk.Menu(self, tearoff=0)
+        for col in self.columns_def:
+            if col["id"] == col_id:
+                if col.get("renameable", True):
+                    menu.add_command(label="Rename", command=lambda: self.prompt_rename(col_id))
+                break
+        menu.add_command(label="Toggle Visibility", command=lambda: self.toggle_column(col_id))
+        menu.add_command(label="Filter Column", command=lambda: self.show_filter_popup(col_id))
+        menu.post(self.winfo_pointerx(), self.winfo_pointery())
+
+    def prompt_rename(self, col_id: str):
+        for col in self.columns_def:
+            if col["id"] == col_id and col.get("renameable", True):
+                new_name = simpledialog.askstring("Rename Column", f"New name for {col['name']}:", initialvalue=col["name"])
+                if new_name:
+                    col["name"] = new_name
+                    self.refresh_headers()
+                break
+
+    def refresh_headers(self):
+        for col in self.visible_columns:
+            self.tree.heading(col["id"], text=col.get("name", col["id"]))
+
+    def toggle_column(self, col_id: str):
+        for col in self.columns_def:
+            if col["id"] == col_id and not col.get("locked", False):
+                col["visible"] = not col.get("visible", True)
+        self.visible_columns = [col for col in self.columns_def if col.get("visible", True)]
+        self.tree["columns"] = [col["id"] for col in self.visible_columns]
+        self.refresh_headers()
+        self.refresh_table()
+
+    def show_filter_popup(self, col_id: str):
+        popup = tk.Toplevel(self)
+        popup.title(f"Filter: {col_id}")
+        popup.transient(self)
+        frame = ctk.CTkFrame(popup)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        unique_vals = sorted(self.df[col_id].dropna().unique())
+        var_dict = {}
+        for val in unique_vals:
+            var = tk.BooleanVar(value=True)
+            var_dict[val] = var
+            chk = ctk.CTkCheckBox(frame, text=str(val), variable=var,
+                                   command=lambda: self.apply_filter(col_id, var_dict))
+            chk.pack(anchor="w")
+        btn = ctk.CTkButton(frame, text="Apply Filter", command=lambda: (popup.destroy(), self.refresh_table()))
+        btn.pack(pady=5)
+
+    def apply_filter(self, col_id: str, var_dict: Dict[Any, tk.BooleanVar]):
+        allowed = {val for val, var in var_dict.items() if var.get()}
+        self.filters[col_id] = allowed
+
+    def clear_filters(self):
+        self.filters.clear()
+        self.refresh_table()
+
+# ----------------------------
+# MAIN GUI APPLICATION
+# ----------------------------
+class ReconciliationGUI(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Data Reconciliation Tool")
+        self.geometry(UI_CONFIG["WINDOW_SIZE"])
+        self.df_differences = None
+        self.raw_alfa = None   # Raw ALFA DataFrame from file
+        self.raw_gamma = None  # Raw GAMMA DataFrame from ZIP
+        self.excel_grid: Optional[ExcelGrid] = None
+        self.setup_tabs()
+        setup_logging()
+        self.log_text = ctk.CTkTextbox(self, height=150, font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"]))
+        self.log_text.configure(state="disabled")
+        self.log_text.pack(fill="both", padx=10, pady=(0,10))
+
+    def setup_tabs(self):
+        self.tab_view = ctk.CTkTabview(self)
+        self.tab_view.pack(fill="both", expand=True, padx=10, pady=10)
+        for tab in ["Settings", "Grid", "Process", "Results"]:
+            self.tab_view.add(tab)
+        self.build_settings_tab()
+        self.build_grid_tab()
+        self.build_process_tab()
+        self.build_results_tab()
+
+    def build_settings_tab(self):
+        tab = self.tab_view.tab("Settings")
+        frame = ctk.CTkFrame(tab)
+        frame.pack(fill="x", padx=10, pady=10)
+        self.path_entries = {}
+        for key in ["ALFA_PATH", "GAMMA_PATH", "EXCEPTION_PATH", "OUTPUT_PATH"]:
+            subframe = ctk.CTkFrame(frame)
+            subframe.pack(fill="x", pady=5)
+            label = ctk.CTkLabel(subframe, text=f"{key.replace('_', ' ')}:", font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"]))
+            label.pack(side="left", padx=5)
+            entry = ctk.CTkEntry(subframe, width=400, font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"]))
+            entry.insert(0, DEFAULT_PATHS.get(key, ""))
+            entry.pack(side="left", padx=5)
+            btn = ctk.CTkButton(subframe, text="Browse", command=lambda k=key: self.browse_file(k))
+            btn.pack(side="left", padx=5)
+            self.path_entries[key] = entry
+        # Add OptionMenus for filtering ALFA's Col1 and Col2
+        self.col1_var = tk.StringVar(value="All")
+        self.col2_var = tk.StringVar(value="All")
+        filt_frame = ctk.CTkFrame(frame)
+        filt_frame.pack(fill="x", pady=5)
+        ctk.CTkLabel(filt_frame, text="Filter Col1:", font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"])).pack(side="left", padx=5)
+        self.col1_menu = ctk.CTkOptionMenu(filt_frame, variable=self.col1_var, values=["All"], font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"]))
+        self.col1_menu.pack(side="left", padx=5)
+        ctk.CTkLabel(filt_frame, text="Filter Col2:", font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"])).pack(side="left", padx=5)
+        self.col2_menu = ctk.CTkOptionMenu(filt_frame, variable=self.col2_var, values=["All"], font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"]))
+        self.col2_menu.pack(side="left", padx=5)
+
+    def build_grid_tab(self):
+        tab = self.tab_view.tab("Grid")
+        view_frame = ctk.CTkFrame(tab)
+        view_frame.pack(fill="x", pady=5)
+        self.view_var = tk.StringVar(value="ALFA")
+        opt = ctk.CTkOptionMenu(view_frame, variable=self.view_var, values=["ALFA", "GAMMA"],
+                                 command=lambda v: self.load_grid_data(), font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"]))
+        opt.pack(side="left", padx=5)
+        # For GAMMA, OptionMenu for filtering by Dimension
+        self.dim_var = tk.StringVar(value="All")
+        self.dim_menu = ctk.CTkOptionMenu(view_frame, variable=self.dim_var, values=["All"],
+                                         command=lambda v: self.load_grid_data(), font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"]))
+        self.dim_menu.pack(side="left", padx=5)
+        self.grid_container = ctk.CTkFrame(tab)
+        self.grid_container.pack(fill="both", expand=True, padx=10, pady=10)
+
+    def build_process_tab(self):
+        tab = self.tab_view.tab("Process")
+        frame = ctk.CTkFrame(tab)
+        frame.pack(fill="x", pady=10)
+        self.progress_bar = ctk.CTkProgressBar(frame)
+        self.progress_bar.pack(fill="x", padx=20, pady=5)
+        self.progress_bar.set(0)
+        self.progress_label = ctk.CTkLabel(frame, text="Ready to process", font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"]))
+        self.progress_label.pack(pady=5)
+        btn_frame = ctk.CTkFrame(frame)
+        btn_frame.pack(pady=5)
+        ctk.CTkButton(btn_frame, text="Run Reconciliation", command=self.run_reconciliation,
+                      font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"])).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Save Results", command=self.save_results,
+                      font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"])).pack(side="left", padx=5)
+
+    def build_results_tab(self):
+        tab = self.tab_view.tab("Results")
+        self.results_text = ctk.CTkTextbox(tab, height=400, font=(UI_CONFIG["FONT_FAMILY"], UI_CONFIG["FONT_SIZES"]["NORMAL"]))
+        self.results_text.pack(fill="both", expand=True, padx=10, pady=10)
+
+    def browse_file(self, key: str):
+        initial_dir = os.path.dirname(self.path_entries[key].get())
+        file_path = filedialog.askopenfilename(initialdir=initial_dir)
+        if file_path:
+            self.path_entries[key].delete(0, tk.END)
+            self.path_entries[key].insert(0, file_path)
+
+    def load_grid_data(self):
+        # Clear grid container
+        for widget in self.grid_container.winfo_children():
+            widget.destroy()
+        view = self.view_var.get()
+        if view == "ALFA":
+            try:
+                self.raw_alfa = pd.read_excel(Path(self.path_entries["ALFA_PATH"].get()), sheet_name="Sheet1", skiprows=3, engine="openpyxl")
+                self.raw_alfa.columns = self.raw_alfa.columns.str.strip()
+                # Populate Col1 and Col2 dropdowns with unique values from the raw data
+                col1_vals = sorted(self.raw_alfa["Col1"].dropna().unique().tolist())
+                col2_vals = sorted(self.raw_alfa["Col2"].dropna().unique().tolist())
+                self.col1_menu.configure(values=["All"] + col1_vals)
+                self.col2_menu.configure(values=["All"] + col2_vals)
+                # Define UI columns for ALFA.
+                # "Dimension_Name" and "Value" are locked (not renameable).
+                ui_cols = [
+                    create_ui_column("Col1", "Col1", locked=True),
+                    create_ui_column("Col2", "Col2", locked=True),
+                    create_ui_column("Dimension_Name", "Dimension", locked=True, renameable=False),
+                    create_ui_column("Value", "Value", locked=True),
+                    create_ui_column("col1", "Column 1"),
+                    create_ui_column("col2", "Column 2"),
+                    create_ui_column("col3", "Column 3")
+                ]
+                self.excel_grid = ExcelGrid(self.grid_container, self.raw_alfa, ui_cols)
+                self.excel_grid.pack(fill="both", expand=True)
+            except Exception as e:
+                messagebox.showerror("Error", f"Error loading ALFA data: {e}")
+        else:
+            try:
+                self.raw_gamma = process_gamma_data(
+                    Path(self.path_entries["GAMMA_PATH"].get()),
+                    ui_columns=[],  # UI customizations will be applied later
+                    bad_dims=[], bad_attrs=[], dim_renames={}, attr_renames={}
+                )
+                dims = sorted(self.raw_gamma["Dimension"].unique())
+                self.dim_menu.configure(values=["All"] + dims)
+                sel_dim = self.dim_var.get()
+                if sel_dim != "All":
+                    display_df = self.raw_gamma[self.raw_gamma["Dimension"] == sel_dim]
+                else:
+                    display_df = self.raw_gamma
+                ui_cols = [
+                    create_ui_column("Name", "Name", locked=True),
+                    create_ui_column("attr1", "Attribute 1"),
+                    create_ui_column("attr2", "Attribute 2"),
+                    create_ui_column("attr3", "Attribute 3")
+                ]
+                self.excel_grid = ExcelGrid(self.grid_container, display_df, ui_cols)
+                self.excel_grid.pack(fill="both", expand=True)
+            except Exception as e:
+                messagebox.showerror("Error", f"Error loading GAMMA data: {e}")
+
+    def run_reconciliation(self):
+        try:
+            self.progress_bar.set(0.1)
+            self.progress_label.configure(text="Processing ALFA data with UI selections...")
+            self.update()
+            # Get UI settings from the grid for ALFA.
+            ui_cols = self.excel_grid.columns_def
+            df_alfa_ui = self.raw_alfa.copy()
+            # Filter by Enabled_Flag
+            if "Enabled_Flag" in df_alfa_ui.columns:
+                df_alfa_ui = df_alfa_ui[df_alfa_ui["Enabled_Flag"].astype(str).str.lower() == "enabled"]
+            # Apply filters for Col1 and Col2
+            col1_filter = self.col1_var.get()
+            col2_filter = self.col2_var.get()
+            if col1_filter != "All":
+                df_alfa_ui = df_alfa_ui[df_alfa_ui["Col1"].astype(str) == col1_filter]
+            if col2_filter != "All":
+                df_alfa_ui = df_alfa_ui[df_alfa_ui["Col2"].astype(str) == col2_filter]
+            # Use only the columns visible in the UI.
+            visible = [col["id"] for col in ui_cols if col.get("visible", True)]
+            df_alfa_ui = df_alfa_ui[visible]
+            # Rename columns according to UI (force "Dimension_Name" -> "Dimension" and "Value" remains)
+            rename_map = {}
+            for col in ui_cols:
+                if col["id"] == "Dimension_Name":
+                    rename_map[col["id"]] = "Dimension"
+                elif col["id"] == "Value":
+                    rename_map[col["id"]] = "Value"
+                elif col.get("renameable", True):
+                    rename_map[col["id"]] = col["name"]
+            df_alfa_ui.rename(columns=rename_map, inplace=True)
+            if "Dimension" not in df_alfa_ui.columns:
+                raise ValueError("Missing required column 'Dimension'")
+            if "Value" not in df_alfa_ui.columns:
+                raise ValueError("Missing required column 'Value'")
+            df_alfa_ui["RecordID"] = df_alfa_ui.index.astype(str)
+            id_vars = ["Dimension", "RecordID"]
+            value_vars = [col for col in df_alfa_ui.columns if col not in id_vars]
+            df_melted = df_alfa_ui.melt(id_vars=id_vars, value_vars=value_vars,
+                                        var_name="Attribute", value_name="MeltedValue")
+            # No backend customizations are applied; everything is UI-based.
+            # Build RefName from rows where Attribute == "Value"
+            ref_df = df_melted[df_melted["Attribute"] == "Value"][["RecordID", "MeltedValue"]].drop_duplicates("RecordID")
+            ref_df.rename(columns={"MeltedValue": "RefName"}, inplace=True)
+            df_final_alfa = df_melted.merge(ref_df, on="RecordID", how="left")
+            for col in ["Dimension", "Attribute", "MeltedValue", "RefName"]:
+                df_final_alfa[col] = df_final_alfa[col].fillna("").astype(str)
+            df_final_alfa["Name"] = df_final_alfa["RefName"]
+            df_final_alfa["GroupKey"] = df_final_alfa["Dimension"].str.strip() + " | " + df_final_alfa["RefName"].str.strip()
+            df_final_alfa["Key"] = (df_final_alfa["Dimension"].str.strip() + " | " +
+                                     df_final_alfa["Name"].str.strip() + " | " +
+                                     df_final_alfa["Attribute"].str.strip() + " | " +
+                                     df_final_alfa["MeltedValue"].str.strip())
+            for col in ["Comments_1", "Comments_2", "Action Item", "Missing In"]:
+                df_final_alfa[col] = ""
+            df_final_alfa.drop_duplicates(inplace=True)
+            self.progress_bar.set(0.4)
+            self.progress_label.configure(text="Processing GAMMA data...")
+            self.update()
+            df_gamma = process_gamma_data(
+                Path(self.path_entries["GAMMA_PATH"].get()),
+                ui_columns=[],  # No UI backend rules here
+                bad_dims=[], bad_attrs=[], dim_renames={}, attr_renames={}
+            )
+            self.progress_bar.set(0.6)
+            self.progress_label.configure(text="Comparing data...")
+            self.update()
+            df_diff = compare_data(df_final_alfa, df_gamma, 2)
+            if not df_diff.empty:
+                df_diff["Key"] = (df_diff["Dimension"].str.strip() + " | " +
+                                  df_diff["Name"].str.strip() + " | " +
+                                  df_diff["Attribute"].str.strip() + " | " +
+                                  df_diff["MeltedValue"].str.strip())
+            exc_path = Path(self.path_entries["EXCEPTION_PATH"].get())
+            df_exceptions = read_exception_table(exc_path) if exc_path.exists() else pd.DataFrame()
+            final_diff = merge_exceptions(df_diff, df_exceptions)
+            if "Action Item" not in final_diff.columns:
+                final_diff["Action Item"] = ""
+            self.df_differences = final_diff
+            self.progress_bar.set(0.8)
+            self.progress_label.configure(text="Generating results...")
+            self.update()
+            self.results_text.delete("1.0", tk.END)
+            self.results_text.insert(tk.END, self.df_differences.to_string())
+            self.progress_bar.set(1.0)
+            self.progress_label.configure(text="Processing complete!")
+            self.tab_view.set("Results")
+        except Exception as e:
+            logging.exception("Error during reconciliation")
+            messagebox.showerror("Error", f"An error occurred: {e}")
+            self.progress_label.configure(text="Error occurred during processing")
+
+    def save_results(self):
+        if self.df_differences is None or self.df_differences.empty:
+            messagebox.showwarning("Warning", "No results to save")
+            return
+        try:
+            output_path = Path(self.path_entries["OUTPUT_PATH"].get())
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            final_cols = ["Key", "Dimension", "Name", "Attribute", "Value", "Comments_1", "Comments_2", "Action Item", "Missing In"]
+            df_out = self.df_differences.copy()
+            for col in final_cols:
+                if col not in df_out.columns:
+                    df_out[col] = ""
+            df_out = df_out[final_cols]
+            df_out.to_excel(output_path, index=False)
+            self.format_excel_output(output_path)
+            messagebox.showinfo("Success", f"Results saved to {output_path}")
+        except Exception as e:
+            logging.exception("Error saving results")
+            messagebox.showerror("Error", f"Error saving results: {e}")
+
+    def format_excel_output(self, path: Path):
+        try:
+            wb = load_workbook(path)
+            ws = wb.active
+            header_font = Font(name=UI_CONFIG["FONT_FAMILY"], size=UI_CONFIG["FONT_SIZES"]["NORMAL"], bold=True)
+            data_font = Font(name=UI_CONFIG["FONT_FAMILY"], size=UI_CONFIG["FONT_SIZES"]["NORMAL"])
+            header_fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+            for cell in ws[1]:
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center")
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
+                    cell.font = data_font
+                    cell.alignment = Alignment(horizontal="left")
+            for column in ws.columns:
+                max_length = 0
+                column = list(column)
+                for cell in column:
+                    try:
+                        max_length = max(max_length, len(str(cell.value)))
+                    except Exception:
+                        pass
+                ws.column_dimensions[column[0].column_letter].width = max_length + 2
+            ws.freeze_panes = "A2"
+            wb.save(path)
+        except Exception as e:
+            logging.exception("Error formatting Excel output")
+            raise
+
+def main():
+    try:
+        app = ReconciliationGUI()
+        app.mainloop()
+    except Exception as e:
+        logging.exception("Critical error in main application")
+        messagebox.showerror("Critical Error", f"Application encountered a critical error: {e}")
+
+if __name__ == "__main__":
+    main()

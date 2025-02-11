@@ -1,0 +1,1014 @@
+#!/usr/bin/env python3
+
+"""
+Full Reconciliation Script with UI
+----------------------------------
+- Reads ALFA from Excel (skip first 3 rows).
+- Reads GAMMA from a zip of .txt files.
+- Allows user to configure dimension/attribute filters, renames, col1/col2 filter, only "Enabled" rows, etc.
+- Stores user choices in a config JSON file for subsequent runs.
+- Merges exceptions (Comments_1, Comments_2) and hides flagged rows.
+- Offers 3 comparison options:
+    1) Show all missing in ALFA or GAMMA.
+    2) If a Name is missing in one, hide all of its attributes. If Name is matched, show missing attributes.
+    3) Show both missing and matching (with potential multiple sheets if large).
+- Outputs final data to Excel with formatting.
+
+Author: (Your Name)
+Date: February 2025
+"""
+
+import os
+import json
+import zipfile
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional, Set, Tuple
+
+# UI imports
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+import customtkinter as ctk
+
+# Data imports
+import pandas as pd
+import numpy as np
+
+# Excel formatting
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+
+# Detect encoding (optional, for reading .txt in the zip)
+try:
+    import chardet
+except ImportError:
+    chardet = None
+
+# ------------------------------
+# DEFAULT PATHS
+# ------------------------------
+DEFAULT_PATHS = {
+    "ALFA_PATH": "data/AlfaData.xlsx",
+    "GAMMA_PATH": "data/GammaData.zip",
+    "EXCEPTION_PATH": "data/Exception_Table.xlsx",
+    "OUTPUT_PATH": "output/Missing_Items.xlsx",
+    "CONFIG_PATH": "config/reconciliation_config.json"
+}
+
+# ------------------------------
+# LOGGING
+# ------------------------------
+def setup_logger():
+    """Set up a basic logger that prints to console."""
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+
+setup_logger()
+
+# ------------------------------
+# CONFIG LOAD/SAVE
+# ------------------------------
+def load_config(path: Path) -> Dict:
+    """Load user config (filters, renames, etc.) from a JSON file, or return defaults if not found."""
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load config from {path}: {e}")
+    return {
+        "alfa": {
+            "filter_col1": None,
+            "filter_col2": None,
+            "only_enabled": True,
+            "excluded_dimensions": [],
+            "excluded_attributes": [],
+            "dimension_renames": {},
+            "attribute_renames": {}
+        },
+        "gamma": {
+            "excluded_dimensions": [],
+            "excluded_attributes": [],
+            "dimension_renames": {},
+            "attribute_renames": {}
+        },
+        "comparison_option": 1
+    }
+
+def save_config(config: Dict, path: Path):
+    """Save user config as JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        logging.info(f"Config saved to {path}")
+    except Exception as e:
+        logging.error(f"Error saving config: {e}")
+
+# ------------------------------
+# DATA READING: ALFA
+# ------------------------------
+def read_alfa(alfa_path: Path,
+              filter_col1: Optional[str],
+              filter_col2: Optional[str],
+              only_enabled: bool) -> pd.DataFrame:
+    """Read ALFA data from Excel (skips first 3 rows). Filter by col1/col2 and only_enabled if so configured."""
+    if not alfa_path.is_file():
+        logging.warning(f"ALFA path not found: {alfa_path}")
+        return pd.DataFrame()
+    try:
+        logging.info(f"Reading ALFA from {alfa_path}")
+        df = pd.read_excel(alfa_path, skiprows=3, engine="openpyxl")
+        df.columns = df.columns.str.strip()  # Clean column names of trailing spaces
+        
+        # Filter by only enabled
+        if only_enabled and "Enabled_Flag" in df.columns:
+            df = df[df["Enabled_Flag"].astype(str).str.lower() == "enabled"]
+        
+        # Filter col1, col2
+        if filter_col1 and filter_col1.lower() != "all":
+            if "Col1" in df.columns:
+                df = df[df["Col1"].astype(str) == filter_col1]
+        if filter_col2 and filter_col2.lower() != "all":
+            if "Col2" in df.columns:
+                df = df[df["Col2"].astype(str) == filter_col2]
+        
+        return df.copy(deep=True)
+    except Exception as e:
+        logging.error(f"Error reading ALFA: {e}")
+        return pd.DataFrame()
+
+# ------------------------------
+# DATA READING: GAMMA
+# ------------------------------
+def read_gamma_zip(zip_path: Path) -> pd.DataFrame:
+    """Read .txt files from a ZIP. Each file’s dimension is derived from the filename minus '_ceaster.txt' (if found)."""
+    if not zip_path.is_file():
+        logging.warning(f"GAMMA path not found: {zip_path}")
+        return pd.DataFrame()
+    
+    all_dfs = []
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+            if not txt_files:
+                logging.warning("No .txt files in ZIP")
+                return pd.DataFrame()
+            
+            for txt_file in txt_files:
+                try:
+                    base_name = os.path.basename(txt_file)
+                    # Derive dimension from filename
+                    if "_ceaster.txt" in base_name.lower():
+                        base_dim = base_name.lower().replace("_ceaster.txt", "")
+                    else:
+                        base_dim, _ = os.path.splitext(base_name)
+                    
+                    dimension = base_dim.replace("_", " ").strip().title()  # or .upper() / custom logic
+
+                    # Load the text data
+                    with z.open(txt_file) as fo:
+                        # Attempt to detect encoding
+                        if chardet is not None:
+                            sample = fo.read(1024)
+                            file_encoding = chardet.detect(sample)["encoding"] or "utf-8"
+                            fo.seek(0)
+                        else:
+                            file_encoding = "utf-8"
+                        
+                        df_part = pd.read_csv(
+                            fo,
+                            delimiter=",",
+                            encoding=file_encoding
+                        )
+                    
+                    if df_part.empty:
+                        continue
+                    df_part.columns = df_part.columns.str.strip()
+                    # The first column is "Name" (RefName)
+                    first_col = df_part.columns[0]
+                    df_part.rename(columns={first_col: "Name"}, inplace=True)
+                    df_part["Dimension"] = dimension
+                    all_dfs.append(df_part)
+                except Exception as e2:
+                    logging.error(f"Error reading {txt_file}: {e2}")
+                    continue
+    except Exception as e:
+        logging.error(f"Error opening ZIP {zip_path}: {e}")
+        return pd.DataFrame()
+    
+    if all_dfs:
+        return pd.concat(all_dfs, ignore_index=True)
+    else:
+        return pd.DataFrame()
+
+# ------------------------------
+# UI DRIVEN FILTERS/RENAMES
+# ------------------------------
+def apply_dimension_attribute_filters_renames(
+    df: pd.DataFrame,
+    dimension_col: str,
+    name_col: str,
+    config_block: Dict[str, any]
+) -> pd.DataFrame:
+    """
+    Filters out dimensions in config_block["excluded_dimensions"], 
+    filters out attributes in config_block["excluded_attributes"],
+    renames certain dimension or attribute values according to config_block["dimension_renames"] and config_block["attribute_renames"].
+
+    dimension_col = "Dimension" or some column name in df
+    name_col      = "Value" / "Name" / "RefName"
+    """
+    if df.empty:
+        return df
+    
+    df = df.copy()
+    # 1) We'll gather attribute columns vs dimension/name columns
+    #    Usually the dimension_col and name_col are known. The rest are attributes.
+    #    We'll do this logic differently for ALFA vs GAMMA, but the principle is the same.
+    
+    # dimension renames
+    dim_map = config_block.get("dimension_renames", {})
+    # attribute renames
+    attr_map = config_block.get("attribute_renames", {})
+    
+    # Step 1: We'll melt the DF so we can do dimension-based filter vs attribute-based filter easily.
+    #         For ALFA, we skip col1/col2, etc. But let's do it in a general approach.
+    # We'll identify "id_vars" as [dimension_col, name_col], everything else -> attributes
+    id_vars = [dimension_col, name_col]
+    # Some columns might not exist (like for ALFA we might skip some). So let's only take existing:
+    id_vars = [c for c in id_vars if c in df.columns]
+    
+    # Build the list of value_vars for melting
+    value_vars = [c for c in df.columns if c not in id_vars]
+    
+    df_melted = df.melt(
+        id_vars=id_vars,
+        value_vars=value_vars,
+        var_name="Attribute",
+        value_name="Value"
+    )
+    
+    # Step 2: Filter out any dimension in excluded_dimensions
+    excl_dims = set(config_block.get("excluded_dimensions", []))
+    if dimension_col in df_melted.columns:
+        df_melted = df_melted[~df_melted[dimension_col].isin(excl_dims)]
+    
+    # Step 3: Filter out any attribute in excluded_attributes
+    excl_attrs = set(config_block.get("excluded_attributes", []))
+    df_melted = df_melted[~df_melted["Attribute"].isin(excl_attrs)]
+    
+    # Step 4: Rename dimension values
+    if dim_map and dimension_col in df_melted.columns:
+        df_melted[dimension_col] = df_melted[dimension_col].replace(dim_map)
+    
+    # Step 5: Rename attribute labels if in attr_map
+    df_melted["Attribute"] = df_melted["Attribute"].replace(attr_map)
+    
+    # Step 6: We'll store references for final merging
+    df_melted = df_melted.fillna("")
+    
+    # Next, build "RefName" from the name_col
+    df_melted.rename(columns={dimension_col: "Dimension"}, inplace=True)
+    df_melted.rename(columns={name_col: "RefName"}, inplace=True)
+    
+    # Finally, we unify columns
+    # We'll produce a standard set: [Dimension, RefName, Attribute, Value]
+    # everything else can go, because we melted it already
+    return df_melted[["Dimension", "RefName", "Attribute", "Value"]].copy()
+
+# ------------------------------
+# BUILD KEYS + COMPARISON
+# ------------------------------
+def build_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """Add columns Key, GroupKey, etc. for final usage."""
+    df = df.copy()
+    df["Dimension"] = df["Dimension"].fillna("").astype(str).str.strip()
+    df["RefName"]   = df["RefName"].fillna("").astype(str).str.strip()
+    df["Attribute"] = df["Attribute"].fillna("").astype(str).str.strip()
+    df["Value"]     = df["Value"].fillna("").astype(str).str.strip()
+    
+    df["GroupKey"] = df["Dimension"] + " | " + df["RefName"]
+    df["Key"] = df["Dimension"] + " | " + df["RefName"] + " | " + df["Attribute"] + " | " + df["Value"]
+    # Additional placeholders
+    df["Comments_1"] = ""
+    df["Comments_2"] = ""
+    df["Action Item"] = ""
+    df["Missing In"] = ""
+    return df
+
+def build_lookup_dict(df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+    """
+    For each GroupKey, build an attribute->value dict.
+    So lookup_dict[group_key]["Name"] = <RefName>
+    """
+    # We'll forcibly store "Name" = RefName for convenience
+    # That helps us in comparison modes.
+    df = df.copy()
+    # We'll group by GroupKey and pivot out:
+    lookup = {}
+    for gk, grp in df.groupby("GroupKey"):
+        # We'll create a dict of {Attribute: Value}
+        adict = {}
+        # Also store a "Name" attribute, which is the RefName
+        # so we have a consistent way to check if the item is "missing"
+        refname = grp["RefName"].iloc[0] if not grp.empty else ""
+        adict["Name"] = refname
+        for _, row in grp.iterrows():
+            adict[row["Attribute"]] = row["Value"]
+        lookup[gk] = adict
+    return lookup
+
+def compare_data(
+    df_alfa: pd.DataFrame,
+    df_gamma: pd.DataFrame,
+    comparison_mode: int = 1
+) -> pd.DataFrame:
+    """
+    Compare data using one of three modes:
+    1) Show everything that is missing in ALFA or GAMMA
+    2) If missing Name, do not show all attributes. But if Name matches, show missing attributes.
+    3) Show missing and matching; can get large.
+    """
+    # Build lookups
+    alfa_lookup = build_lookup_dict(df_alfa)
+    gamma_lookup = build_lookup_dict(df_gamma)
+    all_groupkeys = set(alfa_lookup.keys()) | set(gamma_lookup.keys())
+    
+    differences = []
+    for gk in all_groupkeys:
+        # dimension is part of the gk, e.g. "Dim1 | SomeName"
+        # we'll parse dimension from that if we want
+        dimension = gk.split(" | ")[0] if " | " in gk else ""
+        a_data = alfa_lookup.get(gk, {})
+        g_data = gamma_lookup.get(gk, {})
+        
+        name_a = a_data.get("Name", "").strip()
+        name_g = g_data.get("Name", "").strip()
+        
+        if comparison_mode == 1:
+            differences.extend(compare_mode_1(dimension, name_a, name_g, a_data, g_data))
+        elif comparison_mode == 2:
+            differences.extend(compare_mode_2(dimension, name_a, name_g, a_data, g_data))
+        else:
+            # mode 3
+            differences.extend(compare_mode_3(dimension, name_a, name_g, a_data, g_data))
+    
+    df_diff = pd.DataFrame(differences)
+    if df_diff.empty:
+        return df_diff
+    
+    # Rebuild the "Key" column
+    df_diff["Key"] = (df_diff["Dimension"].str.strip() + " | " +
+                      df_diff["Name"].str.strip() + " | " +
+                      df_diff["Attribute"].str.strip() + " | " +
+                      df_diff["Value"].str.strip())
+    return df_diff
+
+# --- The three modes below are examples of the logic described:
+def compare_mode_1(dimension: str, name_a: str, name_g: str,
+                   a_data: Dict[str, str],
+                   g_data: Dict[str, str]) -> List[Dict[str, str]]:
+    """
+    Mode 1: Show everything that is missing in ALFA or GAMMA.
+    If attribute differs, we show an entry for ALFA side and an entry for GAMMA side.
+    """
+    results = []
+    all_attrs = set(a_data.keys()) | set(g_data.keys())
+    for attr in all_attrs:
+        val_a = a_data.get(attr, "")
+        val_g = g_data.get(attr, "")
+        if val_a != val_g:
+            if val_a and not val_g:
+                # Missing in GAMMA
+                results.append({
+                    "Dimension": dimension,
+                    "Name": name_a,
+                    "Attribute": attr,
+                    "Value": val_a,
+                    "Comments_1": "",
+                    "Comments_2": "",
+                    "Action Item": "",
+                    "Missing In": "GAMMA"
+                })
+            elif val_g and not val_a:
+                results.append({
+                    "Dimension": dimension,
+                    "Name": name_g,
+                    "Attribute": attr,
+                    "Value": val_g,
+                    "Comments_1": "",
+                    "Comments_2": "",
+                    "Action Item": "",
+                    "Missing In": "ALFA"
+                })
+            else:
+                # Both exist but differ
+                results.append({
+                    "Dimension": dimension,
+                    "Name": name_a,
+                    "Attribute": attr,
+                    "Value": val_a,
+                    "Comments_1": "",
+                    "Comments_2": "",
+                    "Action Item": "",
+                    "Missing In": "GAMMA"
+                })
+                results.append({
+                    "Dimension": dimension,
+                    "Name": name_g,
+                    "Attribute": attr,
+                    "Value": val_g,
+                    "Comments_1": "",
+                    "Comments_2": "",
+                    "Action Item": "",
+                    "Missing In": "ALFA"
+                })
+    return results
+
+def compare_mode_2(dimension: str, name_a: str, name_g: str,
+                   a_data: Dict[str, str],
+                   g_data: Dict[str, str]) -> List[Dict[str, str]]:
+    """
+    Mode 2:
+    - If a “Name” is missing entirely, do not show all its attributes.
+    - If Name is matched, show missing attributes under that name.
+    """
+    results = []
+    # If both names exist and match
+    if name_a and name_g and (name_a == name_g):
+        # Compare attributes
+        all_attrs = set(a_data.keys()) | set(g_data.keys())
+        all_attrs.discard("Name")  # skip the "Name" attribute
+        for attr in all_attrs:
+            val_a = a_data.get(attr, "")
+            val_g = g_data.get(attr, "")
+            if val_a != val_g:
+                if val_a and not val_g:
+                    # missing in gamma
+                    results.append({
+                        "Dimension": dimension,
+                        "Name": name_a,
+                        "Attribute": attr,
+                        "Value": val_a,
+                        "Missing In": "GAMMA"
+                    })
+                elif val_g and not val_a:
+                    # missing in alfa
+                    results.append({
+                        "Dimension": dimension,
+                        "Name": name_a,
+                        "Attribute": attr,
+                        "Value": val_g,
+                        "Missing In": "ALFA"
+                    })
+                else:
+                    # both exist but differ
+                    results.append({
+                        "Dimension": dimension,
+                        "Name": name_a,
+                        "Attribute": attr,
+                        "Value": val_a,
+                        "Missing In": "GAMMA"
+                    })
+                    results.append({
+                        "Dimension": dimension,
+                        "Name": name_a,
+                        "Attribute": attr,
+                        "Value": val_g,
+                        "Missing In": "ALFA"
+                    })
+    else:
+        # if name is missing in ALFA or missing in GAMMA, we skip showing the attributes
+        # but we can show a single line to indicate the name is missing if you want
+        if name_a and not name_g:
+            # Name is missing in gamma
+            # We do not list all attributes from ALFA, we just show that name is missing
+            results.append({
+                "Dimension": dimension,
+                "Name": name_a,
+                "Attribute": "Name",
+                "Value": name_a,
+                "Missing In": "GAMMA"
+            })
+        elif name_g and not name_a:
+            # missing in alfa
+            results.append({
+                "Dimension": dimension,
+                "Name": name_g,
+                "Attribute": "Name",
+                "Value": name_g,
+                "Missing In": "ALFA"
+            })
+    return results
+
+def compare_mode_3(dimension: str, name_a: str, name_g: str,
+                   a_data: Dict[str, str],
+                   g_data: Dict[str, str]) -> List[Dict[str, str]]:
+    """
+    Mode 3: Show missing and matching.
+    We show if val_a != val_g. That includes name or any attribute.
+    Potentially large. We also show matched attributes if you wanted.
+    For brevity, let's do a simpler version: list differences similarly to mode 1, plus also list any that match.
+    """
+    results = []
+    all_attrs = set(a_data.keys()) | set(g_data.keys())
+    for attr in all_attrs:
+        val_a = a_data.get(attr, "")
+        val_g = g_data.get(attr, "")
+        if val_a == val_g:
+            # Could show in results as “matching” row if you want:
+            results.append({
+                "Dimension": dimension,
+                "Name": name_a if name_a else name_g,
+                "Attribute": attr,
+                "Value": val_a,
+                "Missing In": ""  # matched
+            })
+        else:
+            # same difference approach as mode 1
+            if val_a and not val_g:
+                results.append({
+                    "Dimension": dimension,
+                    "Name": name_a,
+                    "Attribute": attr,
+                    "Value": val_a,
+                    "Missing In": "GAMMA"
+                })
+            elif val_g and not val_a:
+                results.append({
+                    "Dimension": dimension,
+                    "Name": name_g,
+                    "Attribute": attr,
+                    "Value": val_g,
+                    "Missing In": "ALFA"
+                })
+            else:
+                # both exist but differ
+                results.append({
+                    "Dimension": dimension,
+                    "Name": name_a,
+                    "Attribute": attr,
+                    "Value": val_a,
+                    "Missing In": "GAMMA"
+                })
+                results.append({
+                    "Dimension": dimension,
+                    "Name": name_a if name_a else name_g,
+                    "Attribute": attr,
+                    "Value": val_g,
+                    "Missing In": "ALFA"
+                })
+    return results
+
+# ------------------------------
+# EXCEPTION TABLE MERGE
+# ------------------------------
+def read_exception_table(exc_path: Path) -> pd.DataFrame:
+    """Read an Exception table if it exists, return empty if not."""
+    if exc_path.is_file():
+        try:
+            return pd.read_excel(exc_path, sheet_name=0)
+        except Exception as e:
+            logging.error(f"Error reading exception table {exc_path}: {e}")
+    return pd.DataFrame()
+
+def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merges Comments_1, Comments_2, hide exception from exceptions onto df by 'Key'.
+    If hide exception == 'yes', we remove that row from df.
+    """
+    if df.empty or df_exc.empty or "Key" not in df.columns:
+        return df
+    
+    # We only need a few columns from exceptions: Key, Comments_1, Comments_2, hide exception
+    keep_cols = [c for c in ["Key", "Comments_1", "Comments_2", "hide exception"] if c in df_exc.columns]
+    if not keep_cols:
+        return df
+    
+    exc = df_exc[keep_cols].copy()
+    exc["Key"] = exc["Key"].astype(str).str.strip()
+    
+    merged = df.merge(exc, on="Key", how="left", suffixes=("", "_exc"))
+    
+    # If hide exception is "yes", drop row
+    merged["hide exception"] = merged.get("hide exception", "").fillna("").astype(str).str.lower()
+    final = merged[merged["hide exception"] != "yes"].copy()
+
+    # Overwrite Comments columns if present
+    if "Comments_1_exc" in final.columns:
+        final["Comments_1"] = final["Comments_1_exc"].where(final["Comments_1_exc"].notna(), final["Comments_1"])
+        final.drop(columns=["Comments_1_exc"], inplace=True)
+    if "Comments_2_exc" in final.columns:
+        final["Comments_2"] = final["Comments_2_exc"].where(final["Comments_2_exc"].notna(), final["Comments_2"])
+        final.drop(columns=["Comments_2_exc"], inplace=True)
+    
+    # Remove hide exception column
+    if "hide exception" in final.columns:
+        final.drop(columns=["hide exception"], inplace=True)
+    
+    return final
+
+# ------------------------------
+# EXCEL OUTPUT
+# ------------------------------
+def write_excel(df: pd.DataFrame, out_path: Path, mode: int):
+    """
+    Write final df to Excel. 
+    If mode == 3 and data is huge, split into multiple sheets of 50k rows each (example threshold).
+    """
+    if df.empty:
+        logging.info("No differences found. Not writing output.")
+        return
+    
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # If mode==3 and too big, split
+    max_rows_per_sheet = 50000 if mode == 3 else 5000000  # arbitrary
+    wb = Workbook()
+    sheet_count = 1
+    
+    # Standard columns
+    final_cols = [
+        "Key", "Dimension", "Name", "Attribute", "Value",
+        "Comments_1", "Comments_2", "Action Item", "Missing In"
+    ]
+    for c in final_cols:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[final_cols]
+    
+    start_idx = 0
+    while start_idx < len(df):
+        end_idx = min(start_idx + max_rows_per_sheet, len(df))
+        chunk = df.iloc[start_idx:end_idx]
+        
+        sheet_name = f"Results{sheet_count}"
+        if sheet_count == 1:
+            ws = wb.active
+            ws.title = sheet_name
+        else:
+            ws = wb.create_sheet(title=sheet_name)
+        
+        # Write headers
+        ws.append(final_cols)
+        for r in chunk.itertuples(index=False):
+            ws.append(r)
+        
+        sheet_count += 1
+        start_idx = end_idx
+    
+    # Optional formatting
+    for ws in wb.worksheets:
+        # header style
+        header_font = Font(bold=True)
+        header_fill = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+        # auto width
+        for col in ws.columns:
+            max_length = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                val = str(cell.value) if cell.value is not None else ""
+                max_length = max(max_length, len(val))
+            ws.column_dimensions[col_letter].width = max_length + 2
+        ws.freeze_panes = "A2"
+    
+    wb.save(out_path)
+    logging.info(f"Results written to {out_path}")
+
+# ------------------------------
+# MAIN GUI APP
+# ------------------------------
+class ReconciliationGUI(ctk.CTk):
+    def __init__(self, config_path: Path):
+        super().__init__()
+        self.title("Full Data Reconciliation Tool")
+        self.geometry("1350x800")
+        
+        self.config_path = config_path
+        self.config = load_config(config_path)
+        
+        self.setup_widgets()
+    
+    def setup_widgets(self):
+        """Create main layout: a tabbed interface or frames for each step."""
+        self.tabview = ctk.CTkTabview(self)
+        self.tabview.pack(fill="both", expand=True)
+        
+        # 4 main tabs: Paths, ALFA Config, GAMMA Config, Run
+        self.tabview.add("Paths")
+        self.tabview.add("ALFA Config")
+        self.tabview.add("GAMMA Config")
+        self.tabview.add("Run Comparison")
+        
+        # 1) Paths
+        self.build_paths_tab(self.tabview.tab("Paths"))
+        
+        # 2) ALFA config
+        self.build_alfa_config_tab(self.tabview.tab("ALFA Config"))
+        
+        # 3) GAMMA config
+        self.build_gamma_config_tab(self.tabview.tab("GAMMA Config"))
+        
+        # 4) Run
+        self.build_run_tab(self.tabview.tab("Run Comparison"))
+    
+    # ---------------------------------------------------
+    # Paths Tab
+    # ---------------------------------------------------
+    def build_paths_tab(self, parent):
+        frame = ctk.CTkFrame(parent)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        self.paths = {}
+        
+        def create_path_row(label_text, key):
+            rowf = ctk.CTkFrame(frame)
+            rowf.pack(fill="x", pady=5)
+            lbl = ctk.CTkLabel(rowf, text=label_text, width=150)
+            lbl.pack(side="left", padx=5)
+            
+            ent = ctk.CTkEntry(rowf, width=600)
+            ent.pack(side="left", padx=5)
+            ent.insert(0, self.config.get(key, DEFAULT_PATHS.get(key, "")))
+            
+            def browse_file():
+                if "PATH" in key and key != "CONFIG_PATH":
+                    # normal file open
+                    fpath = filedialog.askopenfilename()
+                    if fpath:
+                        ent.delete(0, tk.END)
+                        ent.insert(0, fpath)
+                else:
+                    # general fallback
+                    fpath = filedialog.askopenfilename()
+                    if fpath:
+                        ent.delete(0, tk.END)
+                        ent.insert(0, fpath)
+            
+            btn = ctk.CTkButton(rowf, text="Browse", command=browse_file)
+            btn.pack(side="left", padx=5)
+            
+            self.paths[key] = ent
+        
+        create_path_row("ALFA Excel Path:", "ALFA_PATH")
+        create_path_row("GAMMA Zip Path:", "GAMMA_PATH")
+        create_path_row("Exception Table Path:", "EXCEPTION_PATH")
+        create_path_row("Output Path:", "OUTPUT_PATH")
+        
+        # Config path is generally fixed
+        ctk.CTkLabel(frame, text=f"Config Path: {self.config_path}", wraplength=500).pack(pady=10)
+    
+    # ---------------------------------------------------
+    # ALFA Config Tab
+    # ---------------------------------------------------
+    def build_alfa_config_tab(self, parent):
+        frame = ctk.CTkFrame(parent)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Filter col1, col2
+        self.col1_var = tk.StringVar(value=self.config["alfa"].get("filter_col1", "All"))
+        self.col2_var = tk.StringVar(value=self.config["alfa"].get("filter_col2", "All"))
+        self.enabled_var = tk.BooleanVar(value=self.config["alfa"].get("only_enabled", True))
+        
+        rowf = ctk.CTkFrame(frame)
+        rowf.pack(fill="x", pady=5)
+        ctk.CTkLabel(rowf, text="Filter Col1:").pack(side="left", padx=5)
+        self.col1_entry = ctk.CTkEntry(rowf, width=200, textvariable=self.col1_var)
+        self.col1_entry.pack(side="left", padx=5)
+        
+        ctk.CTkLabel(rowf, text="Filter Col2:").pack(side="left", padx=5)
+        self.col2_entry = ctk.CTkEntry(rowf, width=200, textvariable=self.col2_var)
+        self.col2_entry.pack(side="left", padx=5)
+        
+        ctk.CTkCheckBox(
+            frame, 
+            text="Only Enabled Rows", 
+            variable=self.enabled_var
+        ).pack(anchor="w", padx=5, pady=5)
+        
+        # Excluded dimensions, attributes
+        rowf2 = ctk.CTkFrame(frame)
+        rowf2.pack(fill="x", pady=5)
+        
+        self.alfa_excl_dims = tk.StringVar(value=", ".join(self.config["alfa"].get("excluded_dimensions", [])))
+        ctk.CTkLabel(rowf2, text="Exclude Dimensions (comma-separated):").pack(anchor="w", padx=5)
+        ctk.CTkEntry(rowf2, textvariable=self.alfa_excl_dims, width=400).pack(side="left", padx=5)
+        
+        rowf3 = ctk.CTkFrame(frame)
+        rowf3.pack(fill="x", pady=5)
+        self.alfa_excl_attrs = tk.StringVar(value=", ".join(self.config["alfa"].get("excluded_attributes", [])))
+        ctk.CTkLabel(rowf3, text="Exclude Attributes (comma-separated):").pack(anchor="w", padx=5)
+        ctk.CTkEntry(rowf3, textvariable=self.alfa_excl_attrs, width=400).pack(side="left", padx=5)
+        
+        # Renames
+        # We'll store dimension_renames and attribute_renames as JSON in config.
+        rowf4 = ctk.CTkFrame(frame)
+        rowf4.pack(fill="both", expand=True, pady=10)
+        ctk.CTkButton(rowf4, text="Manage Dimension Renames", command=lambda: self.show_rename_popup("alfa", "dimension")).pack(side="left", padx=5)
+        ctk.CTkButton(rowf4, text="Manage Attribute Renames", command=lambda: self.show_rename_popup("alfa", "attribute")).pack(side="left", padx=5)
+        
+        ctk.CTkLabel(frame, text="(Use the buttons above to rename ALFA dimension/attribute values.)").pack(pady=5)
+    
+    # ---------------------------------------------------
+    # GAMMA Config Tab
+    # ---------------------------------------------------
+    def build_gamma_config_tab(self, parent):
+        frame = ctk.CTkFrame(parent)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Excluded dims, attrs
+        rowf1 = ctk.CTkFrame(frame)
+        rowf1.pack(fill="x", pady=5)
+        self.gamma_excl_dims = tk.StringVar(value=", ".join(self.config["gamma"].get("excluded_dimensions", [])))
+        ctk.CTkLabel(rowf1, text="Exclude Dimensions (comma-separated):").pack(side="left", padx=5)
+        ctk.CTkEntry(rowf1, textvariable=self.gamma_excl_dims, width=400).pack(side="left", padx=5)
+        
+        rowf2 = ctk.CTkFrame(frame)
+        rowf2.pack(fill="x", pady=5)
+        self.gamma_excl_attrs = tk.StringVar(value=", ".join(self.config["gamma"].get("excluded_attributes", [])))
+        ctk.CTkLabel(rowf2, text="Exclude Attributes (comma-separated):").pack(side="left", padx=5)
+        ctk.CTkEntry(rowf2, textvariable=self.gamma_excl_attrs, width=400).pack(side="left", padx=5)
+        
+        # Buttons to rename dims, attrs
+        rowf3 = ctk.CTkFrame(frame)
+        rowf3.pack(fill="x", pady=10)
+        ctk.CTkButton(rowf3, text="Manage Dimension Renames", command=lambda: self.show_rename_popup("gamma", "dimension")).pack(side="left", padx=5)
+        ctk.CTkButton(rowf3, text="Manage Attribute Renames", command=lambda: self.show_rename_popup("gamma", "attribute")).pack(side="left", padx=5)
+    
+    # ---------------------------------------------------
+    # "Run Comparison" Tab
+    # ---------------------------------------------------
+    def build_run_tab(self, parent):
+        frame = ctk.CTkFrame(parent)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Comparison Mode
+        self.option_var = tk.IntVar(value=self.config.get("comparison_option", 1))
+        
+        rowf1 = ctk.CTkFrame(frame)
+        rowf1.pack(fill="x", pady=5)
+        ctk.CTkLabel(rowf1, text="Comparison Option:").pack(side="left", padx=5)
+        
+        for i, text in enumerate([
+            "Option 1 (Show everything missing in ALFA or GAMMA)",
+            "Option 2 (If missing Name, hide attributes; else show missing attributes)",
+            "Option 3 (Show missing + matching, can create multiple sheets)"
+        ], start=1):
+            rb = ctk.CTkRadioButton(rowf1, text=text, variable=self.option_var, value=i)
+            rb.pack(anchor="w", padx=20)
+        
+        ctk.CTkButton(frame, text="Run Reconciliation", command=self.run_reconciliation).pack(pady=20)
+    
+    # ---------------------------------------------------
+    # RENAME POPUP for dimension/attribute values
+    # ---------------------------------------------------
+    def show_rename_popup(self, source: str, target: str):
+        """
+        source is "alfa" or "gamma".
+        target is "dimension" or "attribute".
+        
+        We'll show a popup with existing rename dict, let user edit or add new.
+        """
+        rename_dict = self.config[source].get(f"{target}_renames", {})
+        
+        popup = tk.Toplevel(self)
+        popup.title(f"Manage {source.upper()} {target.capitalize()} Renames")
+        popup.geometry("400x400")
+        
+        frame = ctk.CTkScrollableFrame(popup)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # We'll list existing rename_map
+        rename_vars = []
+        
+        def add_rename_row(old_val, new_val):
+            rowf = ctk.CTkFrame(frame)
+            rowf.pack(fill="x", pady=2)
+            ctk.CTkLabel(rowf, text="Old:").pack(side="left")
+            lbl_old = ctk.CTkLabel(rowf, text=old_val, width=100)
+            lbl_old.pack(side="left", padx=5)
+            ctk.CTkLabel(rowf, text="->").pack(side="left")
+            var_new = tk.StringVar(value=new_val)
+            ent_new = ctk.CTkEntry(rowf, textvariable=var_new, width=150)
+            ent_new.pack(side="left", padx=5)
+            rename_vars.append((old_val, var_new))
+        
+        for k, v in rename_dict.items():
+            add_rename_row(k, v)
+        
+        # Button to add a new row
+        def on_add():
+            add_rename_row("some_old_value", "some_new_value")
+        ctk.CTkButton(frame, text="Add New Rename", command=on_add).pack(pady=5)
+        
+        def on_save():
+            # read from rename_vars
+            new_map = {}
+            for (old_val, var_new) in rename_vars:
+                new_val = var_new.get().strip()
+                if old_val.strip() and new_val and (new_val != old_val):
+                    new_map[old_val.strip()] = new_val
+            self.config[source][f"{target}_renames"] = new_map
+            popup.destroy()
+        
+        ctk.CTkButton(frame, text="Save", command=on_save).pack(pady=5)
+    
+    # ---------------------------------------------------
+    # RUN RECONCILIATION
+    # ---------------------------------------------------
+    def run_reconciliation(self):
+        """Main button logic: read data, apply filters, merges, compares, writes output."""
+        # Save current UI selections to self.config
+        self.config["ALFA_PATH"] = self.paths["ALFA_PATH"].get().strip()
+        self.config["GAMMA_PATH"] = self.paths["GAMMA_PATH"].get().strip()
+        self.config["EXCEPTION_PATH"] = self.paths["EXCEPTION_PATH"].get().strip()
+        self.config["OUTPUT_PATH"] = self.paths["OUTPUT_PATH"].get().strip()
+        
+        # ALFA
+        self.config["alfa"]["filter_col1"] = self.col1_var.get().strip()
+        self.config["alfa"]["filter_col2"] = self.col2_var.get().strip()
+        self.config["alfa"]["only_enabled"] = self.enabled_var.get()
+        self.config["alfa"]["excluded_dimensions"] = [x.strip() for x in self.alfa_excl_dims.get().split(",") if x.strip()]
+        self.config["alfa"]["excluded_attributes"] = [x.strip() for x in self.alfa_excl_attrs.get().split(",") if x.strip()]
+        
+        # GAMMA
+        self.config["gamma"]["excluded_dimensions"] = [x.strip() for x in self.gamma_excl_dims.get().split(",") if x.strip()]
+        self.config["gamma"]["excluded_attributes"] = [x.strip() for x in self.gamma_excl_attrs.get().split(",") if x.strip()]
+        
+        # comparison option
+        self.config["comparison_option"] = self.option_var.get()
+        
+        # Save config
+        save_config(self.config, self.config_path)
+        
+        # Read ALFA
+        alfa_df = read_alfa(
+            Path(self.config["ALFA_PATH"]),
+            self.config["alfa"]["filter_col1"],
+            self.config["alfa"]["filter_col2"],
+            self.config["alfa"]["only_enabled"]
+        )
+        
+        if alfa_df.empty:
+            messagebox.showerror("Error", "ALFA DataFrame is empty. Check your file/filter settings.")
+            return
+        
+        # Convert ALFA to melted form with dimension/attribute filters
+        alfa_filtered = apply_dimension_attribute_filters_renames(
+            alfa_df,
+            dimension_col="Dimension_Name",  # from specs
+            name_col="Value",               # from specs
+            config_block=self.config["alfa"]
+        )
+        alfa_ready = build_keys(alfa_filtered)
+        
+        # Read GAMMA
+        gamma_raw = read_gamma_zip(Path(self.config["GAMMA_PATH"]))
+        if gamma_raw.empty:
+            messagebox.showerror("Error", "GAMMA DataFrame is empty.")
+            return
+        
+        # Apply dimension/attribute filters and rename
+        gamma_filtered = apply_dimension_attribute_filters_renames(
+            gamma_raw,
+            dimension_col="Dimension",
+            name_col="Name",
+            config_block=self.config["gamma"]
+        )
+        gamma_ready = build_keys(gamma_filtered)
+        
+        # Compare
+        mode = self.config["comparison_option"]
+        df_diff = compare_data(alfa_ready, gamma_ready, comparison_mode=mode)
+        if df_diff.empty:
+            messagebox.showinfo("No Differences", "No differences found based on your filters/renames.")
+            return
+        
+        # Merge exceptions
+        df_exc = read_exception_table(Path(self.config["EXCEPTION_PATH"]))
+        final_diff = merge_exceptions(df_diff, df_exc)
+        
+        # Write output
+        output_path = Path(self.config["OUTPUT_PATH"])
+        write_excel(final_diff, output_path, mode=mode)
+        
+        messagebox.showinfo("Done", f"Comparison complete. Results written to {output_path}.")
+
+# ------------------------------
+# MAIN
+# ------------------------------
+def main():
+    app = ReconciliationGUI(Path(DEFAULT_PATHS["CONFIG_PATH"]))
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()

@@ -6,7 +6,7 @@ Ultra-Mega Reconciliation Script with ZIP Diagnostics
 - Then uses robust CSV reading with multiple encodings and delimiters, skipping bad lines, fallback for old Pandas.
 - Includes Excel-like grid that can filter NaN/blank, dimension rename, 3 compare modes, merges exception table, daily-run line chart, etc.
 
-Author: ChatGPT
+Author: x
 """
 
 import os

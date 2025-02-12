@@ -1,34 +1,26 @@
 #!/usr/bin/env python3
 
 """
-Mega Reconciliation UI - Compatible with Older Pandas
------------------------------------------------------
-- Reads XRP data from Excel (skip first 3 rows).
-- Reads Master data from ZIP of .txt files, applying fallback if 'on_bad_lines' or 'errors' not supported.
-- Excel-like grid UI for each data source (XRP, Master) with:
-    - Column show/hide, rename, reorder
-    - Row filter popups
-- Dimension rename (maps e.g. "Dim1" -> "Dimension1")
-- 3 comparison modes: 
-    1) show everything missing 
-    2) if Name missing, skip attributes, else show missing 
-    3) show missing + matching
-- Merges exception table (comments, hide exception).
-- JSON config so columns/filters persist across runs.
-- A mini dashboard with daily-run line chart (counts mismatches by date).
-  
-This version includes fallback logic so older Pandas doesn't choke on 
-'on_bad_lines' or 'errors' in read_csv.
+Ultra-Mega Reconciliation Script
+--------------------------------
+- Reads ERP (Excel) and Master (ZIP of .txt).
+- Robust CSV reading with multiple encodings and fallback for old Pandas.
+- Excel-like grids that can filter on NaN/blank.
+- Dimension rename, 3 comparison modes, merges exception table, daily-run line chart.
+- Single-file demonstration.
+
+Author: Al Pacino
 """
 
 import os
 import json
 import logging
 import zipfile
+import time
+import copy
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
-from datetime import datetime
-
+from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
@@ -36,22 +28,21 @@ import customtkinter as ctk
 import pandas as pd
 import numpy as np
 
-from openpyxl import Workbook
-from openpyxl.styles import PatternFill, Font, Alignment
-
-# For charts
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-
-# Attempt chardet if available
+# Attempt optional encoding detection
 try:
     import chardet
 except ImportError:
     chardet = None
 
-# -------------- LOGGING --------------
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# ====================== LOGGING ======================
 def setup_logger():
     logging.basicConfig(
         level=logging.INFO,
@@ -59,9 +50,9 @@ def setup_logger():
     )
 setup_logger()
 
-# -------------- DEFAULTS & CONFIG --------------
+# ====================== CONFIG DEFAULTS ======================
 DEFAULT_PATHS = {
-    "XRP_EXCEL_PATH": "data/XRP_Config.xlsx",
+    "ERP_EXCEL_PATH": "data/ERP_Config.xlsx",
     "MASTER_ZIP_PATH": "data/Master_Config.zip",
     "EXCEPTION_PATH": "data/Exception_Table.xlsx",
     "OUTPUT_PATH": "output/Reconciliation.xlsx",
@@ -71,13 +62,13 @@ DEFAULT_PATHS = {
 def default_config() -> Dict:
     return {
         "paths": {
-            "XRP_EXCEL_PATH": DEFAULT_PATHS["XRP_EXCEL_PATH"],
+            "ERP_EXCEL_PATH": DEFAULT_PATHS["ERP_EXCEL_PATH"],
             "MASTER_ZIP_PATH": DEFAULT_PATHS["MASTER_ZIP_PATH"],
             "EXCEPTION_PATH": DEFAULT_PATHS["EXCEPTION_PATH"],
             "OUTPUT_PATH": DEFAULT_PATHS["OUTPUT_PATH"],
             "CONFIG_PATH": DEFAULT_PATHS["CONFIG_PATH"]
         },
-        "XRP_grid": {
+        "erp_grid": {
             "columns": [
                 {"id": "Col1",           "name": "Col1",           "locked": False, "visible": True,  "renameable": True},
                 {"id": "Col2",           "name": "Col2",           "locked": False, "visible": True,  "renameable": True},
@@ -89,8 +80,8 @@ def default_config() -> Dict:
         },
         "master_grid": {
             "columns": [
-                {"id": "Name",       "name": "Name",       "locked": True,  "visible": True, "renameable": False},
-                {"id": "Dimension",  "name": "Dimension",  "locked": True,  "visible": True, "renameable": False},
+                {"id": "Name",      "name": "Name",      "locked": True,  "visible": True, "renameable": False},
+                {"id": "Dimension", "name": "Dimension", "locked": True,  "visible": True, "renameable": False},
             ],
             "filters": {}
         },
@@ -116,34 +107,176 @@ def save_config(cfg: Dict, path: Path):
     except Exception as e:
         logging.error(f"Error saving config: {e}")
 
-# -------------- LOG HANDLER --------------
+# ====================== UI LOG HANDLER ======================
 class TextHandler(logging.Handler):
     def __init__(self, widget: ctk.CTkTextbox):
         super().__init__()
         self.widget = widget
-
     def emit(self, record):
         msg = self.format(record) + "\n"
         self.widget.after(0, self._append, msg)
-
     def _append(self, msg):
         self.widget.configure(state="normal")
         self.widget.insert("end", msg)
         self.widget.see("end")
         self.widget.configure(state="disabled")
 
-# -------------- EXCEL-LIKE GRID --------------
+# ====================== ROBUST CSV READER ======================
+import io
+
+def read_csv_robust(fileobj, guessed_enc: str = "utf-8", try_encodings=None):
+    """
+    Reads CSV lines from an opened fileobj, trying multiple encodings and skipping bad lines.
+    - guessed_enc: from chardet or user guess
+    - try_encodings: list of encodings to attempt
+    Falls back for older Pandas without on_bad_lines / errors.
+    Returns a DataFrame or raises an exception if all attempts fail.
+    """
+    if try_encodings is None:
+        # You can reorder or remove if you want
+        try_encodings = [guessed_enc, "utf-8", "latin1", "iso-8859-1", "cp1252", "ascii"]
+
+    # We'll define a small helper that tries reading with a single encoding
+    def try_single_encoding(fo, encoding):
+        fo.seek(0)
+        raw_data = fo.read()
+        # We do a double fallback:
+        # 1) Attempt new Pandas approach
+        # 2) If TypeError, older approach
+        # Also skip lines. We'll do on_bad_lines='skip' or error_bad_lines=False
+        try:
+            # new approach
+            return pd.read_csv(
+                io.BytesIO(raw_data),
+                encoding=encoding,
+                delimiter=",",
+                on_bad_lines="skip",
+                errors="replace"
+            )
+        except TypeError:
+            # old Pandas
+            logging.info(f"Old Pandas fallback for {encoding}")
+            text_decoded = raw_data.decode(encoding, errors="replace")
+            buffer = io.StringIO(text_decoded)
+            # older way
+            return pd.read_csv(
+                buffer,
+                delimiter=",",
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
+
+    # Attempt each encoding in turn
+    for enc in try_encodings:
+        try:
+            logging.info(f"Trying to decode with {enc}")
+            df_temp = try_single_encoding(fileobj, enc)
+            # If we get here, we succeeded
+            logging.info(f"Successfully read CSV with encoding {enc}")
+            return df_temp
+        except Exception as e:
+            logging.warning(f"Failed reading with {enc}: {e}")
+    # If we exhaust all attempts, raise final
+    raise ValueError(f"Could not read CSV with any attempted encodings: {try_encodings}")
+
+# ====================== FILE HANDLER FOR EXCEL ======================
+class FileHandler:
+    @staticmethod
+    def safe_read_excel(path: Path, skiprows: int = 0, retries: int = 2) -> pd.DataFrame:
+        """Try reading Excel with multiple attempts."""
+        import pandas as pd
+        for attempt in range(retries):
+            try:
+                logging.info(f"Reading Excel: {path} (attempt {attempt+1}/{retries})")
+                df = pd.read_excel(path, skiprows=skiprows)
+                df.columns = df.columns.str.strip()
+                return df
+            except Exception as e:
+                logging.warning(f"Failed reading Excel {path}: {e}")
+                if attempt == retries - 1:
+                    raise
+                time.sleep(1)
+
+# ====================== READ ERP & MASTER ======================
+def safe_read_erp_excel(path: Path) -> pd.DataFrame:
+    try:
+        return FileHandler.safe_read_excel(path, skiprows=3)
+    except Exception as e:
+        logging.error(f"Error reading ERP Excel: {e}")
+        return pd.DataFrame()
+
+def read_master_data(zip_path: Path) -> pd.DataFrame:
+    """
+    Reads each .txt from the ZIP, tries robust CSV with multiple encodings.
+    Dimension is derived from the filename minus "_ceaster.txt".
+    We also do column cleanup. The first column => "Name".
+    """
+    if not zip_path.is_file():
+        logging.warning(f"Master ZIP not found: {zip_path}")
+        return pd.DataFrame()
+
+    all_dfs = []
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+            for txt_file in txt_files:
+                try:
+                    base_name = os.path.basename(txt_file)
+                    if "_ceaster.txt" in base_name.lower():
+                        base_dim = base_name.lower().replace("_ceaster.txt", "")
+                    else:
+                        base_dim, _ = os.path.splitext(base_name)
+                    dimension = base_dim.replace("_", " ").title()
+
+                    with z.open(txt_file) as fo:
+                        # We'll see if we can guess an encoding from chardet
+                        # by reading a small chunk
+                        sample = fo.read(1024) if chardet else b""
+                        if chardet and sample:
+                            enc_guess = chardet.detect(sample)["encoding"] or "utf-8"
+                            logging.info(f"Chardet guessed {enc_guess} for {txt_file}")
+                            fo.seek(0)
+                            # Now read robustly with that guess
+                            df_part = read_csv_robust(fo, guessed_enc=enc_guess)
+                        else:
+                            # fallback no chardet
+                            logging.info(f"No chardet or empty sample, fallback to read_csv_robust with utf-8 for {txt_file}")
+                            fo.seek(0)
+                            df_part = read_csv_robust(fo, guessed_enc="utf-8")
+
+                    # Clean up columns
+                    df_part.columns = df_part.columns.str.strip()
+                    first_col = df_part.columns[0]
+                    df_part.rename(columns={first_col: "Name"}, inplace=True)
+                    df_part["Dimension"] = dimension
+                    all_dfs.append(df_part)
+                except Exception as e2:
+                    logging.error(f"Error reading {txt_file}: {e2}")
+    except Exception as e:
+        logging.error(f"Error opening zip {zip_path}: {e}")
+
+    if all_dfs:
+        return pd.concat(all_dfs, ignore_index=True)
+    else:
+        return pd.DataFrame()
+
+# ====================== EXCELGRID (Filter with NaN/blank) ======================
 class ExcelGrid(ctk.CTkFrame):
     """
-    Excel-like grid with column toggles, rename, filter checkboxes, etc.
+    Excel-like grid with:
+      - column toggling, rename, reorder
+      - filter popups that includes NaN and blank
+      - can handle locked columns (with a lock icon) if you want
+    (For brevity, we only show basic lock = True -> no hide/rename logic.)
     """
+    LOCK_ICON = " \U0001F512"  # '🔒' unicode
+
     def __init__(self, parent, config_block: Dict, name: str):
         super().__init__(parent)
         self.name = name
         self.col_defs = config_block.get("columns", [])
-        filter_block = config_block.get("filters", {})
-        self.filters = {}
-        for col_id, val_list in filter_block.items():
+        self.filters: Dict[str, Set] = {}
+        for col_id, val_list in config_block.get("filters", {}).items():
             self.filters[col_id] = set(val_list) if isinstance(val_list, list) else set()
 
         self.df = pd.DataFrame()
@@ -179,7 +312,9 @@ class ExcelGrid(ctk.CTkFrame):
         self.status_label.pack(fill="x", padx=5, pady=2)
 
     def set_data(self, df: pd.DataFrame):
+        """Load a new DataFrame and refresh."""
         self.df = df.copy(deep=True)
+        # Make sure col_defs has at least all df columns
         existing_ids = [c["id"] for c in self.col_defs]
         for col in self.df.columns:
             if col not in existing_ids:
@@ -192,59 +327,95 @@ class ExcelGrid(ctk.CTkFrame):
                 })
         self.refresh_table()
 
-    def get_config_block(self) -> Dict:
+    def get_config_block(self):
+        """Return current columns + filters to store in config."""
         return {
             "columns": self.col_defs,
             "filters": {col_id: sorted(list(vals)) for col_id, vals in self.filters.items()}
         }
 
     def get_filtered_df(self) -> pd.DataFrame:
+        """Apply row filters + column visibility to the DataFrame."""
         if self.df.empty:
             return self.df
         df_f = self.df.copy()
+
+        def passes_filter(x, allowed_vals):
+            # We must handle NaN specially
+            if pd.isna(x):
+                # does allowed_vals contain a NaN?
+                return any(pd.isna(a) for a in allowed_vals)
+            else:
+                return x in allowed_vals
+
         for col_id, allowed_vals in self.filters.items():
             if col_id in df_f.columns and allowed_vals:
-                df_f = df_f[df_f[col_id].isin(allowed_vals)]
+                mask = df_f[col_id].apply(lambda v: passes_filter(v, allowed_vals))
+                df_f = df_f[mask]
+
+        # keep only visible columns
         visible_ids = [c["id"] for c in self.col_defs if c.get("visible", True)]
-        visible_ids = [c for c in visible_ids if c in df_f.columns]
+        visible_ids = [col for col in visible_ids if col in df_f.columns]
         return df_f[visible_ids]
 
     def refresh_table(self):
+        """Rebuild columns in tree and show filtered data."""
         for item in self.tree.get_children():
             self.tree.delete(item)
+
         visible_cols = [c for c in self.col_defs if c.get("visible", True)]
         self.tree["columns"] = [c["id"] for c in visible_cols]
-        for col in visible_cols:
+
+        for col_def in visible_cols:
+            col_name = col_def["name"]
+            if col_def.get("locked", False):
+                col_name += self.LOCK_ICON
             self.tree.heading(
-                col["id"],
-                text=col["name"],
+                col_def["id"],
+                text=col_name,
                 anchor="w",
-                command=lambda c=col: self.show_filter_popup(c)
+                command=lambda c=col_def: self.show_filter_popup(c)
             )
-            self.tree.column(col["id"], anchor="w", width=col.get("width", 150))
+            self.tree.column(col_def["id"], anchor="w", width=col_def.get("width", 150))
 
         df_f = self.get_filtered_df()
         for idx, row in df_f.iterrows():
             vals = [row[c["id"]] for c in visible_cols]
             self.tree.insert("", "end", values=vals)
+
         self.status_label.configure(text=f"{len(df_f)} rows")
 
     def show_filter_popup(self, col_def: Dict):
+        """Filter popup that includes NaN and blank as special entries."""
         col_id = col_def["id"]
         if self.df.empty or col_id not in self.df.columns:
             return
+
         popup = tk.Toplevel(self)
         popup.title(f"Filter: {col_def['name']}")
-        popup.geometry("300x400")
+        popup.geometry("320x500")
 
         frame = ctk.CTkFrame(popup)
         frame.pack(fill="both", expand=True, padx=5, pady=5)
 
-        series = self.df[col_id].dropna().unique()
-        unique_vals = sorted(series, key=lambda x: str(x))
+        series = self.df[col_id].unique()  # do NOT dropna
+        display_map = {}
+        for val in series:
+            if pd.isna(val):
+                display_str = "(NaN)"
+            elif isinstance(val, str) and not val.strip():
+                display_str = "(blank)"
+            else:
+                display_str = str(val)
+            display_map[val] = display_str
+
+        # Sort by display strings
+        sorted_vals = sorted(display_map.keys(), key=lambda rv: display_map[rv].lower())
+
         current_filter = self.filters.get(col_id, set())
         if not current_filter:
-            current_filter = set(unique_vals)
+            # If no filter is set, default means "all included"
+            current_filter = set(series)
 
         select_all_var = tk.BooleanVar(value=True)
         def toggle_select_all():
@@ -252,19 +423,30 @@ class ExcelGrid(ctk.CTkFrame):
             for vb in var_dict.values():
                 vb.set(new_val)
 
-        ctk.CTkCheckBox(frame, text="Select All", variable=select_all_var, command=toggle_select_all).pack(anchor="w")
+        ctk.CTkCheckBox(frame, text="Select All", variable=select_all_var,
+                        command=toggle_select_all).pack(anchor="w", pady=5)
 
-        scroll = ctk.CTkScrollableFrame(frame, width=250, height=250)
+        scroll = ctk.CTkScrollableFrame(frame, width=280, height=320)
         scroll.pack(fill="both", expand=True, padx=5, pady=5)
 
         var_dict = {}
-        for val in unique_vals:
-            var = tk.BooleanVar(value=(val in current_filter))
-            var_dict[val] = var
-            ctk.CTkCheckBox(scroll, text=str(val), variable=var).pack(anchor="w")
+        for real_val in sorted_vals:
+            disp_str = display_map[real_val]
+
+            if pd.isna(real_val):
+                in_filter = any(pd.isna(fv) for fv in current_filter)
+            else:
+                in_filter = (real_val in current_filter)
+
+            var = tk.BooleanVar(value=in_filter)
+            var_dict[real_val] = var
+            ctk.CTkCheckBox(scroll, text=disp_str, variable=var).pack(anchor="w")
 
         def apply_filter():
-            selected = {v for v, vb in var_dict.items() if vb.get()}
+            selected = set()
+            for rv, vb in var_dict.items():
+                if vb.get():
+                    selected.add(rv)
             self.filters[col_id] = selected
             popup.destroy()
             self.refresh_table()
@@ -277,36 +459,39 @@ class ExcelGrid(ctk.CTkFrame):
     def show_column_manager(self):
         cm = tk.Toplevel(self)
         cm.title(f"{self.name} Column Manager")
-        scrolled = ctk.CTkScrollableFrame(cm, width=500, height=400)
+        scrolled = ctk.CTkScrollableFrame(cm, width=600, height=500)
         scrolled.pack(fill="both", expand=True)
 
-        for i, col in enumerate(self.col_defs):
+        for i, col_def in enumerate(self.col_defs):
             rowf = ctk.CTkFrame(scrolled)
             rowf.pack(fill="x", pady=2)
 
-            if col.get("locked", False):
-                ctk.CTkLabel(rowf, text=f"[LOCKED] {col['name']}").pack(side="left", padx=5)
+            locked = col_def.get("locked", False)
+            if locked:
+                txt = col_def["name"] + self.LOCK_ICON
+                ctk.CTkLabel(rowf, text=txt).pack(side="left", padx=5)
                 continue
 
-            var_vis = tk.BooleanVar(value=col.get("visible", True))
-            def toggler(c=col, v=var_vis):
+            var_vis = tk.BooleanVar(value=col_def.get("visible", True))
+            def toggler(c=col_def, v=var_vis):
                 c["visible"] = v.get()
                 self.refresh_table()
 
             ctk.CTkCheckBox(rowf, text="", variable=var_vis, command=toggler).pack(side="left")
 
-            if col.get("renameable", True):
-                ctk.CTkButton(rowf, text=col["name"][:20], command=lambda c=col: self.rename_column(c)).pack(side="left", padx=5)
+            if col_def.get("renameable", True):
+                ctk.CTkButton(rowf, text=col_def["name"], command=lambda c=col_def: self.rename_column(c)).pack(side="left", padx=5)
             else:
-                ctk.CTkLabel(rowf, text=col["name"]).pack(side="left", padx=5)
+                ctk.CTkLabel(rowf, text=col_def["name"]).pack(side="left", padx=5)
 
             ctk.CTkButton(rowf, text="↑", width=30, command=lambda idx=i: self.move_column(idx, -1)).pack(side="right", padx=2)
             ctk.CTkButton(rowf, text="↓", width=30, command=lambda idx=i: self.move_column(idx, 1)).pack(side="right", padx=2)
 
-    def rename_column(self, col: Dict):
-        new_name = simpledialog.askstring("Rename Column", f"New name for {col['name']}", initialvalue=col["name"])
+    def rename_column(self, col_def: Dict):
+        old_name = col_def["name"]
+        new_name = simpledialog.askstring("Rename Column", f"New name for {old_name}:", initialvalue=old_name)
         if new_name:
-            col["name"] = new_name
+            col_def["name"] = new_name
             self.refresh_table()
 
     def move_column(self, idx: int, delta: int):
@@ -319,94 +504,8 @@ class ExcelGrid(ctk.CTkFrame):
         self.filters.clear()
         self.refresh_table()
 
-# -------------- READ CSV WITH FALLBACK --------------
-import io
-
-def read_csv_flexible(fo, encoding="utf-8"):
-    """
-    Try modern approach with 'on_bad_lines' and 'errors' (Pandas >= 1.3).
-    If TypeError, fallback to manual decode and older approach (error_bad_lines).
-    """
-    try:
-        # Attempt modern read_csv
-        return pd.read_csv(
-            fo,
-            encoding=encoding,
-            delimiter=",",
-            on_bad_lines="skip",
-            errors="replace"
-        )
-    except TypeError:
-        # Fallback if old pandas doesn't support these args
-        logging.info("Falling back to manual decode + error_bad_lines=False")
-        raw_data = fo.read()
-        text_decoded = raw_data.decode(encoding, errors="replace")
-        buffer = io.StringIO(text_decoded)
-        # Old approach
-        return pd.read_csv(
-            buffer,
-            delimiter=",",
-            error_bad_lines=False,  # deprecated in newer versions, but works in older
-            warn_bad_lines=True
-        )
-
-# -------------- READING XRP & MASTER --------------
-def read_XRP_data(xlsx_path: Path) -> pd.DataFrame:
-    if not xlsx_path.is_file():
-        logging.warning(f"XRP path not found: {xlsx_path}")
-        return pd.DataFrame()
-    try:
-        df = pd.read_excel(xlsx_path, skiprows=3)
-        df.columns = df.columns.str.strip()
-        return df
-    except Exception as e:
-        logging.error(f"Error reading XRP Excel: {e}")
-        return pd.DataFrame()
-
-def read_master_data(zip_path: Path) -> pd.DataFrame:
-    if not zip_path.is_file():
-        logging.warning(f"Master ZIP not found: {zip_path}")
-        return pd.DataFrame()
-    all_dfs = []
-    try:
-        with zipfile.ZipFile(zip_path, "r") as z:
-            txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
-            for txt_file in txt_files:
-                try:
-                    base_name = os.path.basename(txt_file)
-                    if "_ceaster.txt" in base_name.lower():
-                        base_dim = base_name.lower().replace("_ceaster.txt", "")
-                    else:
-                        base_dim, _ = os.path.splitext(base_name)
-                    dimension = base_dim.replace("_", " ").title()
-
-                    with z.open(txt_file) as fo:
-                        # detect encoding
-                        if chardet:
-                            sample = fo.read(1024)
-                            detected_enc = chardet.detect(sample)["encoding"] or "utf-8"
-                            fo.seek(0)
-                        else:
-                            detected_enc = "utf-8"
-
-                        df_part = read_csv_flexible(fo, encoding=detected_enc)
-
-                    df_part.columns = df_part.columns.str.strip()
-                    # rename first column -> "Name"
-                    first_col = df_part.columns[0]
-                    df_part.rename(columns={first_col: "Name"}, inplace=True)
-                    df_part["Dimension"] = dimension
-                    all_dfs.append(df_part)
-                except Exception as e2:
-                    logging.error(f"Error reading {txt_file}: {e2}")
-    except Exception as e:
-        logging.error(f"Error opening zip: {e}")
-    if all_dfs:
-        return pd.concat(all_dfs, ignore_index=True)
-    return pd.DataFrame()
-
-# -------------- MELTDOWN & KEYS --------------
-def meltdown_XRP(df: pd.DataFrame, dim_renames: Dict[str,str]) -> pd.DataFrame:
+# ====================== MELTDOWN & COMPARISON ======================
+def meltdown_erp(df: pd.DataFrame, dim_renames: Dict[str, str]) -> pd.DataFrame:
     if df.empty:
         return df
     skip_cols = {"Col1","Col2","Enabled_Flag"}
@@ -460,15 +559,25 @@ def build_keys(df: pd.DataFrame) -> pd.DataFrame:
     df["Missing In"] = ""
     return df
 
-# -------------- COMPARISON --------------
-def compare_data(df_XRP: pd.DataFrame, df_master: pd.DataFrame, mode: int) -> pd.DataFrame:
-    XRP_dict = build_lookup_dict(df_XRP)
+def build_lookup_dict(df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+    lookup = {}
+    for gk, grp in df.groupby("GroupKey"):
+        rec = {}
+        ref = grp["RefName"].iloc[0] if not grp.empty else ""
+        rec["Name"] = ref
+        for _, row in grp.iterrows():
+            rec[row["Attribute"]] = row["Value"]
+        lookup[gk] = rec
+    return lookup
+
+def compare_data(df_erp: pd.DataFrame, df_master: pd.DataFrame, mode: int) -> pd.DataFrame:
+    erp_dict = build_lookup_dict(df_erp)
     mst_dict = build_lookup_dict(df_master)
-    all_keys = set(XRP_dict.keys()) | set(mst_dict.keys())
+    all_keys = set(erp_dict.keys()) | set(mst_dict.keys())
     results = []
     for gk in all_keys:
-        dim = gk.split(" | ")[0]
-        a_data = XRP_dict.get(gk, {})
+        dim = gk.split(" | ")[0] if " | " in gk else ""
+        a_data = erp_dict.get(gk, {})
         b_data = mst_dict.get(gk, {})
         name_a = a_data.get("Name", a_data.get("RefName", ""))
         name_b = b_data.get("Name", b_data.get("RefName", ""))
@@ -479,26 +588,14 @@ def compare_data(df_XRP: pd.DataFrame, df_master: pd.DataFrame, mode: int) -> pd
             results.extend(compare_mode_2(dim, name_a, name_b, a_data, b_data))
         else:
             results.extend(compare_mode_3(dim, name_a, name_b, a_data, b_data))
+
     df_diff = pd.DataFrame(results)
     if not df_diff.empty:
-        df_diff["Key"] = (
-            df_diff["Dimension"] + " | " +
-            df_diff["Name"] + " | " +
-            df_diff["Attribute"] + " | " +
-            df_diff["Value"]
-        )
+        df_diff["Key"] = (df_diff["Dimension"].str.strip() + " | " +
+                          df_diff["Name"].str.strip() + " | " +
+                          df_diff["Attribute"].str.strip() + " | " +
+                          df_diff["Value"].str.strip())
     return df_diff
-
-def build_lookup_dict(df: pd.DataFrame) -> Dict[str,Dict[str,str]]:
-    lookup = {}
-    for gk,grp in df.groupby("GroupKey"):
-        rec = {}
-        ref = grp["RefName"].iloc[0] if not grp.empty else ""
-        rec["Name"] = ref
-        for _, row in grp.iterrows():
-            rec[row["Attribute"]] = row["Value"]
-        lookup[gk] = rec
-    return lookup
 
 def compare_mode_1(dim, name_a, name_b, a_data, b_data):
     results = []
@@ -510,10 +607,10 @@ def compare_mode_1(dim, name_a, name_b, a_data, b_data):
             if va and not vb:
                 results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
             elif vb and not va:
-                results.append({"Dimension": dim, "Name": name_b, "Attribute": attr, "Value": vb, "Missing In": "XRP"})
+                results.append({"Dimension": dim, "Name": name_b, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
             else:
                 results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
-                results.append({"Dimension": dim, "Name": name_b, "Attribute": attr, "Value": vb, "Missing In": "XRP"})
+                results.append({"Dimension": dim, "Name": name_b, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
     return results
 
 def compare_mode_2(dim, name_a, name_b, a_data, b_data):
@@ -527,15 +624,15 @@ def compare_mode_2(dim, name_a, name_b, a_data, b_data):
                 if va and not vb:
                     results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
                 elif vb and not va:
-                    results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": vb, "Missing In": "XRP"})
+                    results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
                 else:
                     results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
-                    results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": vb, "Missing In": "XRP"})
+                    results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
     else:
         if name_a and not name_b:
             results.append({"Dimension": dim, "Name": name_a, "Attribute": "Name", "Value": name_a, "Missing In": "MASTER"})
         elif name_b and not name_a:
-            results.append({"Dimension": dim, "Name": name_b, "Attribute": "Name", "Value": name_b, "Missing In": "XRP"})
+            results.append({"Dimension": dim, "Name": name_b, "Attribute": "Name", "Value": name_b, "Missing In": "ERP"})
     return results
 
 def compare_mode_3(dim, name_a, name_b, a_data, b_data):
@@ -545,24 +642,26 @@ def compare_mode_3(dim, name_a, name_b, a_data, b_data):
         va = a_data.get(attr, "")
         vb = b_data.get(attr, "")
         if va == vb:
+            # matched row
             results.append({"Dimension": dim, "Name": name_a if name_a else name_b, "Attribute": attr, "Value": va, "Missing In": ""})
         else:
             if va and not vb:
                 results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
             elif vb and not va:
-                results.append({"Dimension": dim, "Name": name_b, "Attribute": attr, "Value": vb, "Missing In": "XRP"})
+                results.append({"Dimension": dim, "Name": name_b, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
             else:
                 results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
-                results.append({"Dimension": dim, "Name": name_a if name_a else name_b, "Attribute": attr, "Value": vb, "Missing In": "XRP"})
+                results.append({"Dimension": dim, "Name": name_a if name_a else name_b, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
     return results
 
-# -------------- EXCEPTIONS --------------
+# ====================== EXCEPTIONS ======================
 def read_exception_table(exc_path: Path) -> pd.DataFrame:
     if exc_path.is_file():
         try:
-            return pd.read_excel(exc_path, sheet_name=0)
+            df = pd.read_excel(exc_path, sheet_name=0)
+            return df
         except Exception as e:
-            logging.error(f"Error reading exception: {e}")
+            logging.error(f"Error reading exception table: {e}")
     return pd.DataFrame()
 
 def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame) -> pd.DataFrame:
@@ -573,9 +672,11 @@ def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame) -> pd.DataFrame:
         return df
     exc = df_exc[keep].copy()
     exc["Key"] = exc["Key"].astype(str).str.strip()
+
     merged = df.merge(exc, on="Key", how="left", suffixes=("", "_exc"))
     merged["hide exception"] = merged.get("hide exception", "").fillna("").str.lower()
     final = merged[merged["hide exception"]!="yes"].copy()
+
     if "Comments_1_exc" in final.columns:
         final["Comments_1"] = final["Comments_1_exc"].where(final["Comments_1_exc"].notna(), final["Comments_1"])
         final.drop(columns=["Comments_1_exc"], inplace=True)
@@ -586,24 +687,25 @@ def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame) -> pd.DataFrame:
         final.drop(columns=["hide exception"], inplace=True)
     return final
 
-# -------------- OUTPUT --------------
+# ====================== OUTPUT ======================
 def write_results(df: pd.DataFrame, out_path: Path, mode: int):
     if df.empty:
         logging.info("No differences to write.")
         return
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
     final_cols = ["Key","Dimension","Name","Attribute","Value","Comments_1","Comments_2","Action Item","Missing In"]
     for c in final_cols:
         if c not in df.columns:
             df[c] = ""
     df = df[final_cols]
 
-    max_rows_per_sheet = 30000 if mode==3 else 999999
+    max_rows_per_sheet = 30000 if mode == 3 else 999999
     wb = Workbook()
     sheet_count = 1
     start = 0
     while start < len(df):
-        end = min(start+max_rows_per_sheet, len(df))
+        end = min(start + max_rows_per_sheet, len(df))
         chunk = df.iloc[start:end]
         if sheet_count == 1:
             ws = wb.active
@@ -613,7 +715,7 @@ def write_results(df: pd.DataFrame, out_path: Path, mode: int):
         ws.append(final_cols)
         for row in chunk.itertuples(index=False):
             ws.append(row)
-        # format
+        # minimal styling
         header_font = Font(bold=True)
         fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
         for cell in ws[1]:
@@ -628,24 +730,24 @@ def write_results(df: pd.DataFrame, out_path: Path, mode: int):
                 max_len = max(max_len, len(val))
             ws.column_dimensions[col_letter].width = max_len + 2
         ws.freeze_panes = "A2"
+
         sheet_count += 1
         start = end
+
     wb.save(out_path)
     logging.info(f"Results saved to {out_path}")
 
-# -------------- DASHBOARD --------------
+# ====================== DASHBOARD ======================
 class Dashboard(ctk.CTkFrame):
     """
-    We store mismatch data from the most recent run (df_current)
-    plus a history of all runs in df_history. We'll group by date for a line chart.
+    Basic Dashboard: mismatch heatmap, status dist, dimension analysis, attribute comparison,
+    line chart over runs by date.
     """
     def __init__(self, parent):
         super().__init__(parent)
         self.df_current = pd.DataFrame()
         self.df_history = pd.DataFrame()
-        self.create_widgets()
 
-    def create_widgets(self):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
 
@@ -678,6 +780,7 @@ class Dashboard(ctk.CTkFrame):
             w.destroy()
         if self.df_current.empty:
             return
+
         mismatch_df = self.df_current[self.df_current["Missing In"] != ""]
         pivot_df = mismatch_df.groupby(["Dimension","Attribute"]).size().unstack(fill_value=0)
         if pivot_df.empty:
@@ -689,10 +792,9 @@ class Dashboard(ctk.CTkFrame):
         ax.set_yticks(range(len(pivot_df.index)))
         ax.set_xticklabels(pivot_df.columns, rotation=90)
         ax.set_yticklabels(pivot_df.index)
-        ax.set_title("Discrepancy Heatmap")
+        ax.set_title("Discrepancy Heatmap (# mismatches)")
 
         fig.colorbar(cax, ax=ax)
-
         canvas = FigureCanvasTkAgg(fig, master=self.frame_heatmap)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -702,6 +804,7 @@ class Dashboard(ctk.CTkFrame):
             w.destroy()
         if self.df_current.empty:
             return
+
         dist_counts = self.df_current["Missing In"].fillna("").value_counts()
         data_labels = dist_counts.index.tolist()
         data_values = dist_counts.values.tolist()
@@ -709,7 +812,6 @@ class Dashboard(ctk.CTkFrame):
         fig, ax = plt.subplots(figsize=(5,5))
         ax.pie(data_values, labels=data_labels, autopct="%.1f%%", startangle=140)
         ax.set_title("Status Distribution (Current Run)")
-
         canvas = FigureCanvasTkAgg(fig, master=self.frame_status)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -719,6 +821,7 @@ class Dashboard(ctk.CTkFrame):
             w.destroy()
         if self.df_current.empty:
             return
+
         dim_counts = self.df_current.groupby("Dimension")["Key"].count().sort_values(ascending=False)
 
         fig, ax = plt.subplots(figsize=(6,4))
@@ -747,16 +850,16 @@ class Dashboard(ctk.CTkFrame):
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def plot_run_trend(self):
-        """Line chart grouping by the date in 'RunDate'."""
         for w in self.frame_linechart.winfo_children():
             w.destroy()
         if self.df_history.empty or "RunDate" not in self.df_history.columns:
             return
-        mismatch_df = self.df_history[self.df_history["Missing In"] != ""].copy()
+
+        mismatch_df = self.df_history[self.df_history["Missing In"] != ""]
         if mismatch_df.empty:
             return
-        
         date_counts = mismatch_df.groupby("RunDate")["Key"].count().reset_index()
+
         fig, ax = plt.subplots(figsize=(6,4))
         ax.plot(date_counts["RunDate"], date_counts["Key"], marker="o", color="green")
         ax.set_xlabel("Date")
@@ -771,49 +874,47 @@ class Dashboard(ctk.CTkFrame):
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
-# -------------- MAIN APP --------------
+# ====================== MAIN APPLICATION ======================
 class MainApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Mega Reconciliation UI - Old Pandas Compatible")
+        self.title("Ultra-Mega Reconciliation Script (Robust CSV + NaN Filter + Old Pandas Fallback)")
         self.geometry("1600x900")
 
         self.config_dict = load_config(Path(DEFAULT_PATHS["CONFIG_PATH"]))
-
-        # Keep a "history_df" of mismatch rows from multiple runs
         self.history_df = pd.DataFrame()
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
 
-        # Tab: Paths
+        # 1) Paths
         self.tab_paths = ctk.CTkFrame(self.notebook)
         self.notebook.add(self.tab_paths, text="Paths")
         self.build_paths_tab(self.tab_paths)
 
-        # Tab: XRP
-        self.tab_XRP = ctk.CTkFrame(self.notebook)
-        self.notebook.add(self.tab_XRP, text="XRP Config")
-        self.XRP_grid = ExcelGrid(self.tab_XRP, self.config_dict["XRP_grid"], "XRP")
-        self.XRP_grid.pack(fill="both", expand=True)
+        # 2) ERP
+        self.tab_erp = ctk.CTkFrame(self.notebook)
+        self.notebook.add(self.tab_erp, text="ERP Config")
+        self.erp_grid = ExcelGrid(self.tab_erp, self.config_dict.get("erp_grid", {}), "ERP")
+        self.erp_grid.pack(fill="both", expand=True)
 
-        # Tab: Master
+        # 3) Master
         self.tab_master = ctk.CTkFrame(self.notebook)
         self.notebook.add(self.tab_master, text="Master Config")
-        self.master_grid = ExcelGrid(self.tab_master, self.config_dict["master_grid"], "Master")
+        self.master_grid = ExcelGrid(self.tab_master, self.config_dict.get("master_grid", {}), "Master")
         self.master_grid.pack(fill="both", expand=True)
 
-        # Tab: Dimension Renames
+        # 4) Dimension Renames
         self.tab_dim = ctk.CTkFrame(self.notebook)
         self.notebook.add(self.tab_dim, text="Dimension Renames")
         self.build_dimension_tab(self.tab_dim)
 
-        # Tab: Compare & Exceptions
+        # 5) Compare & Exceptions
         self.tab_compare = ctk.CTkFrame(self.notebook)
         self.notebook.add(self.tab_compare, text="Compare & Exceptions")
         self.build_compare_tab(self.tab_compare)
 
-        # Tab: Dashboard
+        # 6) Dashboard
         self.tab_dashboard = Dashboard(self.notebook)
         self.notebook.add(self.tab_dashboard, text="Dashboard")
 
@@ -826,14 +927,14 @@ class MainApp(ctk.CTk):
         logging.getLogger().addHandler(handler)
 
         # Load initial data
-        self.refresh_XRP_data()
+        self.refresh_erp_data()
         self.refresh_master_data()
 
     def build_paths_tab(self, parent):
         frm = ctk.CTkFrame(parent)
         frm.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self.XRP_path_var = tk.StringVar(value=self.config_dict["paths"].get("XRP_EXCEL_PATH", DEFAULT_PATHS["XRP_EXCEL_PATH"]))
+        self.erp_path_var = tk.StringVar(value=self.config_dict["paths"].get("ERP_EXCEL_PATH", DEFAULT_PATHS["ERP_EXCEL_PATH"]))
         self.master_path_var = tk.StringVar(value=self.config_dict["paths"].get("MASTER_ZIP_PATH", DEFAULT_PATHS["MASTER_ZIP_PATH"]))
         self.exc_path_var = tk.StringVar(value=self.config_dict["paths"].get("EXCEPTION_PATH", DEFAULT_PATHS["EXCEPTION_PATH"]))
         self.out_path_var = tk.StringVar(value=self.config_dict["paths"].get("OUTPUT_PATH", DEFAULT_PATHS["OUTPUT_PATH"]))
@@ -842,8 +943,8 @@ class MainApp(ctk.CTk):
         def mkrow(lbl, var):
             rowf = ctk.CTkFrame(frm)
             rowf.pack(fill="x", pady=5)
-            ctk.CTkLabel(rowf, text=lbl, width=150).pack(side="left", padx=5)
-            ent = ctk.CTkEntry(rowf, textvariable=var, width=600)
+            ctk.CTkLabel(rowf, text=lbl, width=200).pack(side="left", padx=5)
+            ent = ctk.CTkEntry(rowf, textvariable=var, width=800)
             ent.pack(side="left", padx=5)
             def br():
                 path = filedialog.askopenfilename()
@@ -851,15 +952,15 @@ class MainApp(ctk.CTk):
                     var.set(path)
             ctk.CTkButton(rowf, text="Browse", command=br).pack(side="left", padx=5)
 
-        mkrow("XRP Excel Path:", self.XRP_path_var)
+        mkrow("ERP Excel Path:", self.erp_path_var)
         mkrow("Master ZIP Path:", self.master_path_var)
         mkrow("Exception Path:", self.exc_path_var)
         mkrow("Output Excel Path:", self.out_path_var)
         mkrow("JSON Config Path:", self.cfg_path_var)
 
-    def refresh_XRP_data(self):
-        df = read_XRP_data(Path(self.XRP_path_var.get()))
-        self.XRP_grid.set_data(df)
+    def refresh_erp_data(self):
+        df = safe_read_erp_excel(Path(self.erp_path_var.get()))
+        self.erp_grid.set_data(df)
 
     def refresh_master_data(self):
         df = read_master_data(Path(self.master_path_var.get()))
@@ -872,7 +973,6 @@ class MainApp(ctk.CTk):
         self.dim_rename_map = self.config_dict.get("dimension_renames", {})
 
         ctk.CTkLabel(frm, text="Old Dimension -> New Dimension").pack(pady=5)
-
         self.rename_rows = []
         self.list_frame = ctk.CTkScrollableFrame(frm, width=600, height=300)
         self.list_frame.pack(fill="both", expand=True)
@@ -911,7 +1011,7 @@ class MainApp(ctk.CTk):
 
         self.mode_var = tk.IntVar(value=self.config_dict.get("comparison_option", 1))
         for i, label in enumerate([
-            "Option 1 - Show everything missing in XRP or Master",
+            "Option 1 - Show everything missing in ERP or Master",
             "Option 2 - If Name missing, do not show attributes, else show missing attributes",
             "Option 3 - Show missing + matching (can be large)"
         ], start=1):
@@ -923,7 +1023,7 @@ class MainApp(ctk.CTk):
         ctk.CTkButton(btnf, text="Save Config", command=self.save_all_config).pack(side="left", padx=5)
 
     def run_comparison(self):
-        self.config_dict["paths"]["XRP_EXCEL_PATH"] = self.XRP_path_var.get().strip()
+        self.config_dict["paths"]["ERP_EXCEL_PATH"] = self.erp_path_var.get().strip()
         self.config_dict["paths"]["MASTER_ZIP_PATH"] = self.master_path_var.get().strip()
         self.config_dict["paths"]["EXCEPTION_PATH"] = self.exc_path_var.get().strip()
         self.config_dict["paths"]["OUTPUT_PATH"] = self.out_path_var.get().strip()
@@ -931,45 +1031,49 @@ class MainApp(ctk.CTk):
 
         self.config_dict["comparison_option"] = self.mode_var.get()
 
-        df_XRP = self.XRP_grid.get_filtered_df()
+        # Grab filtered data from each grid
+        df_erp = self.erp_grid.get_filtered_df()
         df_master = self.master_grid.get_filtered_df()
 
-        dim_map = self.config_dict.get("dimension_renames", {})
-        XRP_melt = meltdown_XRP(df_XRP, dim_map)
-        XRP_ready = build_keys(XRP_melt)
-        mast_melt = meltdown_master(df_master, dim_map)
+        # meltdown with dimension renames
+        erp_melt = meltdown_erp(df_erp, self.dim_rename_map)
+        erp_ready = build_keys(erp_melt)
+
+        mast_melt = meltdown_master(df_master, self.dim_rename_map)
         mast_ready = build_keys(mast_melt)
 
-        mode = self.config_dict["comparison_option"]
-        df_diff = compare_data(XRP_ready, mast_ready, mode)
+        # compare
+        mode = self.mode_var.get()
+        df_diff = compare_data(erp_ready, mast_ready, mode)
 
+        # exceptions
         exc_path = Path(self.exc_path_var.get().strip())
         df_exc = read_exception_table(exc_path)
         final = merge_exceptions(df_diff, df_exc)
 
+        # write results
         out_path = Path(self.out_path_var.get().strip())
         write_results(final, out_path, mode)
 
-        # Tag this run with today's date for the line chart
+        # Tag with today's date for the line chart
         run_date = datetime.now().strftime("%Y-%m-%d")
         final = final.copy()
         final["RunDate"] = run_date
 
-        # Store in our history
         self.history_df = pd.concat([self.history_df, final], ignore_index=True)
 
-        # Update dashboard
+        # update dashboard
         self.notebook.select(self.tab_dashboard)
         self.tab_dashboard.update_data(final, self.history_df)
 
         messagebox.showinfo("Done", f"Comparison for {run_date} complete. Results in {out_path}")
 
     def save_all_config(self):
-        self.config_dict["XRP_grid"] = self.XRP_grid.get_config_block()
+        self.config_dict["erp_grid"] = self.erp_grid.get_config_block()
         self.config_dict["master_grid"] = self.master_grid.get_config_block()
         self.config_dict["dimension_renames"] = self.dim_rename_map
 
-        self.config_dict["paths"]["XRP_EXCEL_PATH"] = self.XRP_path_var.get().strip()
+        self.config_dict["paths"]["ERP_EXCEL_PATH"] = self.erp_path_var.get().strip()
         self.config_dict["paths"]["MASTER_ZIP_PATH"] = self.master_path_var.get().strip()
         self.config_dict["paths"]["EXCEPTION_PATH"] = self.exc_path_var.get().strip()
         self.config_dict["paths"]["OUTPUT_PATH"] = self.out_path_var.get().strip()

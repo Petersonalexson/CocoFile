@@ -1,18 +1,13 @@
-"""
-Ultra-Mega Reconciliation (Per-File Master with Dimension + Attribute Filtering + Temp CSV)
-------------------------------------------------------------------------------------------
-- Each .txt in the Master ZIP -> read robustly, then saved to a temp CSV (UTF-8),
-  then re-read for display in the GUI, ensuring consistent encoding.
-- The dimension is derived from filename (Old Gamma style). You can rename it
-  via "Dimension Renames."
-- We can skip entire dimensions by simply not loading them or leaving them hidden.
-- Multiple comparison modes (1, 2, 3).
-- Exceptions table merging.
-- Dashboard charts for mismatch analysis.
 
-Reference for decode errors:
-https://stackoverflow.com/questions/16508539/unicodedecodeerror-ascii-codec-cant-decode-byte-0xc2
-We handle it by trying multiple encodings and ignoring errors initially.
+
+"""
+Ultra-Mega Reconciliation (Single Master Table + Convert .txt to UTF-8 CSV)
+---------------------------------------------------------------------------
+- Each .txt in the Master ZIP -> read robustly, saved to a temp CSV in UTF-8,
+  then combined into ONE DataFrame with a 'Dimension' column.
+- We display a SINGLE Master grid, so you can filter/rename columns in one place.
+- The meltdown then occurs on that single Master DataFrame when running comparison.
+- Multiple comparison modes (1, 2, 3), merges exception table, plus a dashboard.
 
 Author: X
 Date: 2025
@@ -79,7 +74,6 @@ def default_config() -> Dict:
             "OUTPUT_PATH": DEFAULT_PATHS["OUTPUT_PATH"],
             "CONFIG_PATH": DEFAULT_PATHS["CONFIG_PATH"]
         },
-        # Single config block for ERP
         "erp_grid": {
             "columns": [
                 {"id": "Col1",           "name": "Col1",           "locked": False, "visible": True,  "renameable": True},
@@ -90,9 +84,11 @@ def default_config() -> Dict:
             ],
             "filters": {}
         },
-        # Master is stored as dimension_name => config for each .txt sub-tab
-        "master_grid_configs": {},
-
+        # Single Master Grid, not multiple sub-tabs
+        "master_grid": {
+            "columns": [],
+            "filters": {}
+        },
         "dimension_renames": {},
         "comparison_option": 1
     }
@@ -119,17 +115,12 @@ def save_config(cfg: Dict, path: Path):
 # 3) TEXT LOGGER HANDLER
 # ------------------------------------------------------------------------------
 class TextHandler(logging.Handler):
-    """
-    A logging handler that appends log messages to a customtkinter textbox in the GUI.
-    """
     def __init__(self, widget: ctk.CTkTextbox):
         super().__init__()
         self.widget = widget
-
     def emit(self, record):
         msg = self.format(record) + "\n"
         self.widget.after(0, self._append, msg)
-
     def _append(self, msg):
         self.widget.configure(state="normal")
         self.widget.insert("end", msg)
@@ -137,7 +128,7 @@ class TextHandler(logging.Handler):
         self.widget.configure(state="disabled")
 
 # ------------------------------------------------------------------------------
-# 4) READ ERP EXCEL
+# 4) SAFE READ ERP EXCEL
 # ------------------------------------------------------------------------------
 class FileHandler:
     @staticmethod
@@ -182,7 +173,6 @@ def read_csv_robust(filebytes: bytes) -> pd.DataFrame:
         logging.warning("[read_csv_robust] Empty file => returning empty DataFrame.")
         return pd.DataFrame()
 
-    # chardet guess
     guess_enc = None
     if chardet:
         det = chardet.detect(filebytes[:4096])
@@ -195,9 +185,7 @@ def read_csv_robust(filebytes: bytes) -> pd.DataFrame:
     encodings_to_try = []
     if guess_enc:
         encodings_to_try.append(guess_enc)
-    encodings_to_try.extend([
-        "utf-8-sig","utf-16","utf-32","cp1252","latin1","iso-8859-1","ascii"
-    ])
+    encodings_to_try.extend(["utf-8-sig","utf-16","utf-32","cp1252","latin1","iso-8859-1","ascii"])
 
     delimiters = [",",";","\t","|",None]
 
@@ -214,7 +202,6 @@ def read_csv_robust(filebytes: bytes) -> pd.DataFrame:
                 engine="python"
             )
         except TypeError:
-            # older pandases
             text_decoded = data.decode(enc, errors="replace")
             buf = io.StringIO(text_decoded)
             return pd.read_csv(
@@ -234,7 +221,7 @@ def read_csv_robust(filebytes: bytes) -> pd.DataFrame:
                 df_tmp.dropna(axis=1, how="all", inplace=True)
                 df_tmp.columns = df_tmp.columns.astype(str).str.strip()
                 if not df_tmp.empty and len(df_tmp.columns) > 0:
-                    logging.info(f"[read_csv_robust] success enc='{enc}', delim='{delim}' => {df_tmp.shape}")
+                    logging.info(f"[read_csv_robust] success enc='{enc}', delim='{delim}' => shape={df_tmp.shape}")
                     return df_tmp
                 else:
                     logging.warning(f"[read_csv_robust] empty/no-cols with enc='{enc}', delim='{delim}'")
@@ -244,12 +231,11 @@ def read_csv_robust(filebytes: bytes) -> pd.DataFrame:
     return pd.DataFrame()
 
 # ------------------------------------------------------------------------------
-# 6) EXCEL-LIKE GRID
+# 6) EXCELGRID
 # ------------------------------------------------------------------------------
 class ExcelGrid(ctk.CTkFrame):
     """
-    Excel-like grid that attempts multiple filters including NaN and blank.
-    Also shows lock icon if 'locked': True in col_def.
+    Single Master or ERP Grid. You can rename/hide columns, filter values, etc.
     """
     LOCK_ICON = " \U0001F512"
 
@@ -294,7 +280,6 @@ class ExcelGrid(ctk.CTkFrame):
         self.status_label.pack(fill="x", padx=5, pady=2)
 
     def set_data(self, df: pd.DataFrame):
-        """Load a new DataFrame and refresh."""
         self.df = df.copy(deep=True)
         existing_ids = [c["id"] for c in self.col_defs]
         for col in self.df.columns:
@@ -337,6 +322,7 @@ class ExcelGrid(ctk.CTkFrame):
     def refresh_table(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
+
         visible_cols = [c for c in self.col_defs if c.get("visible", True)]
         self.tree["columns"] = [c["id"] for c in visible_cols]
 
@@ -344,7 +330,6 @@ class ExcelGrid(ctk.CTkFrame):
             col_name = col_def["name"]
             if col_def.get("locked", False):
                 col_name += self.LOCK_ICON
-
             self.tree.heading(
                 col_def["id"],
                 text=col_name,
@@ -354,7 +339,7 @@ class ExcelGrid(ctk.CTkFrame):
             self.tree.column(col_def["id"], anchor="w", width=col_def.get("width", 150))
 
         df_f = self.get_filtered_df()
-        for idx, row in df_f.iterrows():
+        for _, row in df_f.iterrows():
             vals = [row[c["id"]] for c in visible_cols]
             self.tree.insert("", "end", values=vals)
 
@@ -407,7 +392,6 @@ class ExcelGrid(ctk.CTkFrame):
                 in_filter = any(pd.isna(fv) for fv in current_filter)
             else:
                 in_filter = (real_val in current_filter)
-
             var = tk.BooleanVar(value=in_filter)
             var_dict[real_val] = var
             ctk.CTkCheckBox(scroll, text=disp_str, variable=var).pack(anchor="w")
@@ -602,11 +586,9 @@ def compare_mode_2(dimension, name_a, name_b, a_data, b_data):
                 elif vb and not va:
                     results.append({"Dimension": dimension, "Name": name_a, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
                 else:
-                    # mismatch => both sides
                     results.append({"Dimension": dimension, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
                     results.append({"Dimension": dimension, "Name": name_a, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
     else:
-        # entire record missing from one side
         if name_a and not name_b:
             results.append({"Dimension": dimension, "Name": name_a, "Attribute": "Name", "Value": name_a, "Missing In": "MASTER"})
         elif name_b and not name_a:
@@ -620,7 +602,6 @@ def compare_mode_3(dimension, name_a, name_b, a_data, b_data):
         va = a_data.get(attr, "")
         vb = b_data.get(attr, "")
         if va == vb:
-            # identical => show once
             results.append({"Dimension": dimension, "Name": name_a if name_a else name_b, "Attribute": attr, "Value": va, "Missing In": ""})
         else:
             if va and not vb:
@@ -628,7 +609,6 @@ def compare_mode_3(dimension, name_a, name_b, a_data, b_data):
             elif vb and not va:
                 results.append({"Dimension": dimension, "Name": name_b, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
             else:
-                # mismatch => both sides
                 results.append({"Dimension": dimension, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
                 results.append({"Dimension": dimension, "Name": name_a if name_a else name_b, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
     return results
@@ -844,39 +824,38 @@ class Dashboard(ctk.CTkFrame):
 # ------------------------------------------------------------------------------
 class MainApp(ctk.CTk):
     """
-    - Single ERP grid.
-    - For Master, we read .txt -> robust parse -> save to a temp CSV in UTF-8
-      -> re-read that CSV for final display in sub-tabs.
-    - Then meltdown, compare, exceptions, dashboard.
+    - Single ERP Grid + Single Master Grid
+    - Master Data => For each .txt, robust parse -> temp CSV -> re-read => unify into one DF w/Dimension col
+    - meltdown, compare, exceptions, dashboard
     """
     def __init__(self):
         super().__init__()
-        self.title("Ultra-Mega Reconciliation: Per-file Master + Temp CSV (UTF-8)")
+        self.title("Ultra-Mega Reconciliation: Single Master Table (UTF-8 CSV Conversion)")
         self.geometry("1600x900")
 
         self.config_dict = load_config(Path(DEFAULT_PATHS["CONFIG_PATH"]))
         self.history_df = pd.DataFrame()
 
+        # main notebook
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
 
-        # 1) Paths tab
+        # 1) Paths
         self.tab_paths = ctk.CTkFrame(self.notebook)
         self.notebook.add(self.tab_paths, text="Paths")
         self.build_paths_tab(self.tab_paths)
 
-        # 2) ERP tab
+        # 2) ERP
         self.tab_erp = ctk.CTkFrame(self.notebook)
-        self.notebook.add(self.tab_erp, text="ERP (Alfa)")
+        self.notebook.add(self.tab_erp, text="ERP Data")
         self.erp_grid = ExcelGrid(self.tab_erp, self.config_dict.get("erp_grid", {}), "ERP")
         self.erp_grid.pack(fill="both", expand=True)
 
-        # 3) Master (Gamma)
+        # 3) Master
         self.tab_master = ctk.CTkFrame(self.notebook)
-        self.notebook.add(self.tab_master, text="Master (Gamma)")
-        self.master_notebook = ttk.Notebook(self.tab_master)
-        self.master_notebook.pack(fill="both", expand=True)
-        self.master_grids: Dict[str, ExcelGrid] = {}
+        self.notebook.add(self.tab_master, text="Master Data (All .txt Merged)")
+        self.master_grid = ExcelGrid(self.tab_master, self.config_dict.get("master_grid", {}), "Master")
+        self.master_grid.pack(fill="both", expand=True)
 
         # 4) Dimension Renames
         self.tab_dim = ctk.CTkFrame(self.notebook)
@@ -900,11 +879,14 @@ class MainApp(ctk.CTk):
         handler.setLevel(logging.INFO)
         logging.getLogger().addHandler(handler)
 
-        # Create a folder to store our temp CSVs
+        # Folder for temp CSV
         self.temp_csv_dir = Path("temp_master_csv")
         self.temp_csv_dir.mkdir(exist_ok=True)
 
-        # Load initial data
+        # single DataFrame that merges all Master .txt
+        self.df_master_merged = pd.DataFrame()
+
+        # initial load
         self.refresh_erp_data()
         self.refresh_master_data()
 
@@ -924,12 +906,10 @@ class MainApp(ctk.CTk):
             ctk.CTkLabel(rowf, text=lbl, width=200).pack(side="left", padx=5)
             ent = ctk.CTkEntry(rowf, textvariable=var, width=800)
             ent.pack(side="left", padx=5)
-
             def br():
                 path = filedialog.askopenfilename()
                 if path:
                     var.set(path)
-
             ctk.CTkButton(rowf, text="Browse", command=br).pack(side="left", padx=5)
 
         mkrow("ERP Excel Path:", self.erp_path_var)
@@ -945,31 +925,30 @@ class MainApp(ctk.CTk):
 
     def refresh_master_data(self):
         """
-        For each .txt in the Master ZIP:
-          1) Read with robust approach,
-          2) Save to `temp_master_csv/<DimensionName>.csv` in UTF-8,
-          3) Re-read that CSV with encoding='utf-8',
-          4) Build sub-tab from final DataFrame.
+        1) For each .txt in ZIP, robust parse, store 'Dimension' col from filename
+        2) Save to temp CSV in UTF-8
+        3) Re-read that CSV (UTF-8)
+        4) Accumulate into a single df_master_merged
+        5) display in self.master_grid
         """
         zip_path = Path(self.master_path_var.get())
         if not zip_path.is_file():
             logging.warning("[Master] ZIP not found.")
             return
 
-        # Clear existing sub-tabs
-        for tab_id in list(self.master_notebook.tabs()):
-            self.master_notebook.forget(tab_id)
-        self.master_grids.clear()
+        # Clear old data
+        self.df_master_merged = pd.DataFrame()
 
         with zipfile.ZipFile(zip_path, "r") as z:
             txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
             if not txt_files:
-                logging.warning("[Master] No .txt files found in ZIP.")
+                logging.warning("[Master] No .txt found in ZIP.")
                 return
+
+            partial_dfs = []
 
             for txt_file in txt_files:
                 base_name = os.path.basename(txt_file)
-                # Derive dimension name from filename
                 if "_ceaster.txt" in base_name.lower():
                     base_dim = base_name.lower().replace("_ceaster.txt", "")
                 else:
@@ -982,41 +961,41 @@ class MainApp(ctk.CTk):
                         if not file_bytes:
                             logging.warning(f"[Master] '{txt_file}' is empty.")
                             continue
-
-                        # Step 1) read robust
                         df_raw = read_csv_robust(file_bytes)
                         if df_raw.empty:
-                            logging.warning(f"[Master] '{txt_file}' => empty after parse.")
                             continue
+                        df_raw.columns = df_raw.columns.str.strip()
 
-                        # Step 2) Save to temp CSV (UTF-8)
+                        # Insert a 'Dimension' column
+                        df_raw["Dimension"] = dimension_name
+
+                        # If no "Name" col, rename the first col
+                        if "Name" not in df_raw.columns and len(df_raw.columns) > 0:
+                            first_col = df_raw.columns[0]
+                            df_raw.rename(columns={first_col: "Name"}, inplace=True)
+
+                        # Save to temp CSV
                         out_csv = self.temp_csv_dir / f"{dimension_name}.csv"
                         df_raw.to_csv(out_csv, index=False, encoding="utf-8")
-                        logging.info(f"[Master] Wrote temp CSV => {out_csv}")
 
-                        # Step 3) Re-read that CSV in UTF-8
-                        df_readagain = pd.read_csv(out_csv, encoding="utf-8", on_bad_lines="skip")
-
-                        # rename first col => "Name" if not present
-                        df_readagain.columns = df_readagain.columns.str.strip()
-                        if "Name" not in df_readagain.columns and len(df_readagain.columns) > 0:
-                            first_col = df_readagain.columns[0]
-                            df_readagain.rename(columns={first_col: "Name"}, inplace=True)
+                        # Re-read the CSV
+                        df_reutf = pd.read_csv(out_csv, encoding="utf-8", on_bad_lines="skip")
+                        df_reutf.columns = df_reutf.columns.str.strip()
+                        # Ensure 'Dimension' remains
+                        df_reutf["Dimension"] = dimension_name
+                        partial_dfs.append(df_reutf)
 
                 except Exception as e:
-                    logging.error(f"[Master] Error handling '{txt_file}': {e}")
+                    logging.error(f"[Master] Error reading '{txt_file}': {e}")
                     continue
 
-                # Create sub-tab for dimension
-                cfg_for_dim = self.config_dict.get("master_grid_configs", {}).get(dimension_name, {})
-                tab_frame = ctk.CTkFrame(self.master_notebook)
-                self.master_notebook.add(tab_frame, text=dimension_name)
+            if partial_dfs:
+                self.df_master_merged = pd.concat(partial_dfs, ignore_index=True)
+            else:
+                self.df_master_merged = pd.DataFrame()
 
-                grid = ExcelGrid(tab_frame, cfg_for_dim, name=dimension_name)
-                grid.set_data(df_readagain)
-                grid.pack(fill="both", expand=True)
-
-                self.master_grids[dimension_name] = grid
+        # Now set to the Master grid
+        self.master_grid.set_data(self.df_master_merged)
 
     def build_dimension_tab(self, parent):
         frm = ctk.CTkFrame(parent)
@@ -1055,11 +1034,11 @@ class MainApp(ctk.CTk):
         messagebox.showinfo("Saved", "Dimension renames saved in memory.")
 
     @property
-    def dim_rename_map(self) -> Dict[str, str]:
+    def dim_rename_map(self) -> Dict[str,str]:
         return self.config_dict.get("dimension_renames", {})
 
     @dim_rename_map.setter
-    def dim_rename_map(self, new_map: Dict[str, str]):
+    def dim_rename_map(self, new_map: Dict[str,str]):
         self.config_dict["dimension_renames"] = new_map
 
     def build_compare_tab(self, parent):
@@ -1080,6 +1059,7 @@ class MainApp(ctk.CTk):
         ctk.CTkButton(btnf, text="Save Config", command=self.save_all_config).pack(side="left", padx=5)
 
     def run_reconciliation(self):
+        # update config paths
         self.config_dict["paths"]["ERP_EXCEL_PATH"] = self.erp_path_var.get().strip()
         self.config_dict["paths"]["MASTER_ZIP_PATH"] = self.master_path_var.get().strip()
         self.config_dict["paths"]["EXCEPTION_PATH"] = self.exc_path_var.get().strip()
@@ -1095,30 +1075,8 @@ class MainApp(ctk.CTk):
         erp_ready = build_keys(erp_melt)
 
         # meltdown Master
-        all_master_frames = []
-        for dim_name, grid in self.master_grids.items():
-            self.config_dict.setdefault("master_grid_configs", {})
-            self.config_dict["master_grid_configs"][dim_name] = grid.get_config_block()
-
-            df_sub = grid.get_filtered_df().copy()
-            if df_sub.empty:
-                continue
-
-            if "Dimension" not in df_sub.columns:
-                df_sub["Dimension"] = dim_name
-
-            if "Name" not in df_sub.columns and len(df_sub.columns) > 0:
-                first_col = df_sub.columns[0]
-                df_sub.rename(columns={first_col: "Name"}, inplace=True)
-
-            all_master_frames.append(df_sub)
-
-        if all_master_frames:
-            df_master_big = pd.concat(all_master_frames, ignore_index=True)
-        else:
-            df_master_big = pd.DataFrame()
-
-        master_melt = meltdown_master(df_master_big, self.dim_rename_map)
+        df_master_filtered = self.master_grid.get_filtered_df().copy()
+        master_melt = meltdown_master(df_master_filtered, self.dim_rename_map)
         master_ready = build_keys(master_melt)
 
         # compare
@@ -1129,11 +1087,11 @@ class MainApp(ctk.CTk):
         df_exc = read_exception_table(exc_path)
         final = merge_exceptions(df_diff, df_exc)
 
-        # write results
+        # write
         out_path = Path(self.out_path_var.get().strip())
         write_results(final, out_path, mode)
 
-        # push to dashboard
+        # dashboard
         run_date = datetime.now().strftime("%Y-%m-%d")
         final["RunDate"] = run_date
         self.history_df = pd.concat([self.history_df, final], ignore_index=True)
@@ -1147,10 +1105,8 @@ class MainApp(ctk.CTk):
         # ERP config
         self.config_dict["erp_grid"] = self.erp_grid.get_config_block()
 
-        # master grids
-        mgc = self.config_dict.setdefault("master_grid_configs", {})
-        for dim_name, grid in self.master_grids.items():
-            mgc[dim_name] = grid.get_config_block()
+        # Master config
+        self.config_dict["master_grid"] = self.master_grid.get_config_block()
 
         # dimension renames
         self.config_dict["dimension_renames"] = self.dim_rename_map

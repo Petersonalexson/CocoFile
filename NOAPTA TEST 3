@@ -15,7 +15,7 @@ Requires:
   - chardet (optional but recommended for advanced detection)
   - tkinter (part of standard Python on most platforms)
 
-Author: ChatGPT
+Author: X
 Date: 2025
 """
 

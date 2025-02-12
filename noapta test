@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+
+"""
+Ultra-Mega Reconciliation Script - Multiple Delimiters & Encodings
+------------------------------------------------------------------
+- For Master .txt files, we try multiple encodings (utf-8-sig, utf-8, utf-16, utf-32,
+  cp1252, latin1, iso-8859-1, ascii), fallback to chardet guess if available.
+- Multiple delimiters (",", ";", "\t", "|", None for inference).
+- Skips bad lines, quotes issues, empties, etc. 
+- Fallback for older Pandas if needed.
+
+- The logic for reading Master (ZIP) is based on the older "Gamma" approach:
+  we rename the first column to "Name", add "Dimension" from the filename,
+  add "RecordID", do an initial "melt" to get (Attribute, Value).
+
+- Includes Excel-like grids that filter NaN/blank, dimension rename, 3 compare modes,
+  merges exception table, daily-run chart, config, etc.
+
+Author: X
+Date: 2025
+"""
+
+import os
+import json
+import logging
+import zipfile
+import time
+import copy
+import csv
+from pathlib import Path
+from typing import Dict, List, Set, Tuple
+from datetime import datetime, timedelta
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+import customtkinter as ctk
+import pandas as pd
+import numpy as np
+
+# Attempt optional chardet
+try:
+    import chardet
+except ImportError:
+    chardet = None
+
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# ---------------- LOGGING ----------------
+def setup_logger():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s"
+    )
+setup_logger()
+
+# -------------- DEFAULTS & CONFIG --------------
+DEFAULT_PATHS = {
+    "ERP_EXCEL_PATH": "data/ERP_Config.xlsx",
+    "MASTER_ZIP_PATH": "data/Master_Config.zip",
+    "EXCEPTION_PATH": "data/Exception_Table.xlsx",
+    "OUTPUT_PATH": "output/Reconciliation.xlsx",
+    "CONFIG_PATH": "config/ui_config.json"
+}
+
+def default_config() -> Dict:
+    return {
+        "paths": {
+            "ERP_EXCEL_PATH": DEFAULT_PATHS["ERP_EXCEL_PATH"],
+            "MASTER_ZIP_PATH": DEFAULT_PATHS["MASTER_ZIP_PATH"],
+            "EXCEPTION_PATH": DEFAULT_PATHS["EXCEPTION_PATH"],
+            "OUTPUT_PATH": DEFAULT_PATHS["OUTPUT_PATH"],
+            "CONFIG_PATH": DEFAULT_PATHS["CONFIG_PATH"]
+        },
+        "erp_grid": {
+            "columns": [
+                {"id": "Col1",           "name": "Col1",           "locked": False, "visible": True,  "renameable": True},
+                {"id": "Col2",           "name": "Col2",           "locked": False, "visible": True,  "renameable": True},
+                {"id": "Enabled_Flag",   "name": "Enabled_Flag",   "locked": False, "visible": True,  "renameable": True},
+                {"id": "Dimension_Name", "name": "Dimension_Name", "locked": True,  "visible": True,  "renameable": False},
+                {"id": "Value",          "name": "Value",          "locked": True,  "visible": True,  "renameable": False},
+            ],
+            "filters": {}
+        },
+        "master_grid": {
+            "columns": [
+                {"id": "Name",      "name": "Name",      "locked": True,  "visible": True, "renameable": False},
+                {"id": "Dimension", "name": "Dimension", "locked": True,  "visible": True, "renameable": False},
+            ],
+            "filters": {}
+        },
+        "dimension_renames": {},
+        "comparison_option": 1
+    }
+
+def load_config(path: Path) -> Dict:
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load config from {path}: {e}")
+    return default_config()
+
+def save_config(cfg: Dict, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        logging.info(f"Saved config to {path}")
+    except Exception as e:
+        logging.error(f"Error saving config: {e}")
+
+# -------------- UI LOG HANDLER --------------
+class TextHandler(logging.Handler):
+    def __init__(self, widget: ctk.CTkTextbox):
+        super().__init__()
+        self.widget = widget
+    def emit(self, record):
+        msg = self.format(record) + "\n"
+        self.widget.after(0, self._append, msg)
+    def _append(self, msg):
+        self.widget.configure(state="normal")
+        self.widget.insert("end", msg)
+        self.widget.see("end")
+        self.widget.configure(state="disabled")
+
+# -------------- SAFE READ EXCEL --------------
+class FileHandler:
+    @staticmethod
+    def safe_read_excel(path: Path, skiprows: int = 0, retries: int = 2) -> pd.DataFrame:
+        import pandas as pd
+        for attempt in range(retries):
+            try:
+                logging.info(f"Reading Excel: {path} (attempt {attempt+1}/{retries})")
+                df = pd.read_excel(path, skiprows=skiprows)
+                df.columns = df.columns.str.strip()
+                return df
+            except Exception as e:
+                logging.warning(f"Failed reading Excel {path}: {e}")
+                if attempt == retries - 1:
+                    raise
+                time.sleep(1)
+        return pd.DataFrame()
+
+def safe_read_erp_excel(path: Path) -> pd.DataFrame:
+    try:
+        return FileHandler.safe_read_excel(path, skiprows=3)
+    except Exception as e:
+        logging.error(f"Error reading ERP Excel: {e}")
+        return pd.DataFrame()
+
+# -------------- IMPROVED ROBUST CSV READING --------------
+def read_csv_robust(filebytes: bytes) -> pd.DataFrame:
+    """
+    More robust CSV reading, with multiple encodings & delimiters. 
+    Chardet if installed, fallback if older Pandas doesn't allow on_bad_lines.
+    Removes empty rows/columns.
+    """
+    import io
+    import pandas as pd
+
+    if len(filebytes) == 0:
+        logging.warning("File is empty; returning empty DataFrame.")
+        return pd.DataFrame()
+
+    # Attempt chardet guess
+    chardet_encoding = None
+    if chardet:
+        sample = filebytes[:4096]
+        det = chardet.detect(sample)
+        guess_enc = det["encoding"]
+        confidence = det.get("confidence", 0)
+        if guess_enc and confidence >= 0.75:
+            chardet_encoding = guess_enc
+            logging.info(f"[Robust CSV] chardet guess='{guess_enc}' conf={confidence}")
+
+    encodings_to_try = []
+    if chardet_encoding:
+        encodings_to_try.append(chardet_encoding)
+    encodings_to_try.extend([
+        "utf-8-sig",
+        "utf-16",
+        "utf-32",
+        "cp1252",
+        "latin1",
+        "iso-8859-1",
+        "ascii"
+    ])
+
+    delimiters_to_try = [",", ";", "\t", "|", None]
+
+    def try_read(data: bytes, enc: str, delim) -> pd.DataFrame:
+        try:
+            return pd.read_csv(
+                io.BytesIO(data),
+                encoding=enc,
+                delimiter=delim,
+                on_bad_lines="skip",
+                quoting=csv.QUOTE_MINIMAL,
+                error_bad_lines=False,
+                engine="python"
+            )
+        except TypeError:
+            # older pandas fallback
+            text_decoded = data.decode(enc, errors="replace")
+            buf = io.StringIO(text_decoded)
+            return pd.read_csv(
+                buf,
+                delimiter=delim,
+                error_bad_lines=False,
+                warn_bad_lines=True,
+                quoting=csv.QUOTE_MINIMAL,
+                engine="python"
+            )
+
+    for enc in encodings_to_try:
+        for delim in delimiters_to_try:
+            try:
+                tmp = try_read(filebytes, enc, delim)
+                tmp.dropna(how="all", inplace=True)
+                tmp.dropna(axis=1, how="all", inplace=True)
+                tmp.columns = tmp.columns.astype(str).str.strip()
+                if not tmp.empty and len(tmp.columns) > 0:
+                    logging.info(f"[Robust CSV] success enc='{enc}', delim='{delim}' => shape {tmp.shape}")
+                    return tmp
+                else:
+                    logging.warning(f"[Robust CSV] got empty/no-cols with enc='{enc}', delim='{delim}'")
+            except Exception as e:
+                logging.debug(f"[Robust CSV] failed enc='{enc}', delim='{delim}': {e}")
+
+    logging.error("[Robust CSV] could not read with any tried combos.")
+    return pd.DataFrame()
+
+# -------------- REPLACE old read_master_data with a "Gamma-style" approach --------------
+def transform_master(zip_file_path: Path) -> pd.DataFrame:
+    """
+    Reads the Master ZIP (like old 'Gamma'):
+
+    - For each .txt in the ZIP:
+        1) Derive 'Dimension' from filename.
+        2) Read raw data with read_csv_robust.
+        3) Rename 1st column => 'Name'.
+        4) Add 'RecordID' from row index, add 'Dimension'.
+        5) "Melt" so we get columns: (Dimension, RecordID, Attribute, Value).
+        6) Then combine all into one DataFrame.
+
+    Note that after this function, we still run meltdown_master() in the UI logic,
+    which might be partially redundant. But we keep it to match the new script’s flow.
+    """
+    if not zip_file_path.is_file():
+        logging.warning(f"[Master] ZIP not found: {zip_file_path}")
+        return pd.DataFrame()
+
+    all_dfs = []
+    try:
+        with zipfile.ZipFile(zip_file_path, "r") as z:
+            txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+            if not txt_files:
+                logging.warning("[Master] No .txt in ZIP.")
+                return pd.DataFrame()
+
+            for txt_file in txt_files:
+                base_name = os.path.basename(txt_file)
+                # Derive dimension from the filename
+                if "_ceaster.txt" in base_name.lower():
+                    base_dim = base_name.lower().replace("_ceaster.txt", "")
+                else:
+                    base_dim, _ = os.path.splitext(base_name)
+                dimension = base_dim.replace("_", " ").title()
+
+                try:
+                    with z.open(txt_file) as fo:
+                        raw_bytes = fo.read()
+                        if not raw_bytes:
+                            logging.warning(f"[Master] '{txt_file}' is empty.")
+                            continue
+                        df_raw = read_csv_robust(raw_bytes)
+                except Exception as e:
+                    logging.error(f"[Master] Error reading '{txt_file}': {e}")
+                    continue
+
+                if df_raw.empty:
+                    logging.warning(f"[Master] '{txt_file}' => empty after read.")
+                    continue
+
+                # Rename first column => 'Name'
+                first_col = df_raw.columns[0]
+                df_raw.rename(columns={first_col: "Name"}, inplace=True)
+
+                # Add dimension & RecordID
+                df_raw["Dimension"] = dimension
+                df_raw["RecordID"] = df_raw.index.astype(str)
+
+                # id_vars / value_vars for meltdown
+                id_vars = ["Dimension", "RecordID"]
+                value_vars = [c for c in df_raw.columns if c not in id_vars]
+                melted = df_raw.melt(
+                    id_vars=id_vars,
+                    value_vars=value_vars,
+                    var_name="Attribute",
+                    value_name="Value"
+                )
+
+                # Fill empties so we don’t get NaN in final keys
+                for col in ["Dimension", "Attribute", "Value"]:
+                    melted[col] = melted[col].fillna("").astype(str)
+
+                # done, store
+                logging.info(f"[Master] '{txt_file}' => meltdown => {len(melted)} rows.")
+                all_dfs.append(melted)
+    except Exception as e2:
+        logging.error(f"[Master] Could not open or read ZIP: {e2}")
+        return pd.DataFrame()
+
+    if not all_dfs:
+        logging.warning("[Master] No data extracted.")
+        return pd.DataFrame()
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+    logging.info(f"[Master] Combined => {len(combined)} total rows.")
+    return combined
+
+# -------------- EXCELGRID (with NaN/blank filter) --------------
+class ExcelGrid(ctk.CTkFrame):
+    """
+    (unchanged from your new script)
+    """
+    LOCK_ICON = " \U0001F512"
+
+    def __init__(self, parent, config_block: Dict, name: str):
+        super().__init__(parent)
+        self.name = name
+        self.col_defs = config_block.get("columns", [])
+        self.filters: Dict[str, Set] = {}
+        for col_id, val_list in config_block.get("filters", {}).items():
+            self.filters[col_id] = set(val_list) if isinstance(val_list, list) else set()
+
+        self.df = pd.DataFrame()
+
+        self.create_toolbar()
+        self.create_table()
+        self.create_statusbar()
+
+    def create_toolbar(self):
+        bar = ctk.CTkFrame(self)
+        bar.pack(fill="x", padx=5, pady=5)
+        ctk.CTkButton(bar, text="Manage

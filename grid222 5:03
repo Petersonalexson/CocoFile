@@ -11,7 +11,7 @@ Ultra-Mega Reconciliation Script - Multiple Delimiters & Encodings
 - Includes Excel-like grids that filter NaN/blank, dimension rename, 3 compare modes,
   merges exception table, daily-run chart, config, etc.
 
-Author: Al Pacino
+Author: X
 Date: 2025
 """
 
@@ -303,7 +303,6 @@ def read_master_data(zip_path: Path) -> pd.DataFrame:
                     # Ensure columns are stripped:
                     df_part.columns = df_part.columns.str.strip()
 
-                    # The first column is assumed to be 'Name' if not found:
                     # If the current columns do not contain "Name", rename the first col to "Name".
                     if "Name" not in df_part.columns and len(df_part.columns) > 0:
                         first_col = df_part.columns[0]
@@ -1014,8 +1013,7 @@ class MainApp(ctk.CTk):
         frm = ctk.CTkFrame(parent)
         frm.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self.dim_rename_map = self.config_dict.get("dimension_renames", {})
-
+        # We'll use the property below (it has a setter now!)
         ctk.CTkLabel(frm, text="Old Dimension -> New Dimension").pack(pady=5)
         self.rename_rows = []
         self.list_frame = ctk.CTkScrollableFrame(frm, width=600, height=300)
@@ -1045,8 +1043,8 @@ class MainApp(ctk.CTk):
             newv = tk_new.get().strip()
             if oldv and newv and oldv != newv:
                 new_map[oldv] = newv
+        # Use our property setter
         self.dim_rename_map = new_map
-        self.config_dict["dimension_renames"] = self.dim_rename_map
         messagebox.showinfo("Saved", "Dimension renames saved in memory.")
 
     def build_compare_tab(self, parent):
@@ -1108,12 +1106,19 @@ class MainApp(ctk.CTk):
 
     @property
     def dim_rename_map(self) -> Dict[str,str]:
+        """Return the dictionary of dimension renames."""
         return self.config_dict.get("dimension_renames", {})
+
+    @dim_rename_map.setter
+    def dim_rename_map(self, new_map: Dict[str,str]):
+        """Allow setting the dimension rename map from code."""
+        self.config_dict["dimension_renames"] = new_map
 
     def save_all_config(self):
         self.config_dict["erp_grid"] = self.erp_grid.get_config_block()
         self.config_dict["master_grid"] = self.master_grid.get_config_block()
 
+        # Use our property (getter) for consistency
         self.config_dict["dimension_renames"] = self.dim_rename_map
         self.config_dict["paths"]["ERP_EXCEL_PATH"] = self.erp_path_var.get().strip()
         self.config_dict["paths"]["MASTER_ZIP_PATH"] = self.master_path_var.get().strip()

@@ -5,17 +5,42 @@ This script:
   • Loads a parameter file (with two sheets: "Dimension Parameters" and "Attribute Parameters")
   • Reads ERP data (skipping rows; only rows where Enabled_Flag=="Enabled") and filters/renames using parameters.
   • Processes a Master ZIP (each .txt is robustly parsed to UTF-8 CSV, then merged) and maps its Dimension via parameters.
-  • Melts the ERP and Master data (keeping only required columns: Name and Dimension, plus allowed attributes,
-    optionally Start Date and End Date) so that attributes become rows.
+  • Melts the ERP and Master data (keeping only required columns: Name and Dimension, plus allowed attributes and optional Start Date/End Date) so that attributes become rows.
   • Compares the melted data using mode=2 logic.
   • Writes results and displays eight dashboards (including a run-date timeline).
-  • The GUI allows setting file paths, filtering Start/End Date, running the comparison, and saving configuration.
+  • The GUI allows setting file paths, running the comparison, and saving configuration.
   
 Parameter File Expectations:
   - Sheet "Dimension Parameters" must contain:
       FileName | Dimension | ERP Values | V S C
   - Sheet "Attribute Parameters" must contain:
       ERP Original Attributes | Master Original Attributes | On/Off | Attribute
+
+GUI Filtering:
+  - In the GUI select file paths and (if present) filter the Start Date and End Date values.
+
+Comparison & Dashboard:
+  - Any differences (and exceptions) are written out and also shown in eight dashboards (including a history timeline based on run date).
+  
+ERP Processing:
+  - Drop rows where Enabled_Flag != "Enabled".
+  - Keep only rows with V_S_C in the allowed set (ERP Values == "x") and map V_S_C to final Dimension via parameters.
+  - Keep only required columns (Name and Dimension) plus optional ones (Start Date/End Date) and allowed attributes.
+  - Rename allowed attribute columns and melt the DataFrame (renaming Name to RefName).
+
+Master Processing:
+  - For each .txt in the ZIP, robustly parse the file (using encoding detection) and save it as a UTF-8 CSV.
+  - Use the full raw file name (e.g. "Dimension1_Master.txt") as the initial Dimension; then, if a matching FileName exists in the Dimension Parameters, map it to the final Dimension.
+  - Keep only required columns (Name and Dimension) plus optional ones and allowed attributes; rename them and melt.
+  
+Comparison:
+  - The two melted DataFrames are keyed (by "Dimension | RefName") and compared using mode=2 logic.
+
+Dashboards:
+  - Eight dashboards (including a timeline band chart) are shown.
+  
+Configuration:
+  - The MainApp class allows to set file paths, run the comparison, and save configuration.
 """
 
 import os
@@ -35,7 +60,6 @@ import customtkinter as ctk
 import pandas as pd
 import numpy as np
 
-# Try to import chardet for encoding detection
 try:
     import chardet
 except ImportError:
@@ -50,7 +74,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # ------------------------------------------------------------------------------
-# 1) LOGGING & CONFIGURATION
+# 1) LOGGING & DEFAULT CONFIG
 # ------------------------------------------------------------------------------
 def setup_logger():
     logging.basicConfig(
@@ -130,12 +154,6 @@ class TextHandler(logging.Handler):
 # 3) PARAMETER FILE READING
 # ------------------------------------------------------------------------------
 def read_dimension_parameters(path: Path) -> Dict[str, object]:
-    """
-    Reads the "Dimension Parameters" sheet and returns:
-      - 'erp_vsc_map': mapping from original V S C to final Dimension.
-      - 'erp_vsc_keep': set of V S C values to keep (where ERP Values=='x').
-      - 'master_file_map': mapping from FileName to final Dimension.
-    """
     param = {
         "erp_vsc_map": {},
         "erp_vsc_keep": set(),
@@ -164,11 +182,6 @@ def read_dimension_parameters(path: Path) -> Dict[str, object]:
         return param
 
 def read_attribute_parameters(path: Path) -> Dict[str, object]:
-    """
-    Reads the "Attribute Parameters" sheet and returns:
-      - 'allowed_erp': mapping from ERP Original Attributes to final attribute name (if On/Off=='x').
-      - 'allowed_master': mapping from Master Original Attributes to final attribute name (if On/Off=='x').
-    """
     attr_params = {
         "allowed_erp": {},
         "allowed_master": {}
@@ -213,9 +226,6 @@ def read_erp_enabled(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 def read_txt_robust(filebytes: bytes) -> pd.DataFrame:
-    """
-    Attempts to read CSV data from raw bytes using multiple encodings and delimiters.
-    """
     import io
     if len(filebytes) == 0:
         logging.warning("[read_txt_robust] Empty file.")
@@ -244,7 +254,7 @@ def read_txt_robust(filebytes: bytes) -> pd.DataFrame:
                 if not df.empty and len(df.columns) > 0:
                     logging.info(f"[read_txt_robust] success with enc='{enc}', delim='{delim}'")
                     return df
-            except Exception as ex:
+            except Exception:
                 continue
     logging.error("[read_txt_robust] Failed to parse file with any encoding/delimiter.")
     return pd.DataFrame()
@@ -271,7 +281,7 @@ def convert_master_txt_to_csv(zip_path: Path, out_dir: Path) -> List[Path]:
                     continue
                 df = read_txt_robust(raw_bytes)
                 df.columns = df.columns.str.strip()
-                # Use the full raw file name as the initial Dimension value
+                # Use the full raw file name as the initial Dimension value.
                 df["Dimension"] = base_name
                 if "Name" not in df.columns and len(df.columns) > 0:
                     first = df.columns[0]
@@ -298,19 +308,9 @@ def unify_master_csvs(csv_paths: List[Path]) -> pd.DataFrame:
     return pd.DataFrame()
 
 # ------------------------------------------------------------------------------
-# 5) MELTDOWN FUNCTIONS (using parameter file mappings)
+# 5) MELTDOWN FUNCTIONS (using parameter mappings)
 # ------------------------------------------------------------------------------
 def meltdown_erp(df: pd.DataFrame, dim_params: Dict[str,object], attr_params: Dict[str,object]) -> pd.DataFrame:
-    """
-    Process ERP data:
-      - Keep only rows with V_S_C in allowed set (from dim_params["erp_vsc_keep"]).
-      - Create new "Dimension" by mapping V_S_C via dim_params["erp_vsc_map"].
-      - Keep only required columns: always "Name" and "Dimension", plus optional "Start Date" and "End Date",
-        and any columns allowed per attr_params["allowed_erp"].
-      - Rename allowed ERP attribute columns per attr_params["allowed_erp"].
-      - Melt the DataFrame so that each attribute becomes a row (and rename "Name" to "RefName").
-      - For "Start Date" and "End Date", strip any trailing "T..." portion.
-    """
     if "V_S_C" not in df.columns:
         logging.warning("[ERP meltdown] 'V_S_C' column not found.")
         return pd.DataFrame()
@@ -319,23 +319,18 @@ def meltdown_erp(df: pd.DataFrame, dim_params: Dict[str,object], attr_params: Di
     if df.empty:
         logging.warning("[ERP meltdown] No rows left after filtering by V_S_C.")
         return pd.DataFrame()
-    # Build Dimension column using mapping from V_S_C
     df["Dimension"] = df["V_S_C"].map(dim_params.get("erp_vsc_map", {})).fillna(df["V_S_C"])
-    # Define required and optional columns
     required = {"Name", "Dimension"}
     optional = {"Start Date", "End Date"}
-    allowed_cols = set(attr_params.get("allowed_erp", {}).keys())
-    keep_cols = [c for c in df.columns if c in required or c in optional or c in allowed_cols]
+    allowed = set(attr_params.get("allowed_erp", {}).keys())
+    keep_cols = [c for c in df.columns if c in required or c in optional or c in allowed]
     df = df[keep_cols].copy()
-    # Rename allowed ERP attribute columns
     rename_dict = attr_params.get("allowed_erp", {})
     df.rename(columns=rename_dict, inplace=True)
-    # Melt the DataFrame with id_vars as Name and Dimension
     id_vars = ["Dimension", "Name"]
     value_vars = [c for c in df.columns if c not in id_vars]
     melted = df.melt(id_vars=id_vars, value_vars=value_vars, var_name="Attribute", value_name="Value")
     melted.rename(columns={"Name": "RefName"}, inplace=True)
-    # Strip trailing "T" if present in Start Date or End Date values
     def strip_t(val):
         if isinstance(val, str) and "T" in val:
             return val.split("T")[0]
@@ -344,16 +339,6 @@ def meltdown_erp(df: pd.DataFrame, dim_params: Dict[str,object], attr_params: Di
     return melted[["Dimension", "RefName", "Attribute", "Value"]].copy()
 
 def meltdown_master(df: pd.DataFrame, dim_params: Dict[str,object], attr_params: Dict[str,object]) -> pd.DataFrame:
-    """
-    Process Master data:
-      - Use column "Dimension" (which was set during reading as the full raw file name).
-      - If a mapping exists in dim_params["master_file_map"], replace Dimension.
-      - Keep only required columns: always "Name" and "Dimension", plus optional "Start Date", "End Date",
-        and allowed columns per attr_params["allowed_master"].
-      - Rename allowed Master attribute columns per attr_params["allowed_master"].
-      - Melt the DataFrame (id_vars: Dimension and Name, with Name renamed to RefName),
-        and strip trailing "T" in date columns.
-    """
     if df.empty:
         return df
     file_map = dim_params.get("master_file_map", {})
@@ -361,8 +346,8 @@ def meltdown_master(df: pd.DataFrame, dim_params: Dict[str,object], attr_params:
         df["Dimension"] = df["Dimension"].apply(lambda x: file_map.get(x, x))
     required = {"Name", "Dimension"}
     optional = {"Start Date", "End Date"}
-    allowed_cols = set(attr_params.get("allowed_master", {}).keys())
-    keep_cols = [c for c in df.columns if c in required or c in optional or c in allowed_cols]
+    allowed = set(attr_params.get("allowed_master", {}).keys())
+    keep_cols = [c for c in df.columns if c in required or c in optional or c in allowed]
     df = df[keep_cols].copy()
     rename_dict = attr_params.get("allowed_master", {})
     df.rename(columns=rename_dict, inplace=True)
@@ -515,7 +500,74 @@ def write_results(df: pd.DataFrame, out_path: Path, mode: int):
     logging.info(f"Results saved to {out_path}")
 
 # ------------------------------------------------------------------------------
-# 8) DASHBOARD (8 charts, including timeline band chart)
+# 8) EXCEL GRID CLASS (Filtering on Start Date/End Date only)
+# ------------------------------------------------------------------------------
+class ExcelGrid(ctk.CTkFrame):
+    """
+    Displays a DataFrame. In this version, no column management is provided;
+    only filtering on (for example) Start Date and End Date is allowed.
+    """
+    def __init__(self, parent, config_block: Dict, name: str):
+        super().__init__(parent)
+        self.name = name
+        self.col_defs = config_block.get("columns", [])
+        self.filters: Dict[str, Set] = {}
+        for col_id, vals in config_block.get("filters", {}).items():
+            self.filters[col_id] = set(vals) if isinstance(vals, list) else set()
+        self.df = pd.DataFrame()
+        self.create_table()
+        self.create_statusbar()
+
+    def create_table(self):
+        container = ctk.CTkFrame(self)
+        container.pack(fill="both", expand=True, padx=5, pady=5)
+        self.tree = ttk.Treeview(container, show="headings")
+        vsb = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(container, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+    def create_statusbar(self):
+        self.status_label = ctk.CTkLabel(self, text="Ready")
+        self.status_label.pack(fill="x", padx=5, pady=2)
+
+    def set_data(self, df: pd.DataFrame):
+        self.df = df.copy(deep=True)
+        self.refresh_table()
+
+    def get_filtered_df(self) -> pd.DataFrame:
+        if self.df.empty:
+            return self.df
+        df_f = self.df.copy()
+        def passes(x, allowed):
+            if pd.isna(x):
+                return any(pd.isna(a) for a in allowed)
+            else:
+                return x in allowed
+        for col_id, allowed in self.filters.items():
+            if col_id in df_f.columns and allowed:
+                df_f = df_f[df_f[col_id].apply(lambda v: passes(v, allowed))]
+        return df_f
+
+    def refresh_table(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        cols = list(self.df.columns)
+        self.tree["columns"] = cols
+        for col in cols:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=150)
+        df_f = self.get_filtered_df()
+        for _, row in df_f.iterrows():
+            self.tree.insert("", "end", values=list(row))
+        self.status_label.configure(text=f"{len(df_f)} rows")
+
+# ------------------------------------------------------------------------------
+# 9) DASHBOARD (8 charts)
 # ------------------------------------------------------------------------------
 class Dashboard(ctk.CTkFrame):
     def __init__(self, parent):
@@ -706,26 +758,16 @@ class Dashboard(ctk.CTkFrame):
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
 # ------------------------------------------------------------------------------
-# 9) MAIN APP
+# 10) MAIN APP
 # ------------------------------------------------------------------------------
 class MainApp(ctk.CTk):
-    """
-    The main application GUI:
-      - Loads ERP data and Master ZIP (each .txt converted to a UTF-8 CSV).
-      - Uses the parameter file (both Dimension and Attribute sheets) to filter and rename columns.
-      - Melts ERP and Master data (keeping only required columns: Name and Dimension,
-        plus allowed attributes and optional Start Date/End Date).
-      - Compares the melted DataFrames using mode 2 logic.
-      - Displays differences in Excel output and shows 8 dashboards (including a run-date timeline).
-      - Allows filtering on Start Date and End Date.
-    """
     def __init__(self):
         super().__init__()
         self.title("Ultra-Mega Reconciliation: Mode=2, Parameter-Driven")
         self.geometry("1600x900")
         self.config_dict = load_config(Path(DEFAULT_PATHS["CONFIG_PATH"]))
         self.history_df = pd.DataFrame()
-        # Load parameters
+        # Load parameter file mappings
         par_path = Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"]))
         self.dim_params = read_dimension_parameters(par_path)
         self.attr_params = read_attribute_parameters(par_path)
@@ -768,7 +810,7 @@ class MainApp(ctk.CTk):
         self.temp_csv_dir = Path(self.config_dict["paths"].get("MASTER_CSV_OUTPUT", DEFAULT_PATHS["MASTER_CSV_OUTPUT"]))
         self.temp_csv_dir.mkdir(exist_ok=True)
         self.df_master_merged = pd.DataFrame()
-        # Initial Data Load
+        # Initial Load
         self.refresh_erp_data()
         self.refresh_master_data()
 
@@ -810,13 +852,12 @@ class MainApp(ctk.CTk):
         with zipfile.ZipFile(zip_path, "r") as z:
             txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
             if not txt_files:
-                logging.warning("[Master] No .txt files found in the ZIP.")
+                logging.warning("[Master] No .txt files found in ZIP.")
                 return
             partial_dfs = []
             for txt_file in txt_files:
                 base_name = os.path.basename(txt_file)
-                # Use full raw file name as initial Dimension value
-                dimension_val = base_name
+                dimension_val = base_name  # Full raw file name used as Dimension
                 try:
                     with z.open(txt_file) as fo:
                         raw_bytes = fo.read()
@@ -905,24 +946,18 @@ class MainApp(ctk.CTk):
         self.config_dict["paths"]["CONFIG_PATH"] = self.cfg_path_var.get().strip()
         self.config_dict["comparison_option"] = self.mode_var.get()
         mode = self.config_dict["comparison_option"]
-        # Melt ERP using parameter file mappings
         df_erp = self.erp_grid.get_filtered_df()
         erp_melt = meltdown_erp(df_erp, self.dim_params, self.attr_params)
         erp_ready = build_keys(erp_melt)
-        # Melt Master using parameter file mappings
         df_master = self.master_grid.get_filtered_df().copy()
         master_melt = meltdown_master(df_master, self.dim_params, self.attr_params)
         master_ready = build_keys(master_melt)
-        # Compare using mode 2
         df_diff = compare_mode2(erp_ready, master_ready)
-        # Exceptions
         exc_path = Path(self.exc_path_var.get().strip())
         df_exc = read_exception_table(exc_path)
         final = merge_exceptions(df_diff, df_exc)
-        # Write results to Excel
         out_path = Path(self.out_path_var.get().strip())
         write_results(final, out_path, mode)
-        # Dashboard: add run date
         run_date = datetime.now().strftime("%Y-%m-%d")
         final["RunDate"] = run_date
         self.history_df = pd.concat([self.history_df, final], ignore_index=True)
@@ -944,7 +979,7 @@ class MainApp(ctk.CTk):
         messagebox.showinfo("Saved", "Configuration saved successfully.")
 
 # ------------------------------------------------------------------------------
-# 10) MAIN
+# 11) MAIN
 # ------------------------------------------------------------------------------
 def main():
     app = MainApp()

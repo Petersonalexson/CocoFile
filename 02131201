@@ -1,4 +1,3 @@
-
 """
 Ultra-Mega Reconciliation: Mode=2, Parameter-Driven
 ---------------------------------------------------------------------------
@@ -9,17 +8,14 @@ This script:
   • The meltdown functions keep only the required columns (Name and Dimension) plus optional ones (Start Date/End Date)
     and allowed attributes (as defined in the parameter file) and then melt the DataFrame so that each attribute becomes a row.
   • The two melted DataFrames are keyed and compared using mode‑2 logic.
-  • The GUI allows to set file paths, run the comparison, and save configuration.
+  • The GUI allows to set file paths, filter Start Date/End Date via dropdowns, run the comparison, and save configuration.
   • Results are written to an Excel file and eight dashboards (including a run‑date timeline) are shown.
   
-Parameter File:
-  • "Dimension Parameters" must include:
+Parameter File Expectations:
+  - Sheet "Dimension Parameters" must include:
       FileName | Dimension | ERP Values | V S C
-  • "Attribute Parameters" must include:
+  - Sheet "Attribute Parameters" must include:
       ERP Original Attributes | Master Original Attributes | On/Off | Attribute
-
-GUI Filtering:
-  • In the GUI filter on Start Date and End Date (if present).
 
 Author: Al Pacino
 Date: 2025
@@ -63,7 +59,6 @@ def setup_logger():
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s"
     )
-
 setup_logger()
 
 DEFAULT_PATHS = {
@@ -90,7 +85,7 @@ def default_config() -> Dict:
         "erp_grid": {"columns": [], "filters": {}},
         "master_grid": {"columns": [], "filters": {}},
         "dimension_renames": {},
-        "comparison_option": 2
+        "comparison_option": 2  # Only option 2 is used
     }
 
 def load_config(path: Path) -> Dict:
@@ -131,7 +126,11 @@ class TextHandler(logging.Handler):
 # 3) PARAMETER FILE READING
 # ------------------------------------------------------------------------------
 def read_dimension_parameters(path: Path) -> Dict[str, object]:
-    param = {"erp_vsc_map": {}, "erp_vsc_keep": set(), "master_file_map": {}}
+    param = {
+        "erp_vsc_map": {},
+        "erp_vsc_keep": set(),
+        "master_file_map": {}
+    }
     if not path.is_file():
         logging.warning(f"Dimension parameters file not found: {path}")
         return param
@@ -190,6 +189,8 @@ def read_erp_enabled(path: Path) -> pd.DataFrame:
         df.columns = df.columns.str.strip()
         if "Enabled_Flag" in df.columns:
             df = df[df["Enabled_Flag"] == "Enabled"]
+        else:
+            logging.warning("No Enabled_Flag column found in ERP data")
         return df
     except Exception as e:
         logging.error(f"Error reading ERP file: {e}")
@@ -251,8 +252,7 @@ def convert_master_txt_to_csv(zip_path: Path, out_dir: Path) -> List[Path]:
                     continue
                 df = read_txt_robust(raw_bytes)
                 df.columns = df.columns.str.strip()
-                # Use the full raw file name as the initial Dimension value
-                df["Dimension"] = base_name
+                df["Dimension"] = base_name  # Use full raw file name as initial Dimension
                 if "Name" not in df.columns and len(df.columns) > 0:
                     first = df.columns[0]
                     df.rename(columns={first: "Name"}, inplace=True)
@@ -278,9 +278,9 @@ def unify_master_csvs(csv_paths: List[Path]) -> pd.DataFrame:
     return pd.DataFrame()
 
 # ------------------------------------------------------------------------------
-# 5) MELTDOWN FUNCTIONS (using parameter mappings)
+# 5) MELTDOWN FUNCTIONS (Using Parameter Mappings)
 # ------------------------------------------------------------------------------
-def meltdown_erp(df: pd.DataFrame, dim_params: Dict[str,object], attr_params: Dict[str,object]) -> pd.DataFrame:
+def meltdown_erp(df: pd.DataFrame, dim_params: Dict[str, object], attr_params: Dict[str, object]) -> pd.DataFrame:
     if "V_S_C" not in df.columns:
         logging.warning("[ERP meltdown] 'V_S_C' column not found.")
         return pd.DataFrame()
@@ -308,7 +308,7 @@ def meltdown_erp(df: pd.DataFrame, dim_params: Dict[str,object], attr_params: Di
     melted["Value"] = melted.apply(lambda row: strip_t(row["Value"]) if row["Attribute"] in ["Start Date", "End Date"] else row["Value"], axis=1)
     return melted[["Dimension", "RefName", "Attribute", "Value"]].copy()
 
-def meltdown_master(df: pd.DataFrame, dim_params: Dict[str,object], attr_params: Dict[str,object]) -> pd.DataFrame:
+def meltdown_master(df: pd.DataFrame, dim_params: Dict[str, object], attr_params: Dict[str, object]) -> pd.DataFrame:
     if df.empty:
         return df
     file_map = dim_params.get("master_file_map", {})
@@ -333,7 +333,7 @@ def meltdown_master(df: pd.DataFrame, dim_params: Dict[str,object], attr_params:
     return melted[["Dimension", "RefName", "Attribute", "Value"]].copy()
 
 # ------------------------------------------------------------------------------
-# 6) KEY BUILDING & COMPARISON (Mode 2)
+# 6) KEY BUILDING & COMPARISON (Mode 2 Only)
 # ------------------------------------------------------------------------------
 def build_keys(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -470,20 +470,38 @@ def write_results(df: pd.DataFrame, out_path: Path, mode: int):
     logging.info(f"Results saved to {out_path}")
 
 # ------------------------------------------------------------------------------
-# 8) EXCEL GRID CLASS (Filtering on Start Date/End Date only)
+# 8) MODIFIED EXCEL GRID CLASS WITH START/END DATE FILTERING
 # ------------------------------------------------------------------------------
 class ExcelGrid(ctk.CTkFrame):
     """
-    A simple grid for displaying a DataFrame with basic filtering.
-    In this version, column management is not provided – only filtering (e.g. on Start Date/End Date).
+    Displays a DataFrame with a filter frame (dropdowns for Start Date and End Date).
     """
     def __init__(self, parent, config_block: Dict, name: str):
         super().__init__(parent)
         self.name = name
         self.df = pd.DataFrame()
-        self.filters: Dict[str, Set] = {}  # e.g., {"Start Date": {"2025-01-01", "2025-01-02"}}
+        self.date_filters = {}  # e.g. {"Start Date": "2025-01-01", "End Date": "2025-01-31"}
+        self.create_filter_frame()
         self.create_table()
         self.create_statusbar()
+    
+    def create_filter_frame(self):
+        self.filter_frame = ctk.CTkFrame(self)
+        self.filter_frame.pack(fill="x", padx=5, pady=5)
+        # Start Date filter
+        start_frame = ctk.CTkFrame(self.filter_frame)
+        start_frame.pack(side="left", padx=5)
+        ctk.CTkLabel(start_frame, text="Start Date:").pack(side="left")
+        self.start_combo = ttk.Combobox(start_frame, width=20)
+        self.start_combo.pack(side="left", padx=5)
+        self.start_combo.bind("<<ComboboxSelected>>", self.apply_date_filters)
+        # End Date filter
+        end_frame = ctk.CTkFrame(self.filter_frame)
+        end_frame.pack(side="left", padx=5)
+        ctk.CTkLabel(end_frame, text="End Date:").pack(side="left")
+        self.end_combo = ttk.Combobox(end_frame, width=20)
+        self.end_combo.pack(side="left", padx=5)
+        self.end_combo.bind("<<ComboboxSelected>>", self.apply_date_filters)
     
     def create_table(self):
         container = ctk.CTkFrame(self)
@@ -504,16 +522,36 @@ class ExcelGrid(ctk.CTkFrame):
     
     def set_data(self, df: pd.DataFrame):
         self.df = df.copy(deep=True)
+        # Update dropdowns if columns exist
+        if "Start Date" in self.df.columns:
+            vals = sorted(self.df["Start Date"].dropna().unique().tolist())
+            self.start_combo["values"] = [""] + vals
+        if "End Date" in self.df.columns:
+            vals = sorted(self.df["End Date"].dropna().unique().tolist())
+            self.end_combo["values"] = [""] + vals
+        self.apply_date_filters()
+    
+    def apply_date_filters(self, event=None):
+        start_val = self.start_combo.get()
+        end_val = self.end_combo.get()
+        if start_val:
+            self.date_filters["Start Date"] = start_val
+        else:
+            self.date_filters.pop("Start Date", None)
+        if end_val:
+            self.date_filters["End Date"] = end_val
+        else:
+            self.date_filters.pop("End Date", None)
         self.refresh_table()
     
     def get_filtered_df(self) -> pd.DataFrame:
         if self.df.empty:
             return self.df
-        df_filtered = self.df.copy()
-        for col, allowed in self.filters.items():
-            if col in df_filtered.columns and allowed:
-                df_filtered = df_filtered[df_filtered[col].isin(allowed)]
-        return df_filtered
+        df_f = self.df.copy()
+        for col, val in self.date_filters.items():
+            if col in df_f.columns and val:
+                df_f = df_f[df_f[col].astype(str) == val]
+        return df_f
     
     def refresh_table(self):
         for item in self.tree.get_children():
@@ -525,10 +563,10 @@ class ExcelGrid(ctk.CTkFrame):
         for col in cols:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=150)
-        df_filtered = self.get_filtered_df()
-        for _, row in df_filtered.iterrows():
+        df_f = self.get_filtered_df()
+        for _, row in df_f.iterrows():
             self.tree.insert("", "end", values=list(row))
-        self.status_label.configure(text=f"{len(df_filtered)} rows")
+        self.status_label.configure(text=f"{len(df_f)} rows")
 
 # ------------------------------------------------------------------------------
 # 9) DASHBOARD CLASS (8 charts)
@@ -722,7 +760,7 @@ class Dashboard(ctk.CTkFrame):
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
 # ------------------------------------------------------------------------------
-# 10) MAIN APP
+# 10) MAIN APP (Only Option 2)
 # ------------------------------------------------------------------------------
 class MainApp(ctk.CTk):
     def __init__(self):
@@ -731,7 +769,7 @@ class MainApp(ctk.CTk):
         self.geometry("1600x900")
         self.config_dict = load_config(Path(DEFAULT_PATHS["CONFIG_PATH"]))
         self.history_df = pd.DataFrame()
-        # Load parameter file mappings
+        # Load parameter mappings
         par_path = Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"]))
         self.dim_params = read_dimension_parameters(par_path)
         self.attr_params = read_attribute_parameters(par_path)
@@ -821,7 +859,7 @@ class MainApp(ctk.CTk):
             partial_dfs = []
             for txt_file in txt_files:
                 base_name = os.path.basename(txt_file)
-                dimension_val = base_name  # Full raw file name as Dimension
+                dimension_val = base_name  # Full raw file name used as Dimension
                 try:
                     with z.open(txt_file) as fo:
                         raw_bytes = fo.read()
@@ -890,13 +928,9 @@ class MainApp(ctk.CTk):
     def build_compare_tab(self, parent):
         frm = ctk.CTkFrame(parent)
         frm.pack(fill="both", expand=True, padx=10, pady=10)
-        self.mode_var = tk.IntVar(value=self.config_dict.get("comparison_option", 2))
-        for i, label in enumerate([
-            "Option 1 - Show all missing in ERP or Master",
-            "Option 2 - Show only missing attributes if Name exists",
-            "Option 3 - Show both missing and matching (large)"
-        ], start=1):
-            ctk.CTkRadioButton(frm, text=label, variable=self.mode_var, value=i).pack(anchor="w", padx=5, pady=2)
+        # Only option 2 is used
+        self.mode_var = tk.IntVar(value=2)
+        ctk.CTkLabel(frm, text="Comparison Mode: Show only missing attributes if Name exists").pack(anchor="w", padx=5, pady=2)
         btnf = ctk.CTkFrame(frm)
         btnf.pack(fill="x", pady=10)
         ctk.CTkButton(btnf, text="Run Comparison", command=self.run_comparison).pack(side="left", padx=5)
@@ -909,7 +943,6 @@ class MainApp(ctk.CTk):
         self.config_dict["paths"]["OUTPUT_PATH"] = self.out_path_var.get().strip()
         self.config_dict["paths"]["CONFIG_PATH"] = self.cfg_path_var.get().strip()
         self.config_dict["comparison_option"] = self.mode_var.get()
-        mode = self.config_dict["comparison_option"]
         df_erp = self.erp_grid.get_filtered_df()
         erp_melt = meltdown_erp(df_erp, self.dim_params, self.attr_params)
         erp_ready = build_keys(erp_melt)
@@ -921,16 +954,17 @@ class MainApp(ctk.CTk):
         df_exc = read_exception_table(exc_path)
         final = merge_exceptions(df_diff, df_exc)
         out_path = Path(self.out_path_var.get().strip())
-        write_results(final, out_path, mode)
+        write_results(final, out_path, mode=2)
         run_date = datetime.now().strftime("%Y-%m-%d")
         final["RunDate"] = run_date
         self.history_df = pd.concat([self.history_df, final], ignore_index=True)
         self.notebook.select(self.tab_dashboard)
         self.tab_dashboard.update_data(final, self.history_df)
+        self.save_all_config()
         messagebox.showinfo("Done", f"Comparison for {run_date} complete!\nResults saved to {out_path}")
     
     def save_all_config(self):
-        self.config_dict["erp_grid"] = {}  # For simplicity, not saving grid state here.
+        self.config_dict["erp_grid"] = {}  # (Grid config not saved in this version)
         self.config_dict["master_grid"] = {}
         self.config_dict["dimension_renames"] = self.dim_rename_map
         self.config_dict["paths"]["ERP_EXCEL_PATH"] = self.erp_path_var.get().strip()

@@ -25,7 +25,7 @@ Ultra-Mega Reconciliation (Extract Master as CSV, Only 'Enabled', Mode=2, Filter
    - Only "Start Date" or "End Date" columns are filterable in both ERP & Master. All other headings ignore filter clicks.
 7) Output => an Excel with the differences, plus we have a dashboard for analysis.
 
-Author: ChatGPT
+Author: Al Pacino
 Date: 2025
 """
 
@@ -312,7 +312,7 @@ def convert_master_txt_to_csv(zip_path: Path, out_dir: Path) -> List[Path]:
 
                 # remove underscores => spaces, or just remove them
                 dimension_part = dimension_part.replace("_"," ")
-                # Title-case it or you can do anything
+                # Title-case it 
                 dimension_str = dimension_part.title()
 
                 # Add dimension col

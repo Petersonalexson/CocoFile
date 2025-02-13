@@ -1,0 +1,17 @@
+{
+  "inputs": {
+    "host": {
+      "connection": {
+        "name": "@parameters('$connections')['shared_office365']['connectionId']"
+      }
+    },
+    "method": "move",
+    "body": {
+      "MessageId": "@{triggerOutputs()?['body/MessageId']}",
+      "DestinationFolder": "/Inbox/Invoices",
+      "SharedMailboxAddress": ""
+    }
+  },
+  "runAfter": {},
+  "type": "OpenApiConnection"
+}

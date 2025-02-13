@@ -1,39 +1,42 @@
+#!/usr/bin/env python3
 """
-Ultra-Mega Reconciliation: Mode=2, Parameter-Driven
----------------------------------------------------------------------------
-This script:
-  • Loads a parameter file (with two sheets: "Dimension Parameters" and "Attribute Parameters")
-  • Reads ERP data (skipping rows; only rows where Enabled_Flag=="Enabled") and filters/renames using parameters.
-  • Processes a Master ZIP (each .txt is robustly parsed to a UTF‑8 CSV, then merged) and maps its Dimension via parameters.
-  • The meltdown functions keep only the required columns (Name and Dimension) plus optional ones (Start Date/End Date)
-    and allowed attributes (as defined in the parameter file) and then melt the DataFrame so that each attribute becomes a row.
-  • The two melted DataFrames are keyed and compared using mode‑2 logic.
-  • The GUI allows to set file paths, filter Start Date/End Date via dropdowns, run the comparison, and save configuration.
-  • Results are written to an Excel file and eight dashboards (including a run‑date timeline) are shown.
-  
-Parameter File Expectations:
-  - Sheet "Dimension Parameters" must include:
-      FileName | Dimension | ERP Values | V S C
-  - Sheet "Attribute Parameters" must include:
-      ERP Original Attributes | Master Original Attributes | On/Off | Attribute
+Ultra-Mega Reconciliation: Mode=2, Parameter-based with Dimension & Attribute Parameters
 
-Author: Al Pacino
-Date: 2025
+Changes made:
+1) ERP:
+   - Reads an Excel with headers starting on row 4.
+   - Uses column "V_S_C" (or "V S C" if "V_S_C" not found) as the ERP “raw” dimension.
+   - Filters for "Enabled_Flag" == "Enabled".
+   - Melts the ERP data so that the designated "Value" column becomes the record’s name and the remaining columns become attributes.
+2) Master:
+   - Reads all .txt files from the ZIP. The file’s full name (e.g. "Dimension1_master.txt") is used as the raw dimension.
+   - Assumes the first column is "Name" and the rest are attributes.
+3) Parameters:
+   - Loads two sheets from the parameters file:
+     a) "Dimension Parameters" with columns: FileName, V S C, Dimension, ERP Values.
+        • Builds mappings for ERP (from V S C) and Master (from FileName) to final Dimension names.
+        • Only keeps rows where ERP Values is 'x'.
+     b) "Attribute Parameters" with columns: ERP Original Attributes, Master Original Attributes, Attribute, On/Off.
+        • Builds mappings for allowed attributes (for ERP and Master) to final attribute names.
+        • Only keeps attributes marked with an "x".
+   - When melting, any ERP/Master dimension not included in the parameters (or not marked with an x) is filtered out.
+   - Only attributes listed in the parameters (or the essential ones “Dimension” and “Name”) are kept.
+4) GUI:
+   - The GUI now only allows filtering on "Start Date" and "End Date" (including NaNs) and does not permit renaming/hiding columns.
+   - It still provides eight charts.
 """
 
 import os
 import json
 import logging
-import time
-import csv
 import zipfile
+import shutil
 from pathlib import Path
 from typing import Dict, List, Set
 from datetime import datetime
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
-
 import customtkinter as ctk
 import pandas as pd
 import numpy as np
@@ -51,9 +54,7 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-# ------------------------------------------------------------------------------
-# 1) LOGGING & DEFAULT CONFIG
-# ------------------------------------------------------------------------------
+# ---------------- LOGGING ----------------
 def setup_logger():
     logging.basicConfig(
         level=logging.INFO,
@@ -61,6 +62,7 @@ def setup_logger():
     )
 setup_logger()
 
+# ---------------- DEFAULT CONFIG ----------------
 DEFAULT_PATHS = {
     "ERP_EXCEL_PATH": "data/ERP_Config.xlsx",
     "MASTER_ZIP_PATH": "data/Master_Config.zip",
@@ -82,10 +84,9 @@ def default_config() -> Dict:
             "PARAMETER_PATH": DEFAULT_PATHS["PARAMETER_PATH"],
             "MASTER_CSV_OUTPUT": DEFAULT_PATHS["MASTER_CSV_OUTPUT"]
         },
-        "erp_grid": {"columns": [], "filters": {}},
-        "master_grid": {"columns": [], "filters": {}},
-        "dimension_renames": {},
-        "comparison_option": 2  # Only option 2 is used
+        "erp_grid": {},
+        "master_grid": {},
+        "comparison_option": 2
     }
 
 def load_config(path: Path) -> Dict:
@@ -94,7 +95,7 @@ def load_config(path: Path) -> Dict:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            logging.warning(f"Could not load config from {path}: {e}")
+            logging.warning(f"Could not load config: {e}")
     return default_config()
 
 def save_config(cfg: Dict, path: Path):
@@ -106,9 +107,7 @@ def save_config(cfg: Dict, path: Path):
     except Exception as e:
         logging.error(f"Error saving config: {e}")
 
-# ------------------------------------------------------------------------------
-# 2) TEXT LOGGER HANDLER
-# ------------------------------------------------------------------------------
+# ---------------- TEXT LOGGER HANDLER ----------------
 class TextHandler(logging.Handler):
     def __init__(self, widget: ctk.CTkTextbox):
         super().__init__()
@@ -122,123 +121,131 @@ class TextHandler(logging.Handler):
         self.widget.see("end")
         self.widget.configure(state="disabled")
 
-# ------------------------------------------------------------------------------
-# 3) PARAMETER FILE READING
-# ------------------------------------------------------------------------------
-def read_dimension_parameters(path: Path) -> Dict[str, object]:
+# ---------------- HELPER: Determine ERP VSC column ----------------
+def get_vsc_column(df: pd.DataFrame) -> str:
+    for col in ["V_S_C", "V S C"]:
+        if col in df.columns:
+            return col
+    return ""
+
+# ---------------- PARAMETERS FILE READING ----------------
+def read_parameter_file(path: Path) -> Dict[str,object]:
+    """
+    Expects an Excel file with two sheets:
+    1) "Dimension Parameters" with columns:
+         FileName, V S C, Dimension, ERP Values
+       - For rows where ERP Values == 'x', build:
+           • erp_vsc_map: mapping from ERP V S C value to final Dimension.
+           • master_file_map: mapping from Master FileName to final Dimension.
+    2) "Attribute Parameters" with columns:
+         ERP Original Attributes, Master Original Attributes, Attribute, On/Off
+       - For rows where On/Off == 'x', build:
+           • erp_attr_map: mapping from ERP Original Attributes to final Attribute.
+           • master_attr_map: mapping from Master Original Attributes to final Attribute.
+    """
     param = {
-        "erp_vsc_map": {},
-        "erp_vsc_keep": set(),
-        "master_file_map": {}
+        "dimension_params": {
+            "erp_vsc_map": {},
+            "master_file_map": {}
+        },
+        "attribute_params": {
+            "erp_attr_map": {},
+            "master_attr_map": {}
+        }
     }
     if not path.is_file():
-        logging.warning(f"Dimension parameters file not found: {path}")
-        return param
-    try:
-        df = pd.read_excel(path, sheet_name="Dimension Parameters")
-        df.columns = df.columns.astype(str).str.strip()
-        for _, row in df.iterrows():
-            file_ = str(row.get("FileName", "")).strip()
-            final_dim = str(row.get("Dimension", "")).strip()
-            vsc = str(row.get("V S C", "")).strip()
-            erp_vals = str(row.get("ERP Values", "")).strip().lower()
-            if file_ and final_dim:
-                param["master_file_map"][file_] = final_dim
-            if vsc and final_dim:
-                param["erp_vsc_map"][vsc] = final_dim
-            if vsc and erp_vals == "x":
-                param["erp_vsc_keep"].add(vsc)
-        return param
-    except Exception as e:
-        logging.error(f"Error reading Dimension Parameters: {e}")
+        logging.warning(f"Param file not found: {path}")
         return param
 
-def read_attribute_parameters(path: Path) -> Dict[str, object]:
-    attr_params = {"allowed_erp": {}, "allowed_master": {}}
-    if not path.is_file():
-        logging.warning(f"Attribute parameters file not found: {path}")
-        return attr_params
     try:
-        df = pd.read_excel(path, sheet_name="Attribute Parameters")
-        df.columns = df.columns.astype(str).str.strip()
-        for _, row in df.iterrows():
-            on_off = str(row.get("On/Off", "")).strip().lower()
-            if on_off != "x":
-                continue
-            erp_orig = str(row.get("ERP Original Attributes", "")).strip()
-            master_orig = str(row.get("Master Original Attributes", "")).strip()
-            final_attr = str(row.get("Attribute", "")).strip()
-            if erp_orig:
-                attr_params["allowed_erp"][erp_orig] = final_attr
-            if master_orig:
-                attr_params["allowed_master"][master_orig] = final_attr
-        return attr_params
-    except Exception as e:
-        logging.error(f"Error reading Attribute Parameters: {e}")
-        return attr_params
+        # Read Dimension Parameters
+        df_dim = pd.read_excel(path, sheet_name="Dimension Parameters")
+        df_dim.columns = df_dim.columns.astype(str).str.strip()
+        def s(x):
+            return str(x).strip() if pd.notna(x) else ""
+        for _, row in df_dim.iterrows():
+            file_ = s(row.get("FileName", ""))
+            vsc = s(row.get("V S C", ""))
+            final_dim = s(row.get("Dimension", ""))
+            erp_val = s(row.get("ERP Values", ""))
+            if erp_val.lower() == "x" and final_dim:
+                if vsc:
+                    param["dimension_params"]["erp_vsc_map"][vsc] = final_dim
+                if file_:
+                    param["dimension_params"]["master_file_map"][file_] = final_dim
 
-# ------------------------------------------------------------------------------
-# 4) DATA READING: ERP and MASTER
-# ------------------------------------------------------------------------------
+        # Read Attribute Parameters
+        df_attr = pd.read_excel(path, sheet_name="Attribute Parameters")
+        df_attr.columns = df_attr.columns.astype(str).str.strip()
+        for _, row in df_attr.iterrows():
+            erp_orig = s(row.get("ERP Original Attributes", ""))
+            master_orig = s(row.get("Master Original Attributes", ""))
+            final_attr = s(row.get("Attribute", ""))
+            on_off = s(row.get("On/Off", ""))
+            if on_off.lower() == "x" and final_attr:
+                if erp_orig:
+                    param["attribute_params"]["erp_attr_map"][erp_orig] = final_attr
+                if master_orig:
+                    param["attribute_params"]["master_attr_map"][master_orig] = final_attr
+        return param
+    except Exception as e:
+        logging.error(f"Error reading param file: {e}")
+        return param
+
+# ---------------- ERP READING => Only 'Enabled' rows ----------------
 def read_erp_enabled(path: Path) -> pd.DataFrame:
     if not path.is_file():
-        logging.warning(f"ERP file not found at {path}")
+        logging.warning(f"ERP file not found: {path}")
         return pd.DataFrame()
     try:
+        # Headers start on row 4 (skip first three rows)
         df = pd.read_excel(path, skiprows=3)
         df.columns = df.columns.str.strip()
         if "Enabled_Flag" in df.columns:
             df = df[df["Enabled_Flag"] == "Enabled"]
-        else:
-            logging.warning("No Enabled_Flag column found in ERP data")
         return df
     except Exception as e:
-        logging.error(f"Error reading ERP file: {e}")
+        logging.error(f"Error reading ERP: {e}")
         return pd.DataFrame()
 
-def read_txt_robust(filebytes: bytes) -> pd.DataFrame:
+# ---------------- MASTER .TXT => Convert to CSV and Unify ----------------
+def read_txt_robust_in_memory(raw: bytes) -> pd.DataFrame:
+    import csv
     import io
-    if len(filebytes) == 0:
-        logging.warning("[read_txt_robust] Empty file.")
-        return pd.DataFrame()
-    guess_enc = None
-    if chardet:
-        det = chardet.detect(filebytes[:4096])
-        enc_ = det.get("encoding")
-        conf_ = det.get("confidence", 0)
-        if enc_ and conf_ >= 0.75:
-            guess_enc = enc_
-            logging.info(f"[read_txt_robust] chardet guess='{enc_}' (conf={conf_})")
-    encodings = []
-    if guess_enc:
-        encodings.append(guess_enc)
-    encodings.extend(["utf-8-sig", "utf-16", "utf-32", "cp1252", "latin1", "iso-8859-1"])
-    delimiters = [",", ";", "\t", "|", None]
-    for enc in encodings:
-        for delim in delimiters:
-            try:
-                buf = io.BytesIO(filebytes)
-                df = pd.read_csv(buf, encoding=enc, delimiter=delim, on_bad_lines="skip", engine="python")
-                df.dropna(how="all", inplace=True)
-                df.dropna(axis=1, how="all", inplace=True)
-                df.columns = df.columns.astype(str).str.strip()
-                if not df.empty and len(df.columns) > 0:
-                    logging.info(f"[read_txt_robust] success with enc='{enc}', delim='{delim}'")
-                    return df
-            except Exception:
-                continue
-    logging.error("[read_txt_robust] Failed to parse file with any encoding/delimiter.")
+    encs = [
+        'utf-8-sig','utf-8','utf-16','utf-16-le','utf-16-be','utf-32','utf-32-le','utf-32-be',
+        'cp1250','cp1251','cp1252','cp1254','cp1256','cp932','cp949','latin1','iso-8859-1','iso-8859-2',
+        'windows-1250','windows-1251','windows-1252','windows-1254','windows-1256','shift_jis','euc_jp','euc_kr',
+        'big5','big5hkscs','gb2312','gbk','gb18030'
+    ]
+    for enc in encs:
+        try:
+            buf = io.BytesIO(raw)
+            df = pd.read_csv(
+                buf,
+                encoding=enc,
+                sep=",",
+                on_bad_lines="skip",
+                quoting=csv.QUOTE_MINIMAL,
+                engine="python"
+            )
+            df.dropna(how="all", axis=0, inplace=True)
+            df.dropna(how="all", axis=1, inplace=True)
+            return df
+        except:
+            pass
+    logging.error("[Master] Could not parse .txt with known encodings.")
     return pd.DataFrame()
 
 def convert_master_txt_to_csv(zip_path: Path, out_dir: Path) -> List[Path]:
     if out_dir.exists():
-        import shutil
         shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True, exist_ok=True)
-    csv_paths = []
+    csvs = []
     if not zip_path.is_file():
-        logging.warning(f"[Master] ZIP file not found: {zip_path}")
-        return csv_paths
+        logging.warning(f"[Master] ZIP not found: {zip_path}")
+        return csvs
+
     with zipfile.ZipFile(zip_path, "r") as z:
         txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
         for txt_file in txt_files:
@@ -247,100 +254,164 @@ def convert_master_txt_to_csv(zip_path: Path, out_dir: Path) -> List[Path]:
                 continue
             try:
                 with z.open(txt_file) as fo:
-                    raw_bytes = fo.read()
-                if not raw_bytes:
+                    raw = fo.read()
+                if not raw:
                     continue
-                df = read_txt_robust(raw_bytes)
+                df = read_txt_robust_in_memory(raw)
                 df.columns = df.columns.str.strip()
-                df["Dimension"] = base_name  # Use full raw file name as initial Dimension
+                # Store the raw file name as a column for later mapping
+                df["RawFileName"] = base_name
+                # Ensure first column is named "Name"
                 if "Name" not in df.columns and len(df.columns) > 0:
-                    first = df.columns[0]
-                    df.rename(columns={first: "Name"}, inplace=True)
+                    firstcol = df.columns[0]
+                    df.rename(columns={firstcol: "Name"}, inplace=True)
                 out_csv = out_dir / base_name.replace(".txt", ".csv")
                 df.to_csv(out_csv, index=False, encoding="utf-8")
-                csv_paths.append(out_csv)
+                csvs.append(out_csv)
             except Exception as e:
-                logging.error(f"[Master] Error processing {txt_file}: {e}")
-    return csv_paths
+                logging.error(f"[Master] Error reading {txt_file}: {e}")
+    return csvs
 
-def unify_master_csvs(csv_paths: List[Path]) -> pd.DataFrame:
-    dfs = []
-    for cp in csv_paths:
-        if cp.is_file():
-            try:
-                df = pd.read_csv(cp, encoding="utf-8", on_bad_lines="skip")
-                df.columns = df.columns.str.strip()
-                dfs.append(df)
-            except Exception as e:
-                logging.error(f"[Master] Error reading {cp}: {e}")
-    if dfs:
-        return pd.concat(dfs, ignore_index=True)
+def unify_master_csvs(csvs: List[Path]) -> pd.DataFrame:
+    frames = []
+    for cp in csvs:
+        if not cp.is_file():
+            continue
+        try:
+            df = pd.read_csv(cp, encoding="utf-8", on_bad_lines="skip")
+            df.columns = df.columns.str.strip()
+            frames.append(df)
+        except Exception as e:
+            logging.error(f"[Master unify] Error reading {cp}: {e}")
+    if frames:
+        return pd.concat(frames, ignore_index=True)
     return pd.DataFrame()
 
-# ------------------------------------------------------------------------------
-# 5) MELTDOWN FUNCTIONS (Using Parameter Mappings)
-# ------------------------------------------------------------------------------
-def meltdown_erp(df: pd.DataFrame, dim_params: Dict[str, object], attr_params: Dict[str, object]) -> pd.DataFrame:
-    if "V_S_C" not in df.columns:
-        logging.warning("[ERP meltdown] 'V_S_C' column not found.")
+# ---------------- MELTDOWN FUNCTIONS (Apply Parameter Filtering & Renaming) ----------------
+def meltdown_erp(df: pd.DataFrame, param: Dict[str,object]) -> pd.DataFrame:
+    """
+    ERP meltdown:
+      - Identify the ERP dimension column ("V_S_C" or "V S C").
+      - Filter rows so that only ERP dimensions found in the parameters (and marked with an x) are kept.
+      - Melt the remaining columns so that the (non-Enabled_Flag) columns become attributes.
+      - Rename the ERP dimension using the parameters mapping.
+      - Filter out attributes not listed in the Attribute Parameters (except essential ones).
+      - Rename attributes per the mapping.
+      - For attributes "Start Date"/"End Date", strip any trailing 'T' and following text.
+    """
+    vsc_col = get_vsc_column(df)
+    if not vsc_col:
+        logging.warning("[ERP meltdown] ERP dimension column not found.")
         return pd.DataFrame()
-    allowed_vsc = dim_params.get("erp_vsc_keep", set())
-    df = df[df["V_S_C"].isin(allowed_vsc)].copy()
-    if df.empty:
-        logging.warning("[ERP meltdown] No rows left after filtering by V_S_C.")
+
+    # Only keep rows with allowed ERP dimensions (from parameter file)
+    allowed_erp = set(param["dimension_params"]["erp_vsc_map"].keys())
+    df2 = df[df[vsc_col].isin(allowed_erp)].copy()
+    if df2.empty:
+        logging.warning("[ERP meltdown] No rows left after filtering ERP dimensions.")
         return pd.DataFrame()
-    df["Dimension"] = df["V_S_C"].map(dim_params.get("erp_vsc_map", {})).fillna(df["V_S_C"])
-    required = {"Name", "Dimension"}
-    optional = {"Start Date", "End Date"}
-    allowed = set(attr_params.get("allowed_erp", {}).keys())
-    keep_cols = [c for c in df.columns if c in required or c in optional or c in allowed]
-    df = df[keep_cols].copy()
-    rename_dict = attr_params.get("allowed_erp", {})
-    df.rename(columns=rename_dict, inplace=True)
-    id_vars = ["Dimension", "Name"]
-    value_vars = [c for c in df.columns if c not in id_vars]
-    melted = df.melt(id_vars=id_vars, value_vars=value_vars, var_name="Attribute", value_name="Value")
-    melted.rename(columns={"Name": "RefName"}, inplace=True)
+
+    # Set id_vars: include the ERP dimension and the "Value" column if present (which holds the record's name)
+    id_vars = [vsc_col]
+    if "Value" in df2.columns:
+        id_vars.append("Value")
+    value_vars = [c for c in df2.columns if c not in id_vars and c != "Enabled_Flag"]
+
+    melted = df2.melt(
+        id_vars=id_vars,
+        value_vars=value_vars,
+        var_name="Attribute",
+        value_name="Value"
+    )
+    # Rename the ERP dimension column for clarity
+    melted.rename(columns={vsc_col: "DimRaw"}, inplace=True)
+    if "Value" in melted.columns:
+        melted.rename(columns={"Value": "RefName"}, inplace=True)
+
+    # Map ERP dimension using parameter mapping
+    def dimension_rename(orig):
+        return param["dimension_params"]["erp_vsc_map"].get(orig, orig)
+    melted["Dimension"] = melted["DimRaw"].apply(dimension_rename)
+
+    # Filter attributes: only keep those listed in Attribute Parameters (for ERP) 
+    # (Note: "Dimension" and "Name" are always kept—but in ERP the record's name comes from "RefName".)
+    allowed_attrs = set(param["attribute_params"]["erp_attr_map"].keys())
+    melted = melted[melted["Attribute"].isin(allowed_attrs)]
+    melted["Attribute"] = melted["Attribute"].map(param["attribute_params"]["erp_attr_map"])
+
+    # Strip trailing 'T' from date attributes if needed.
     def strip_t(val):
         if isinstance(val, str) and "T" in val:
             return val.split("T")[0]
         return val
-    melted["Value"] = melted.apply(lambda row: strip_t(row["Value"]) if row["Attribute"] in ["Start Date", "End Date"] else row["Value"], axis=1)
+    melted["Value"] = melted.apply(lambda row: strip_t(row["Value"]) if row["Attribute"] in {"Start Date", "End Date"} else row["Value"], axis=1)
+
     return melted[["Dimension", "RefName", "Attribute", "Value"]].copy()
 
-def meltdown_master(df: pd.DataFrame, dim_params: Dict[str, object], attr_params: Dict[str, object]) -> pd.DataFrame:
+def meltdown_master(df: pd.DataFrame, param: Dict[str,object]) -> pd.DataFrame:
+    """
+    Master meltdown:
+      - Use the full raw file name (from "RawFileName") as the master dimension.
+      - Filter to only keep rows whose RawFileName is in the Dimension Parameters.
+      - Rename the master dimension using the parameters mapping.
+      - Melt the rest of the columns (first column "Name" holds the record's name).
+      - Filter out attributes not allowed per the Attribute Parameters (for Master).
+      - Rename attributes accordingly.
+      - For "Start Date"/"End Date", strip trailing 'T' parts.
+    """
     if df.empty:
         return df
-    file_map = dim_params.get("master_file_map", {})
-    if "Dimension" in df.columns:
-        df["Dimension"] = df["Dimension"].apply(lambda x: file_map.get(x, x))
-    required = {"Name", "Dimension"}
-    optional = {"Start Date", "End Date"}
-    allowed = set(attr_params.get("allowed_master", {}).keys())
-    keep_cols = [c for c in df.columns if c in required or c in optional or c in allowed]
-    df = df[keep_cols].copy()
-    rename_dict = attr_params.get("allowed_master", {})
-    df.rename(columns=rename_dict, inplace=True)
-    id_vars = ["Dimension", "Name"]
-    value_vars = [c for c in df.columns if c not in id_vars]
-    melted = df.melt(id_vars=id_vars, value_vars=value_vars, var_name="Attribute", value_name="Value")
-    melted.rename(columns={"Name": "RefName"}, inplace=True)
-    def strip_t(val):
-        if isinstance(val, str) and "T" in val:
-            return val.split("T")[0]
-        return val
-    melted["Value"] = melted.apply(lambda row: strip_t(row["Value"]) if row["Attribute"] in ["Start Date", "End Date"] else row["Value"], axis=1)
-    return melted[["Dimension", "RefName", "Attribute", "Value"]].copy()
 
-# ------------------------------------------------------------------------------
-# 6) KEY BUILDING & COMPARISON (Mode 2 Only)
-# ------------------------------------------------------------------------------
+    allowed_master = set(param["dimension_params"]["master_file_map"].keys())
+    if "RawFileName" not in df.columns:
+        logging.warning("[Master meltdown] 'RawFileName' not found; cannot apply dimension mapping.")
+        df["Dimension"] = ""
+        id_vars = [c for c in ["Dimension", "Name"] if c in df.columns]
+        value_vars = [c for c in df.columns if c not in id_vars]
+        melted = df.melt(id_vars=id_vars, value_vars=value_vars,
+                         var_name="Attribute", value_name="Value")
+        if "Name" in melted.columns:
+            melted.rename(columns={"Name": "RefName"}, inplace=True)
+        allowed_attrs = set(param["attribute_params"]["master_attr_map"].keys())
+        melted = melted[melted["Attribute"].isin(allowed_attrs)]
+        melted["Attribute"] = melted["Attribute"].map(param["attribute_params"]["master_attr_map"])
+        def strip_t(val):
+            if isinstance(val, str) and "T" in val:
+                return val.split("T")[0]
+            return val
+        melted["Value"] = melted.apply(lambda row: strip_t(row["Value"]) if row["Attribute"] in {"Start Date", "End Date"} else row["Value"], axis=1)
+        return melted[["Dimension", "RefName", "Attribute", "Value"]].copy()
+    else:
+        df2 = df[df["RawFileName"].isin(allowed_master)].copy()
+        if df2.empty:
+            return pd.DataFrame()
+        def get_dim_from_filename(rawfile):
+            return param["dimension_params"]["master_file_map"].get(rawfile, rawfile)
+        df2["Dimension"] = df2["RawFileName"].apply(get_dim_from_filename)
+        id_vars = ["RawFileName"]
+        if "Name" in df2.columns:
+            id_vars.append("Name")
+        value_vars = [c for c in df2.columns if c not in id_vars]
+        melted = df2.melt(id_vars=id_vars, value_vars=value_vars,
+                          var_name="Attribute", value_name="Value")
+        if "Name" in melted.columns:
+            melted.rename(columns={"Name": "RefName"}, inplace=True)
+        allowed_attrs = set(param["attribute_params"]["master_attr_map"].keys())
+        melted = melted[melted["Attribute"].isin(allowed_attrs)]
+        melted["Attribute"] = melted["Attribute"].map(param["attribute_params"]["master_attr_map"])
+        def strip_t(val):
+            if isinstance(val, str) and "T" in val:
+                return val.split("T")[0]
+            return val
+        melted["Value"] = melted.apply(lambda row: strip_t(row["Value"]) if row["Attribute"] in {"Start Date", "End Date"} else row["Value"], axis=1)
+        return melted[["Dimension", "RefName", "Attribute", "Value"]].copy()
+
 def build_keys(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    for col in ["Dimension", "RefName", "Attribute", "Value"]:
-        if col not in df.columns:
-            df[col] = ""
-        df[col] = df[col].fillna("").astype(str).str.strip()
+    for c in ["Dimension", "RefName", "Attribute", "Value"]:
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].fillna("").astype(str).str.strip()
     df["GroupKey"] = df["Dimension"] + " | " + df["RefName"]
     df["Key"] = df["Dimension"] + " | " + df["RefName"] + " | " + df["Attribute"] + " | " + df["Value"]
     df["Comments_1"] = ""
@@ -353,22 +424,22 @@ def build_lookup_dict(df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
     lookup = {}
     for gk, grp in df.groupby("GroupKey"):
         rec = {}
-        ref = grp["RefName"].iloc[0] if not grp.empty else ""
-        rec["Name"] = ref
+        name_ = grp["RefName"].iloc[0] if not grp.empty else ""
+        rec["Name"] = name_
         for _, row in grp.iterrows():
             rec[row["Attribute"]] = row["Value"]
         lookup[gk] = rec
     return lookup
 
-def compare_mode2(df_erp: pd.DataFrame, df_master: pd.DataFrame) -> pd.DataFrame:
+def compare_mode2(df_erp: pd.DataFrame, df_mst: pd.DataFrame) -> pd.DataFrame:
     erp_dict = build_lookup_dict(df_erp)
-    master_dict = build_lookup_dict(df_master)
-    all_keys = set(erp_dict.keys()) | set(master_dict.keys())
+    mst_dict = build_lookup_dict(df_mst)
+    all_keys = set(erp_dict.keys()) | set(mst_dict.keys())
     results = []
     for gk in all_keys:
-        dimension = gk.split(" | ")[0] if " | " in gk else ""
+        dim = gk.split(" | ")[0]
         a_data = erp_dict.get(gk, {})
-        b_data = master_dict.get(gk, {})
+        b_data = mst_dict.get(gk, {})
         name_a = a_data.get("Name", a_data.get("RefName", ""))
         name_b = b_data.get("Name", b_data.get("RefName", ""))
         if name_a and name_b and (name_a == name_b):
@@ -378,31 +449,39 @@ def compare_mode2(df_erp: pd.DataFrame, df_master: pd.DataFrame) -> pd.DataFrame
                 vb = b_data.get(attr, "")
                 if va != vb:
                     if va and not vb:
-                        results.append({"Dimension": dimension, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
+                        results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
                     elif vb and not va:
-                        results.append({"Dimension": dimension, "Name": name_a, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
+                        results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
                     else:
-                        results.append({"Dimension": dimension, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
-                        results.append({"Dimension": dimension, "Name": name_a, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
+                        results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": va, "Missing In": "MASTER"})
+                        results.append({"Dimension": dim, "Name": name_a, "Attribute": attr, "Value": vb, "Missing In": "ERP"})
         else:
             if name_a and not name_b:
-                results.append({"Dimension": dimension, "Name": name_a, "Attribute": "Name", "Value": name_a, "Missing In": "MASTER"})
+                results.append({"Dimension": dim, "Name": name_a, "Attribute": "Name", "Value": name_a, "Missing In": "MASTER"})
             elif name_b and not name_a:
-                results.append({"Dimension": dimension, "Name": name_b, "Attribute": "Name", "Value": name_b, "Missing In": "ERP"})
-    return pd.DataFrame(results)
+                results.append({"Dimension": dim, "Name": name_b, "Attribute": "Name", "Value": name_b, "Missing In": "ERP"})
+    df_diff = pd.DataFrame(results)
+    if not df_diff.empty:
+        df_diff["Key"] = (
+            df_diff["Dimension"].str.strip() + " | " +
+            df_diff["Name"].str.strip() + " | " +
+            df_diff["Attribute"].str.strip() + " | " +
+            df_diff["Value"].str.strip()
+        )
+    return df_diff
 
-# ------------------------------------------------------------------------------
-# 7) EXCEPTIONS & WRITE RESULTS
-# ------------------------------------------------------------------------------
+# ---------------- EXCEPTIONS & WRITE RESULTS ----------------
 def read_exception_table(path: Path) -> pd.DataFrame:
-    if path.is_file():
-        try:
-            df = pd.read_excel(path, sheet_name=0)
-            df.columns = df.columns.astype(str).str.strip()
-            return df
-        except Exception as e:
-            logging.error(f"Error reading exception table: {e}")
-    return pd.DataFrame()
+    if not path.is_file():
+        logging.warning(f"Exception table not found: {path}")
+        return pd.DataFrame()
+    try:
+        df = pd.read_excel(path)
+        df.columns = df.columns.astype(str).str.strip()
+        return df
+    except Exception as e:
+        logging.error(f"Error reading exception table: {e}")
+        return pd.DataFrame()
 
 def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame) -> pd.DataFrame:
     if df.empty or df_exc.empty or "Key" not in df.columns:
@@ -412,22 +491,24 @@ def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame) -> pd.DataFrame:
         return df
     exc = df_exc[keep].copy()
     exc["Key"] = exc["Key"].astype(str).str.strip()
+
     merged = df.merge(exc, on="Key", how="left", suffixes=("", "_exc"))
     merged["hide exception"] = merged.get("hide exception", "").fillna("").str.lower()
     final = merged[merged["hide exception"] != "yes"].copy()
+
     if "Comments_1_exc" in final.columns:
-        final["Comments_1"] = final["Comments_1_exc"].where(final["Comments_1_exc"].notna(), final["Comments_1"])
+        final["Comments_1"] = np.where(final["Comments_1_exc"].notna(), final["Comments_1_exc"], final["Comments_1"])
         final.drop(columns=["Comments_1_exc"], inplace=True)
     if "Comments_2_exc" in final.columns:
-        final["Comments_2"] = final["Comments_2_exc"].where(final["Comments_2_exc"].notna(), final["Comments_2"])
+        final["Comments_2"] = np.where(final["Comments_2_exc"].notna(), final["Comments_2_exc"], final["Comments_2"])
         final.drop(columns=["Comments_2_exc"], inplace=True)
     if "hide exception" in final.columns:
         final.drop(columns=["hide exception"], inplace=True)
     return final
 
-def write_results(df: pd.DataFrame, out_path: Path, mode: int):
+def write_results(df: pd.DataFrame, out_path: Path):
     if df.empty:
-        logging.info("No differences found; skipping file output.")
+        logging.info("No differences found; skipping write.")
         return
     out_path.parent.mkdir(parents=True, exist_ok=True)
     final_cols = ["Key", "Dimension", "Name", "Attribute", "Value", "Comments_1", "Comments_2", "Action Item", "Missing In"]
@@ -435,169 +516,68 @@ def write_results(df: pd.DataFrame, out_path: Path, mode: int):
         if c not in df.columns:
             df[c] = ""
     df = df[final_cols]
+
     wb = Workbook()
-    max_rows_per_sheet = 30000 if mode == 3 else 999999
-    sheet_count = 1
-    start = 0
-    while start < len(df):
-        end = min(start + max_rows_per_sheet, len(df))
-        chunk = df.iloc[start:end]
-        if sheet_count == 1:
-            ws = wb.active
-            ws.title = f"Results{sheet_count}"
-        else:
-            ws = wb.create_sheet(title=f"Results{sheet_count}")
-        ws.append(final_cols)
-        for row in chunk.itertuples(index=False):
-            ws.append(row)
-        header_font = Font(bold=True)
-        fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
-        for cell in ws[1]:
-            cell.font = header_font
-            cell.fill = fill
-            cell.alignment = Alignment(horizontal="center")
-        for col in ws.columns:
-            max_len = 0
-            col_letter = col[0].column_letter
-            for cell in col:
-                val = str(cell.value) if cell.value is not None else ""
-                max_len = max(max_len, len(val))
-            ws.column_dimensions[col_letter].width = max_len + 2
-        ws.freeze_panes = "A2"
-        sheet_count += 1
-        start = end
+    ws = wb.active
+    ws.title = "Results"
+    ws.append(final_cols)
+    for rowvals in df.itertuples(index=False):
+        ws.append(rowvals)
+
+    header_font = Font(bold=True)
+    fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for col in ws.columns:
+        max_len = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            val = str(cell.value) if cell.value else ""
+            max_len = max(max_len, len(val))
+        ws.column_dimensions[col_letter].width = max_len + 2
+
+    ws.freeze_panes = "A2"
     wb.save(out_path)
     logging.info(f"Results saved to {out_path}")
 
-# ------------------------------------------------------------------------------
-# 8) MODIFIED EXCEL GRID CLASS WITH START/END DATE FILTERING
-# ------------------------------------------------------------------------------
-class ExcelGrid(ctk.CTkFrame):
-    """
-    Displays a DataFrame with a filter frame (dropdowns for Start Date and End Date).
-    """
-    def __init__(self, parent, config_block: Dict, name: str):
-        super().__init__(parent)
-        self.name = name
-        self.df = pd.DataFrame()
-        self.date_filters = {}  # e.g. {"Start Date": "2025-01-01", "End Date": "2025-01-31"}
-        self.create_filter_frame()
-        self.create_table()
-        self.create_statusbar()
-    
-    def create_filter_frame(self):
-        self.filter_frame = ctk.CTkFrame(self)
-        self.filter_frame.pack(fill="x", padx=5, pady=5)
-        # Start Date filter
-        start_frame = ctk.CTkFrame(self.filter_frame)
-        start_frame.pack(side="left", padx=5)
-        ctk.CTkLabel(start_frame, text="Start Date:").pack(side="left")
-        self.start_combo = ttk.Combobox(start_frame, width=20)
-        self.start_combo.pack(side="left", padx=5)
-        self.start_combo.bind("<<ComboboxSelected>>", self.apply_date_filters)
-        # End Date filter
-        end_frame = ctk.CTkFrame(self.filter_frame)
-        end_frame.pack(side="left", padx=5)
-        ctk.CTkLabel(end_frame, text="End Date:").pack(side="left")
-        self.end_combo = ttk.Combobox(end_frame, width=20)
-        self.end_combo.pack(side="left", padx=5)
-        self.end_combo.bind("<<ComboboxSelected>>", self.apply_date_filters)
-    
-    def create_table(self):
-        container = ctk.CTkFrame(self)
-        container.pack(fill="both", expand=True, padx=5, pady=5)
-        self.tree = ttk.Treeview(container, show="headings")
-        vsb = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
-        hsb = ttk.Scrollbar(container, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        container.rowconfigure(0, weight=1)
-        container.columnconfigure(0, weight=1)
-    
-    def create_statusbar(self):
-        self.status_label = ctk.CTkLabel(self, text="Ready")
-        self.status_label.pack(fill="x", padx=5, pady=2)
-    
-    def set_data(self, df: pd.DataFrame):
-        self.df = df.copy(deep=True)
-        # Update dropdowns if columns exist
-        if "Start Date" in self.df.columns:
-            vals = sorted(self.df["Start Date"].dropna().unique().tolist())
-            self.start_combo["values"] = [""] + vals
-        if "End Date" in self.df.columns:
-            vals = sorted(self.df["End Date"].dropna().unique().tolist())
-            self.end_combo["values"] = [""] + vals
-        self.apply_date_filters()
-    
-    def apply_date_filters(self, event=None):
-        start_val = self.start_combo.get()
-        end_val = self.end_combo.get()
-        if start_val:
-            self.date_filters["Start Date"] = start_val
-        else:
-            self.date_filters.pop("Start Date", None)
-        if end_val:
-            self.date_filters["End Date"] = end_val
-        else:
-            self.date_filters.pop("End Date", None)
-        self.refresh_table()
-    
-    def get_filtered_df(self) -> pd.DataFrame:
-        if self.df.empty:
-            return self.df
-        df_f = self.df.copy()
-        for col, val in self.date_filters.items():
-            if col in df_f.columns and val:
-                df_f = df_f[df_f[col].astype(str) == val]
-        return df_f
-    
-    def refresh_table(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        if self.df.empty:
-            return
-        cols = list(self.df.columns)
-        self.tree["columns"] = cols
-        for col in cols:
-            self.tree.heading(col, text=col)
-            self.tree.column(col, width=150)
-        df_f = self.get_filtered_df()
-        for _, row in df_f.iterrows():
-            self.tree.insert("", "end", values=list(row))
-        self.status_label.configure(text=f"{len(df_f)} rows")
-
-# ------------------------------------------------------------------------------
-# 9) DASHBOARD CLASS (8 charts)
-# ------------------------------------------------------------------------------
+# ---------------- 8-CHART DASHBOARD ----------------
 class Dashboard(ctk.CTkFrame):
+    """
+    Eight chart frames: Heatmap, Lollipop, Circular, Scatter, Radar, Normal Pie, Normal Bar, Band Chart.
+    """
     def __init__(self, parent):
         super().__init__(parent)
         self.df_current = pd.DataFrame()
         self.df_history = pd.DataFrame()
+
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
-        self.frame_heatmap = ctk.CTkFrame(self.notebook)
-        self.notebook.add(self.frame_heatmap, text="Heatmap")
-        self.frame_lollipop = ctk.CTkFrame(self.notebook)
-        self.notebook.add(self.frame_lollipop, text="Lollipop")
-        self.frame_circular = ctk.CTkFrame(self.notebook)
-        self.notebook.add(self.frame_circular, text="Circular")
-        self.frame_scatter = ctk.CTkFrame(self.notebook)
-        self.notebook.add(self.frame_scatter, text="Scatter")
-        self.frame_radar = ctk.CTkFrame(self.notebook)
-        self.notebook.add(self.frame_radar, text="Radar")
+
+        self.frame_heatmap   = ctk.CTkFrame(self.notebook)
+        self.frame_lollipop  = ctk.CTkFrame(self.notebook)
+        self.frame_circular  = ctk.CTkFrame(self.notebook)
+        self.frame_scatter   = ctk.CTkFrame(self.notebook)
+        self.frame_radar     = ctk.CTkFrame(self.notebook)
         self.frame_normalpie = ctk.CTkFrame(self.notebook)
-        self.notebook.add(self.frame_normalpie, text="Normal Pie")
         self.frame_normalbar = ctk.CTkFrame(self.notebook)
-        self.notebook.add(self.frame_normalbar, text="Normal Bar")
         self.frame_bandchart = ctk.CTkFrame(self.notebook)
+
+        self.notebook.add(self.frame_heatmap,   text="Heatmap")
+        self.notebook.add(self.frame_lollipop,  text="Lollipop Dim")
+        self.notebook.add(self.frame_circular,  text="Circular Attr")
+        self.notebook.add(self.frame_scatter,   text="Scatter")
+        self.notebook.add(self.frame_radar,     text="Radar")
+        self.notebook.add(self.frame_normalpie, text="Normal Pie")
+        self.notebook.add(self.frame_normalbar, text="Normal Bar")
         self.notebook.add(self.frame_bandchart, text="Band Chart")
-    
+
     def update_data(self, df_current: pd.DataFrame, df_history: pd.DataFrame):
         self.df_current = df_current.copy()
         self.df_history = df_history.copy()
+
         self.plot_heatmap()
         self.plot_lollipop()
         self.plot_circular()
@@ -606,44 +586,46 @@ class Dashboard(ctk.CTkFrame):
         self.plot_normal_pie()
         self.plot_normal_bar()
         self.plot_band_chart()
-    
+
     def plot_heatmap(self):
         for w in self.frame_heatmap.winfo_children():
             w.destroy()
         df_m = self.df_current[self.df_current["Missing In"] != ""]
         if df_m.empty:
             return
-        pivot = df_m.groupby(["Dimension", "Attribute"]).size().unstack(fill_value=0)
-        if pivot.empty:
+        pivoted = df_m.groupby(["Dimension", "Attribute"]).size().unstack(fill_value=0)
+        if pivoted.empty:
             return
         fig, ax = plt.subplots(figsize=(6, 5))
-        cax = ax.imshow(pivot, cmap="Reds", aspect="auto")
-        ax.set_xticks(range(len(pivot.columns)))
-        ax.set_xticklabels(pivot.columns, rotation=90)
-        ax.set_yticks(range(len(pivot.index)))
-        ax.set_yticklabels(pivot.index)
-        ax.set_title("Discrepancy Heatmap")
+        cax = ax.imshow(pivoted, aspect="auto", cmap="Reds")
+        ax.set_xticks(range(len(pivoted.columns)))
+        ax.set_xticklabels(pivoted.columns, rotation=90)
+        ax.set_yticks(range(len(pivoted.index)))
+        ax.set_yticklabels(pivoted.index)
         fig.colorbar(cax, ax=ax)
+        ax.set_title("Heatmap: Missing Items")
         canvas = FigureCanvasTkAgg(fig, master=self.frame_heatmap)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
-    
+
     def plot_lollipop(self):
         for w in self.frame_lollipop.winfo_children():
             w.destroy()
         df_m = self.df_current[self.df_current["Missing In"] != ""]
         if df_m.empty:
             return
-        count = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False).head(10)
+        count_dim = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False).head(10)
+        if count_dim.empty:
+            return
         fig, ax = plt.subplots(figsize=(6, 5))
-        ax.hlines(y=count.index, xmin=0, xmax=count.values, color="skyblue")
-        ax.plot(count.values, count.index, "o", color="skyblue")
-        ax.set_title("Top 10 Dimensions with Mismatches")
-        ax.set_xlabel("Mismatch Count")
+        ax.hlines(y=count_dim.index, xmin=0, xmax=count_dim.values, color="skyblue")
+        ax.plot(count_dim.values, count_dim.index, "o", color="skyblue")
+        ax.set_title("Lollipop: Missing Dimensions")
+        ax.set_xlabel("Missing Count")
         canvas = FigureCanvasTkAgg(fig, master=self.frame_lollipop)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
-    
+
     def plot_circular(self):
         for w in self.frame_circular.winfo_children():
             w.destroy()
@@ -651,334 +633,477 @@ class Dashboard(ctk.CTkFrame):
         if df_m.empty:
             return
         count_attr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
+        if count_attr.empty:
+            return
         categories = count_attr.index.tolist()
         values = count_attr.values
         angles = np.linspace(0, 2*np.pi, len(categories), endpoint=False)
-        fig, ax = plt.subplots(figsize=(6, 6), subplot_kw={'polar': True})
-        ax.bar(angles, values, width=0.4, color="orange", alpha=0.6)
+
+        fig = plt.figure(figsize=(6, 6))
+        ax = fig.add_subplot(111, polar=True)
+        ax.set_theta_offset(np.pi/2)
+        ax.set_theta_direction(-1)
         ax.set_xticks(angles)
-        ax.set_xticklabels(categories)
-        ax.set_title("Top 10 Mismatched Attributes (Circular)")
+        ax.set_xticklabels(categories, fontsize=9)
+        ax.bar(angles, values, width=0.4, color="orange", alpha=0.6)
+        ax.set_title("Circular Barplot: Missing Attributes", y=1.05)
         canvas = FigureCanvasTkAgg(fig, master=self.frame_circular)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
-    
+
     def plot_scatter(self):
         for w in self.frame_scatter.winfo_children():
             w.destroy()
         df_m = self.df_current[self.df_current["Missing In"] != ""]
         if df_m.empty:
             return
-        count = df_m.groupby("Dimension")["Key"].count().reset_index()
-        count.sort_values("Key", ascending=False, inplace=True)
-        x = np.arange(len(count))
+        count_dim = df_m.groupby("Dimension")["Key"].count().reset_index(name="Count")
+        count_dim.sort_values("Count", ascending=False, inplace=True)
+        if count_dim.empty:
+            return
+        xvals = np.arange(len(count_dim))
+        yvals = count_dim["Count"].values
+        labels = count_dim["Dimension"].values
+
         fig, ax = plt.subplots(figsize=(6, 5))
-        ax.scatter(x, count["Key"], color="green")
-        for i, txt in enumerate(count["Dimension"]):
-            ax.text(x[i], count["Key"].iloc[i], txt, rotation=45, ha="right")
-        ax.set_title("Scatter Plot: Mismatches per Dimension")
-        ax.set_ylabel("Mismatch Count")
+        ax.scatter(xvals, yvals, color="green")
+        for i, txt in enumerate(labels):
+            ax.text(xvals[i], yvals[i], txt, ha="center", va="bottom", rotation=60)
         ax.set_xticks([])
+        ax.set_ylabel("Missing Count")
+        ax.set_title("Scatter: Missing by Dimension")
         canvas = FigureCanvasTkAgg(fig, master=self.frame_scatter)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
-    
+
     def plot_radar(self):
         for w in self.frame_radar.winfo_children():
             w.destroy()
         df_m = self.df_current[self.df_current["Missing In"] != ""]
         if df_m.empty:
             return
-        count = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False).head(5)
-        categories = count.index.tolist()
-        values = count.values.tolist()
+        count_dim = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False).head(5)
+        if count_dim.empty:
+            return
+        categories = count_dim.index.tolist()
+        values = count_dim.values.tolist()
         N = len(categories)
         angles = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
         angles += angles[:1]
         values += values[:1]
-        fig, ax = plt.subplots(figsize=(6, 6), subplot_kw={'polar': True})
-        ax.plot(angles, values, color="red", linewidth=2)
-        ax.fill(angles, values, color="red", alpha=0.25)
+
+        fig = plt.figure(figsize=(6, 6))
+        ax = fig.add_subplot(111, polar=True)
+        ax.set_theta_offset(np.pi/2)
+        ax.set_theta_direction(-1)
         ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(categories)
-        ax.set_title("Radar: Top 5 Dimensions")
+        ax.set_xticklabels(categories, fontsize=9)
+        ax.plot(angles, values, color="red", linewidth=2)
+        ax.fill(angles, values, color="red", alpha=0.3)
+        ax.set_title("Radar: Top 5 Missing Dimensions", y=1.08)
         canvas = FigureCanvasTkAgg(fig, master=self.frame_radar)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
-    
+
     def plot_normal_pie(self):
         for w in self.frame_normalpie.winfo_children():
             w.destroy()
-        if self.df_current.empty:
+        df_m = self.df_current[self.df_current["Missing In"] != ""]
+        if df_m.empty:
             return
-        counts = self.df_current["Missing In"].fillna("").value_counts()
+        dist = df_m["Missing In"].value_counts()
         fig, ax = plt.subplots(figsize=(5, 5))
-        ax.pie(counts.values, labels=counts.index, autopct="%.1f%%", startangle=140)
-        ax.set_title("Status Distribution")
+        ax.pie(dist.values, labels=dist.index, autopct="%.1f%%", startangle=140)
+        ax.set_title("Normal Pie: Missing In Distribution")
         canvas = FigureCanvasTkAgg(fig, master=self.frame_normalpie)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
-    
+
     def plot_normal_bar(self):
         for w in self.frame_normalbar.winfo_children():
             w.destroy()
-        if self.df_current.empty:
+        df_m = self.df_current[self.df_current["Missing In"] != ""]
+        if df_m.empty:
             return
-        count_attr = self.df_current.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
+        count_attr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
         fig, ax = plt.subplots(figsize=(6, 4))
         count_attr.plot(kind="bar", ax=ax, color="blue")
-        ax.set_title("Top 10 Attributes with Mismatches")
-        ax.set_ylabel("Mismatch Count")
+        ax.set_ylabel("Missing Count")
+        ax.set_title("Normal Bar: Top 10 Missing Attributes")
         canvas = FigureCanvasTkAgg(fig, master=self.frame_normalbar)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
-    
+
     def plot_band_chart(self):
         for w in self.frame_bandchart.winfo_children():
             w.destroy()
         if self.df_history.empty or "RunDate" not in self.df_history.columns:
             return
-        df_hist = self.df_history[self.df_history["Missing In"] != ""]
-        if df_hist.empty:
+        df_m = self.df_history[self.df_history["Missing In"] != ""]
+        if df_m.empty:
             return
-        date_counts = df_hist.groupby("RunDate")["Key"].count().reset_index()
+        date_counts = df_m.groupby("RunDate")["Key"].count().reset_index()
         date_counts.sort_values("RunDate", inplace=True)
         date_counts["Count_min"] = date_counts["Key"] * 0.9
         date_counts["Count_max"] = date_counts["Key"] * 1.1
+
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(date_counts["RunDate"], date_counts["Key"], marker="o", color="purple", label="Mismatch Count")
-        ax.fill_between(date_counts["RunDate"], date_counts["Count_min"], date_counts["Count_max"], color="purple", alpha=0.2, label="±10% band")
-        ax.set_title("Mismatch Trend Over Days")
+        ax.plot(date_counts["RunDate"], date_counts["Key"], color="purple", label="Missing Count")
+        ax.fill_between(date_counts["RunDate"], date_counts["Count_min"], date_counts["Count_max"],
+                        color="purple", alpha=0.2, label="±10% band")
+        ax.set_title("Band Chart Over Days")
         ax.set_xlabel("RunDate")
-        ax.set_ylabel("Mismatch Count")
+        ax.set_ylabel("Missing Count")
         plt.xticks(rotation=45)
         ax.legend()
-        for _, row in date_counts.iterrows():
+
+        for i, row in date_counts.iterrows():
             ax.text(row["RunDate"], row["Key"], str(row["Key"]), ha="center", va="bottom")
+
         canvas = FigureCanvasTkAgg(fig, master=self.frame_bandchart)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
-# ------------------------------------------------------------------------------
-# 10) MAIN APP (Only Option 2)
-# ------------------------------------------------------------------------------
+# ---------------- EXCELGRID (GUI) ----------------
+class ExcelGrid(ctk.CTkFrame):
+    """
+    Displays a DataFrame as a grid.
+    The GUI now does NOT allow renaming/hiding columns.
+    Only "Start Date" and "End Date" columns (if present) can be filtered.
+    """
+    FILTERABLE_COLS = {"Start Date", "End Date"}
+
+    def __init__(self, parent, config_block: Dict, name: str):
+        super().__init__(parent)
+        self.name = name
+        # We ignore any column renaming/hiding settings from config_block.
+        self.df = pd.DataFrame()
+        self.filters: Dict[str, Set] = {}  # Only for date filtering.
+
+        self.create_toolbar()
+        self.create_table()
+        self.create_statusbar()
+
+    def create_toolbar(self):
+        tb = ctk.CTkFrame(self)
+        tb.pack(fill="x", padx=5, pady=5)
+        # Only allow clearing filters; no column manager is provided.
+        ctk.CTkButton(tb, text="Clear Filters", command=self.clear_filters).pack(side="left", padx=5)
+
+    def create_table(self):
+        container = ctk.CTkFrame(self)
+        container.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.tree = ttk.Treeview(container, show="headings")
+        vsb = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(container, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+    def create_statusbar(self):
+        self.status_label = ctk.CTkLabel(self, text="Ready")
+        self.status_label.pack(fill="x")
+
+    def set_data(self, df: pd.DataFrame):
+        self.df = df.copy(deep=True)
+        self.refresh_table()
+
+    def get_filtered_df(self) -> pd.DataFrame:
+        if self.df.empty:
+            return self.df
+        df_f = self.df.copy()
+
+        def passes(x, allowed):
+            if pd.isna(x):
+                return any(pd.isna(a) for a in allowed)
+            else:
+                return x in allowed
+
+        for col, allowed_vals in self.filters.items():
+            if col in df_f.columns and allowed_vals:
+                df_f = df_f[df_f[col].apply(lambda z: passes(z, allowed_vals))]
+        return df_f
+
+    def refresh_table(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        # Display all columns as is
+        cols = list(self.df.columns)
+        self.tree["columns"] = cols
+
+        for col in cols:
+            self.tree.heading(col, text=col, anchor="w", command=lambda c=col: self.on_heading_click(c))
+            self.tree.column(col, anchor="w", width=150)
+
+        df_f = self.get_filtered_df()
+        for _, row in df_f.iterrows():
+            rowvals = [row[c] if c in df_f.columns else "" for c in cols]
+            self.tree.insert("", "end", values=rowvals)
+
+        self.status_label.configure(text=f"{len(df_f)} rows")
+
+    def on_heading_click(self, col_name: str):
+        # Only allow filter popup for "Start Date" and "End Date"
+        if col_name in self.FILTERABLE_COLS:
+            self.show_filter_popup(col_name)
+
+    def show_filter_popup(self, col_name: str):
+        if self.df.empty or col_name not in self.df.columns:
+            return
+        popup = tk.Toplevel(self)
+        popup.title(f"Filter: {col_name}")
+        popup.geometry("300x400")
+
+        frame = ctk.CTkFrame(popup)
+        frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        unique_vals = self.df[col_name].unique()
+        display_map = {}
+        for v in unique_vals:
+            if pd.isna(v):
+                dsp = "(NaN)"
+            elif isinstance(v, str) and not v.strip():
+                dsp = "(blank)"
+            else:
+                dsp = str(v)
+            display_map[v] = dsp
+
+        sorted_vals = sorted(display_map.keys(), key=lambda x: display_map[x].lower())
+        curr_filter = self.filters.get(col_name, set())
+        if not curr_filter:
+            curr_filter = set(unique_vals)
+
+        select_all_var = tk.BooleanVar(value=True)
+        def toggle_all():
+            check = select_all_var.get()
+            for vb in var_dict.values():
+                vb.set(check)
+        ctk.CTkCheckBox(frame, text="Select All", variable=select_all_var, command=toggle_all).pack(anchor="w", pady=5)
+
+        scroll = ctk.CTkScrollableFrame(frame, width=250, height=250)
+        scroll.pack(fill="both", expand=True, padx=5, pady=5)
+
+        var_dict = {}
+        for rv in sorted_vals:
+            if pd.isna(rv):
+                in_filter = any(pd.isna(a) for a in curr_filter)
+            else:
+                in_filter = (rv in curr_filter)
+            bvar = tk.BooleanVar(value=in_filter)
+            var_dict[rv] = bvar
+            ctk.CTkCheckBox(scroll, text=display_map[rv], variable=bvar).pack(anchor="w")
+
+        def apply_():
+            sel = set()
+            for rv, vb in var_dict.items():
+                if vb.get():
+                    sel.add(rv)
+            self.filters[col_name] = sel
+            popup.destroy()
+            self.refresh_table()
+
+        bf = ctk.CTkFrame(frame)
+        bf.pack(fill="x", pady=5)
+        ctk.CTkButton(bf, text="Apply", command=apply_).pack(side="left", padx=5)
+        ctk.CTkButton(bf, text="Cancel", command=popup.destroy).pack(side="left", padx=5)
+
+    def clear_filters(self):
+        self.filters.clear()
+        self.refresh_table()
+
+    def get_config_block(self) -> Dict:
+        # Returns a minimal config since columns cannot be renamed/hidden.
+        return {"filters": {col: list(vals) for col, vals in self.filters.items()}}
+
+# ---------------- MAIN APP ----------------
 class MainApp(ctk.CTk):
+    """
+    Main application for Mode=2 reconciliation.
+    - Loads ERP (filtering by "Enabled_Flag" and using the ERP dimension from V_S_C/V S C).
+    - Loads Master (using the full file name as dimension, with the first column as Name).
+    - Applies parameter-based filtering and renaming (dimensions and attributes).
+    - Compares the two (Mode=2) and shows differences.
+    - Provides eight dashboard charts.
+    - The GUI only allows filtering on "Start Date" and "End Date".
+    """
     def __init__(self):
         super().__init__()
-        self.title("Ultra-Mega Reconciliation: Mode=2, Parameter-Driven")
+        self.title("Ultra-Mega Reconciliation: Mode=2, V_S_C for ERP Dimension, Parameter-based, 8 Charts")
         self.geometry("1600x900")
+
         self.config_dict = load_config(Path(DEFAULT_PATHS["CONFIG_PATH"]))
         self.history_df = pd.DataFrame()
-        # Load parameter mappings
-        par_path = Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"]))
-        self.dim_params = read_dimension_parameters(par_path)
-        self.attr_params = read_attribute_parameters(par_path)
-        # Main Notebook
+
+        # Read parameter file (with two sheets)
+        self.param_dict = read_parameter_file(Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"])))
+
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
-        # Paths Tab
+
+        # 1) Paths
         self.tab_paths = ctk.CTkFrame(self.notebook)
         self.notebook.add(self.tab_paths, text="Paths")
         self.build_paths_tab(self.tab_paths)
-        # ERP Tab
+
+        # 2) ERP
         self.tab_erp = ctk.CTkFrame(self.notebook)
-        self.notebook.add(self.tab_erp, text="ERP Data")
+        self.notebook.add(self.tab_erp, text="ERP")
         self.erp_grid = ExcelGrid(self.tab_erp, self.config_dict.get("erp_grid", {}), "ERP")
         self.erp_grid.pack(fill="both", expand=True)
-        # Master Tab
+
+        # 3) Master
         self.tab_master = ctk.CTkFrame(self.notebook)
-        self.notebook.add(self.tab_master, text="Master Data")
+        self.notebook.add(self.tab_master, text="Master")
         self.master_grid = ExcelGrid(self.tab_master, self.config_dict.get("master_grid", {}), "Master")
         self.master_grid.pack(fill="both", expand=True)
-        # Dimension Renames Tab
-        self.tab_dim = ctk.CTkFrame(self.notebook)
-        self.notebook.add(self.tab_dim, text="Dimension Renames")
-        self.build_dimension_tab(self.tab_dim)
-        # Compare & Exceptions Tab
+
+        # 4) Compare & Exceptions
         self.tab_compare = ctk.CTkFrame(self.notebook)
         self.notebook.add(self.tab_compare, text="Compare & Exceptions")
         self.build_compare_tab(self.tab_compare)
-        # Dashboard Tab
+
+        # 5) Dashboard
         self.tab_dashboard = Dashboard(self.notebook)
         self.notebook.add(self.tab_dashboard, text="Dashboard")
-        # Logging Textbox
-        self.log_box = ctk.CTkTextbox(self, height=100)
+
+        # Logging
+        self.log_box = ctk.CTkTextbox(self, height=120)
         self.log_box.pack(fill="both", expand=False)
         self.log_box.configure(state="disabled")
         handler = TextHandler(self.log_box)
         handler.setLevel(logging.INFO)
         logging.getLogger().addHandler(handler)
-        # Temp CSV folder for Master conversion
-        self.temp_csv_dir = Path(self.config_dict["paths"].get("MASTER_CSV_OUTPUT", DEFAULT_PATHS["MASTER_CSV_OUTPUT"]))
+
+        # Master CSV folder
+        self.temp_csv_dir = Path(self.config_dict["paths"].get("MASTER_CSV_OUTPUT", "temp_master_csv"))
         self.temp_csv_dir.mkdir(exist_ok=True)
-        self.df_master_merged = pd.DataFrame()
-        # Initial Data Load
+
+        # Load initial data
         self.refresh_erp_data()
         self.refresh_master_data()
-    
+
     def build_paths_tab(self, parent):
         frm = ctk.CTkFrame(parent)
         frm.pack(fill="both", expand=True, padx=10, pady=10)
-        self.erp_path_var = tk.StringVar(value=self.config_dict["paths"].get("ERP_EXCEL_PATH", DEFAULT_PATHS["ERP_EXCEL_PATH"]))
-        self.master_path_var = tk.StringVar(value=self.config_dict["paths"].get("MASTER_ZIP_PATH", DEFAULT_PATHS["MASTER_ZIP_PATH"]))
-        self.exc_path_var = tk.StringVar(value=self.config_dict["paths"].get("EXCEPTION_PATH", DEFAULT_PATHS["EXCEPTION_PATH"]))
-        self.out_path_var = tk.StringVar(value=self.config_dict["paths"].get("OUTPUT_PATH", DEFAULT_PATHS["OUTPUT_PATH"]))
-        self.cfg_path_var = tk.StringVar(value=self.config_dict["paths"].get("CONFIG_PATH", DEFAULT_PATHS["CONFIG_PATH"]))
-        def mkrow(lbl, var):
-            row = ctk.CTkFrame(frm)
-            row.pack(fill="x", pady=5)
-            ctk.CTkLabel(row, text=lbl, width=200).pack(side="left", padx=5)
-            ent = ctk.CTkEntry(row, textvariable=var, width=800)
-            ent.pack(side="left", padx=5)
-            def browse():
-                path = filedialog.askopenfilename()
-                if path:
-                    var.set(path)
-            ctk.CTkButton(row, text="Browse", command=browse).pack(side="left", padx=5)
-        mkrow("ERP Excel Path:", self.erp_path_var)
-        mkrow("Master ZIP Path:", self.master_path_var)
-        mkrow("Exception Path:", self.exc_path_var)
-        mkrow("Output Excel Path:", self.out_path_var)
-        mkrow("JSON Config Path:", self.cfg_path_var)
-    
-    def refresh_erp_data(self):
-        df = read_erp_enabled(Path(self.erp_path_var.get().strip()))
-        self.erp_grid.set_data(df)
-    
-    def refresh_master_data(self):
-        zip_path = Path(self.master_path_var.get().strip())
-        if not zip_path.is_file():
-            logging.warning("[Master] ZIP not found.")
-            return
-        self.df_master_merged = pd.DataFrame()
-        with zipfile.ZipFile(zip_path, "r") as z:
-            txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
-            if not txt_files:
-                logging.warning("[Master] No .txt files found in ZIP.")
-                return
-            partial_dfs = []
-            for txt_file in txt_files:
-                base_name = os.path.basename(txt_file)
-                dimension_val = base_name  # Full raw file name used as Dimension
-                try:
-                    with z.open(txt_file) as fo:
-                        raw_bytes = fo.read()
-                    if not raw_bytes:
-                        continue
-                    df_raw = read_txt_robust(raw_bytes)
-                    df_raw.columns = df_raw.columns.str.strip()
-                    df_raw["Dimension"] = dimension_val
-                    if "Name" not in df_raw.columns and len(df_raw.columns) > 0:
-                        first = df_raw.columns[0]
-                        df_raw.rename(columns={first: "Name"}, inplace=True)
-                    out_csv = self.temp_csv_dir / f"{dimension_val}.csv"
-                    df_raw.to_csv(out_csv, index=False, encoding="utf-8")
-                    df_re = pd.read_csv(out_csv, encoding="utf-8", on_bad_lines="skip")
-                    df_re.columns = df_re.columns.str.strip()
-                    df_re["Dimension"] = dimension_val
-                    partial_dfs.append(df_re)
-                except Exception as e:
-                    logging.error(f"[Master] Error processing {txt_file}: {e}")
-                    continue
-            if partial_dfs:
-                self.df_master_merged = pd.concat(partial_dfs, ignore_index=True)
-        self.master_grid.set_data(self.df_master_merged)
-    
-    def build_dimension_tab(self, parent):
-        frm = ctk.CTkFrame(parent)
-        frm.pack(fill="both", expand=True, padx=10, pady=10)
-        ctk.CTkLabel(frm, text="Old Dimension -> New Dimension").pack(pady=5)
-        self.rename_rows = []
-        self.list_frame = ctk.CTkScrollableFrame(frm, width=600, height=300)
-        self.list_frame.pack(fill="both", expand=True)
-        for old_dim, new_dim in self.dim_rename_map.items():
-            self.add_dim_rename_row(old_dim, new_dim)
-        ctk.CTkButton(frm, text="Add New Mapping", command=lambda: self.add_dim_rename_row("", "")).pack(pady=5)
-        ctk.CTkButton(frm, text="Save Dimension Renames", command=self.save_dim_renames).pack(pady=5)
-    
-    def add_dim_rename_row(self, old_val: str, new_val: str):
-        row = ctk.CTkFrame(self.list_frame)
-        row.pack(fill="x", pady=2)
-        var_old = tk.StringVar(value=old_val)
-        var_new = tk.StringVar(value=new_val)
-        ctk.CTkLabel(row, text="Old:").pack(side="left", padx=5)
-        ctk.CTkEntry(row, textvariable=var_old, width=200).pack(side="left", padx=5)
-        ctk.CTkLabel(row, text=" -> ").pack(side="left")
-        ctk.CTkEntry(row, textvariable=var_new, width=200).pack(side="left", padx=5)
-        self.rename_rows.append((var_old, var_new))
-    
-    def save_dim_renames(self):
-        new_map = {}
-        for (var_old, var_new) in self.rename_rows:
-            o = var_old.get().strip()
-            n = var_new.get().strip()
-            if o and n and o != n:
-                new_map[o] = n
-        self.dim_rename_map = new_map
-        messagebox.showinfo("Saved", "Dimension renames saved.")
-    
-    @property
-    def dim_rename_map(self) -> Dict[str, str]:
-        return self.config_dict.get("dimension_renames", {})
-    
-    @dim_rename_map.setter
-    def dim_rename_map(self, new_map: Dict[str, str]):
-        self.config_dict["dimension_renames"] = new_map
-    
+
+        self.erp_var = tk.StringVar(value=self.config_dict["paths"].get("ERP_EXCEL_PATH", DEFAULT_PATHS["ERP_EXCEL_PATH"]))
+        self.mst_var = tk.StringVar(value=self.config_dict["paths"].get("MASTER_ZIP_PATH", DEFAULT_PATHS["MASTER_ZIP_PATH"]))
+        self.exc_var = tk.StringVar(value=self.config_dict["paths"].get("EXCEPTION_PATH", DEFAULT_PATHS["EXCEPTION_PATH"]))
+        self.out_var = tk.StringVar(value=self.config_dict["paths"].get("OUTPUT_PATH", DEFAULT_PATHS["OUTPUT_PATH"]))
+        self.cfg_var = tk.StringVar(value=self.config_dict["paths"].get("CONFIG_PATH", DEFAULT_PATHS["CONFIG_PATH"]))
+        self.par_var = tk.StringVar(value=self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"]))
+        self.csv_var = tk.StringVar(value=self.config_dict["paths"].get("MASTER_CSV_OUTPUT", DEFAULT_PATHS["MASTER_CSV_OUTPUT"]))
+
+        def mkrow(lbl, var, is_dir=False):
+            rowf = ctk.CTkFrame(frm)
+            rowf.pack(fill="x", pady=5)
+            ctk.CTkLabel(rowf, text=lbl, width=180).pack(side="left", padx=5)
+            e = ctk.CTkEntry(rowf, textvariable=var, width=600)
+            e.pack(side="left", padx=5)
+            def br():
+                if is_dir:
+                    p = filedialog.askdirectory()
+                else:
+                    p = filedialog.askopenfilename()
+                if p:
+                    var.set(p)
+            ctk.CTkButton(rowf, text="Browse", command=br).pack(side="left", padx=5)
+        mkrow("ERP Excel Path:", self.erp_var)
+        mkrow("Master ZIP Path:", self.mst_var)
+        mkrow("Exception Path:", self.exc_var)
+        mkrow("Output Excel Path:", self.out_var)
+        mkrow("JSON Config Path:", self.cfg_var)
+        mkrow("Parameter File Path:", self.par_var)
+        mkrow("Master CSV Folder:", self.csv_var, is_dir=True)
+
     def build_compare_tab(self, parent):
         frm = ctk.CTkFrame(parent)
         frm.pack(fill="both", expand=True, padx=10, pady=10)
-        # Only option 2 is used
-        self.mode_var = tk.IntVar(value=2)
-        ctk.CTkLabel(frm, text="Comparison Mode: Show only missing attributes if Name exists").pack(anchor="w", padx=5, pady=2)
+        ctk.CTkLabel(frm, text="Mode=2 Only").pack(pady=5)
+
         btnf = ctk.CTkFrame(frm)
-        btnf.pack(fill="x", pady=10)
+        btnf.pack(fill="x", pady=5)
         ctk.CTkButton(btnf, text="Run Comparison", command=self.run_comparison).pack(side="left", padx=5)
         ctk.CTkButton(btnf, text="Save Config", command=self.save_all_config).pack(side="left", padx=5)
-    
+
+    def refresh_erp_data(self):
+        df_erp = read_erp_enabled(Path(self.erp_var.get().strip()))
+        self.erp_grid.set_data(df_erp)
+
+    def refresh_master_data(self):
+        zip_path = Path(self.mst_var.get().strip())
+        out_dir = Path(self.csv_var.get().strip())
+        csvs = convert_master_txt_to_csv(zip_path, out_dir)
+        df_m = unify_master_csvs(csvs)
+        self.master_grid.set_data(df_m)
+
     def run_comparison(self):
-        self.config_dict["paths"]["ERP_EXCEL_PATH"] = self.erp_path_var.get().strip()
-        self.config_dict["paths"]["MASTER_ZIP_PATH"] = self.master_path_var.get().strip()
-        self.config_dict["paths"]["EXCEPTION_PATH"] = self.exc_path_var.get().strip()
-        self.config_dict["paths"]["OUTPUT_PATH"] = self.out_path_var.get().strip()
-        self.config_dict["paths"]["CONFIG_PATH"] = self.cfg_path_var.get().strip()
-        self.config_dict["comparison_option"] = self.mode_var.get()
-        df_erp = self.erp_grid.get_filtered_df()
-        erp_melt = meltdown_erp(df_erp, self.dim_params, self.attr_params)
-        erp_ready = build_keys(erp_melt)
-        df_master = self.master_grid.get_filtered_df().copy()
-        master_melt = meltdown_master(df_master, self.dim_params, self.attr_params)
-        master_ready = build_keys(master_melt)
-        df_diff = compare_mode2(erp_ready, master_ready)
-        exc_path = Path(self.exc_path_var.get().strip())
+        # Update config paths
+        self.config_dict["paths"]["ERP_EXCEL_PATH"] = self.erp_var.get().strip()
+        self.config_dict["paths"]["MASTER_ZIP_PATH"] = self.mst_var.get().strip()
+        self.config_dict["paths"]["EXCEPTION_PATH"] = self.exc_var.get().strip()
+        self.config_dict["paths"]["OUTPUT_PATH"] = self.out_var.get().strip()
+        self.config_dict["paths"]["CONFIG_PATH"] = self.cfg_var.get().strip()
+        self.config_dict["paths"]["PARAMETER_PATH"] = self.par_var.get().strip()
+        self.config_dict["paths"]["MASTER_CSV_OUTPUT"] = self.csv_var.get().strip()
+        self.config_dict["comparison_option"] = 2
+
+        # Re-read parameter file
+        newparam = read_parameter_file(Path(self.par_var.get().strip()))
+
+        # Meltdown ERP using the new parameters
+        df_erp_filt = self.erp_grid.get_filtered_df()
+        erp_ready_raw = meltdown_erp(df_erp_filt, newparam)
+        erp_ready = build_keys(erp_ready_raw)
+
+        # Meltdown Master using the new parameters
+        df_mst_filt = self.master_grid.get_filtered_df()
+        mst_ready_raw = meltdown_master(df_mst_filt, newparam)
+        mst_ready = build_keys(mst_ready_raw)
+
+        # Compare using mode 2
+        df_diff = compare_mode2(erp_ready, mst_ready)
+
+        # Exceptions
+        exc_path = Path(self.exc_var.get().strip())
         df_exc = read_exception_table(exc_path)
         final = merge_exceptions(df_diff, df_exc)
-        out_path = Path(self.out_path_var.get().strip())
-        write_results(final, out_path, mode=2)
+
+        # Write results
+        out_path = Path(self.out_var.get().strip())
+        write_results(final, out_path)
+
+        # Update dashboard history
         run_date = datetime.now().strftime("%Y-%m-%d")
         final["RunDate"] = run_date
         self.history_df = pd.concat([self.history_df, final], ignore_index=True)
+
         self.notebook.select(self.tab_dashboard)
         self.tab_dashboard.update_data(final, self.history_df)
-        self.save_all_config()
-        messagebox.showinfo("Done", f"Comparison for {run_date} complete!\nResults saved to {out_path}")
-    
-    def save_all_config(self):
-        self.config_dict["erp_grid"] = {}  # (Grid config not saved in this version)
-        self.config_dict["master_grid"] = {}
-        self.config_dict["dimension_renames"] = self.dim_rename_map
-        self.config_dict["paths"]["ERP_EXCEL_PATH"] = self.erp_path_var.get().strip()
-        self.config_dict["paths"]["MASTER_ZIP_PATH"] = self.master_path_var.get().strip()
-        self.config_dict["paths"]["EXCEPTION_PATH"] = self.exc_path_var.get().strip()
-        self.config_dict["paths"]["OUTPUT_PATH"] = self.out_path_var.get().strip()
-        self.config_dict["paths"]["CONFIG_PATH"] = self.cfg_path_var.get().strip()
-        self.config_dict["comparison_option"] = self.mode_var.get()
-        save_config(self.config_dict, Path(self.cfg_path_var.get().strip()))
-        messagebox.showinfo("Saved", "Configuration saved successfully.")
 
-# ------------------------------------------------------------------------------
-# 11) MAIN
-# ------------------------------------------------------------------------------
+        messagebox.showinfo("Done", f"Comparison (Mode=2) done. Output saved to {out_path}")
+
+    def save_all_config(self):
+        # Since the GUI no longer supports column modifications, we simply update the paths.
+        self.config_dict["paths"]["ERP_EXCEL_PATH"] = self.erp_var.get().strip()
+        self.config_dict["paths"]["MASTER_ZIP_PATH"] = self.mst_var.get().strip()
+        self.config_dict["paths"]["EXCEPTION_PATH"] = self.exc_var.get().strip()
+        self.config_dict["paths"]["OUTPUT_PATH"] = self.out_var.get().strip()
+        self.config_dict["paths"]["CONFIG_PATH"] = self.cfg_var.get().strip()
+        self.config_dict["paths"]["PARAMETER_PATH"] = self.par_var.get().strip()
+        self.config_dict["paths"]["MASTER_CSV_OUTPUT"] = self.csv_var.get().strip()
+        self.config_dict["comparison_option"] = 2
+        save_config(self.config_dict, Path(self.cfg_var.get()))
+        messagebox.showinfo("Saved", "Config saved successfully.")
+
+# ---------------- MAIN ----------------
 def main():
     app = MainApp()
     app.mainloop()

@@ -19,8 +19,8 @@ Key Points:
   • Compare melts wide data back to long & compares records by Dimension+Name => "missing items."
   • Dashboard includes timeline filter, dimension/attribute filter, multiple charts, Apple-style UI with glassy/burgundy theme & exports.
 
-Author: [Your Name]
-Date: [Today's Date]
+Author: Al Pacino
+Date: 14
 """
 
 import os, sys, json, logging, zipfile, shutil, io, codecs

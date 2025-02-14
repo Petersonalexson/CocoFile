@@ -1,0 +1,521 @@
+# eye 2025 02 14
+
+import sys
+import os
+from pathlib import Path
+from typing import Dict, List, Set, Optional
+from datetime import datetime, timedelta
+import logging
+import json
+import zipfile
+import shutil
+import io
+
+# ---------------------------
+# PySide6 imports
+# ---------------------------
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QLineEdit, QFileDialog, QMessageBox,
+    QTabWidget, QScrollArea, QFrame, QProgressBar, QCalendarWidget,
+    QSlider, QGraphicsOpacityEffect, QStyleOption, QStyle
+)
+from PySide6.QtCore import (
+    Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, QPoint,
+    QSize, Signal, Slot, Property
+)
+from PySide6.QtGui import (
+    QPainter, QColor, QLinearGradient, QPainterPath, QPen, QFont, QIcon
+)
+
+# ---------------------------
+# Charts (optional placeholders for now)
+# ---------------------------
+# If you plan to embed Matplotlib, Plotly, or QtCharts, you'll import them here.
+# We'll do some placeholders for now.
+#import matplotlib
+#matplotlib.use('Qt5Agg')
+#import matplotlib.pyplot as plt
+#from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+#from matplotlib.figure import Figure
+
+# For memory monitoring
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+# ---------------------------
+# Custom Aesthetics
+# ---------------------------
+BURGUNDY       = "#800020"
+BURGUNDY_LIGHT = "#A52A2A"
+BURGUNDY_DARK  = "#4A0012"
+GLASS_BG       = "rgba(255, 255, 255, 0.85)"
+
+STYLESHEET = f"""
+QMainWindow {{
+    background: rgba(255, 255, 255, 0.95);
+}}
+
+QPushButton {{
+    background-color: {BURGUNDY};
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-weight: 500;
+}}
+
+QPushButton:hover {{
+    background-color: {BURGUNDY_LIGHT};
+}}
+
+QPushButton:pressed {{
+    background-color: {BURGUNDY_DARK};
+}}
+
+QLabel {{
+    color: #1D1D1F;
+    font-family: -apple-system, "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+}}
+
+QTabWidget::pane {{
+    border: none;
+    background: {GLASS_BG};
+    border-radius: 10px;
+}}
+
+QTabBar::tab {{
+    background: rgba(245, 245, 247, 0.8);
+    padding: 8px 16px;
+    margin-right: 2px;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+}}
+
+QTabBar::tab:selected {{
+    background: {BURGUNDY};
+    color: white;
+}}
+
+QProgressBar {{
+    border: none;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.1);
+    height: 8px;
+    text-align: center;
+}}
+
+QProgressBar::chunk {{
+    background: {BURGUNDY};
+    border-radius: 4px;
+}}
+
+QSlider::groove:horizontal {{
+    border: none;
+    height: 4px;
+    background: rgba(0, 0, 0, 0.1);
+    border-radius: 2px;
+}}
+
+QSlider::handle:horizontal {{
+    background: {BURGUNDY};
+    border: none;
+    width: 16px;
+    margin: -6px 0;
+    border-radius: 8px;
+}}
+
+QSlider::handle:horizontal:hover {{
+    background: {BURGUNDY_LIGHT};
+}}
+"""
+
+# ---------------------------
+# GlassWidget
+# ---------------------------
+class GlassWidget(QWidget):
+    """
+    Base class for widgets with iOS-style glass effect.
+    Subclasses can simply inherit to get a frosted, translucent background.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.blur_effect = QGraphicsOpacityEffect(self)
+        self.blur_effect.setOpacity(0.95)
+        self.setGraphicsEffect(self.blur_effect)
+
+    def paintEvent(self, event):
+        opt = QStyleOption()
+        opt.initFrom(self)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect = self.rect()
+        path = QPainterPath()
+        path.addRoundedRect(rect, 10, 10)
+
+        # Subtle gradient for the glass effect
+        gradient = QLinearGradient(0, 0, 0, self.height())
+        gradient.setColorAt(0, QColor(255, 255, 255, 230))
+        gradient.setColorAt(1, QColor(255, 255, 255, 200))
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(gradient)
+        painter.drawPath(path)
+
+        # Optional: faint border
+        painter.setPen(QPen(QColor(255, 255, 255, 50), 1))
+        painter.drawPath(path)
+
+# ---------------------------
+# ModernButton
+# ---------------------------
+class ModernButton(QPushButton):
+    """
+    iOS-style button with a subtle hover animation changing opacity.
+    """
+    def __init__(self, text="", parent=None, icon: Optional[QIcon] = None):
+        super().__init__(text, parent)
+        if icon:
+            self.setIcon(icon)
+        self.setCursor(Qt.PointingHandCursor)
+        self._opacity = 1.0
+        
+        # Hover animation
+        self._hover_animation = QPropertyAnimation(self, b"hover_opacity")
+        self._hover_animation.setDuration(150)
+        self._hover_animation.setEasingCurve(QEasingCurve.InOutQuad)
+        
+        # Optional: fixed height for uniform look
+        self.setFixedHeight(36)
+
+    def enterEvent(self, event):
+        self._hover_animation.stop()
+        self._hover_animation.setStartValue(self._opacity)
+        self._hover_animation.setEndValue(0.8)
+        self._hover_animation.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover_animation.stop()
+        self._hover_animation.setStartValue(self._opacity)
+        self._hover_animation.setEndValue(1.0)
+        self._hover_animation.start()
+        super().leaveEvent(event)
+
+    def get_hover_opacity(self):
+        return self._opacity
+
+    def set_hover_opacity(self, value):
+        self._opacity = value
+        # Re-apply stylesheet with updated opacity
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background-color: rgba(128, 0, 32, {value});
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: 500;
+            }}
+        """)
+
+    hover_opacity = Property(float, get_hover_opacity, set_hover_opacity)
+
+# ---------------------------
+# ModernProgressBar
+# ---------------------------
+class ModernProgressBar(QProgressBar):
+    """
+    iOS-style progress bar with an animation for value changes.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTextVisible(False)
+        self.setFixedHeight(4)
+        self.animation = QPropertyAnimation(self, b"value")
+        self.animation.setDuration(300)
+        self.animation.setEasingCurve(QEasingCurve.OutCubic)
+
+    def setValueAnimated(self, value: int):
+        self.animation.stop()
+        self.animation.setStartValue(self.value())
+        self.animation.setEndValue(value)
+        self.animation.start()
+
+# ---------------------------
+# TimelineSlider
+# ---------------------------
+class TimelineSlider(QWidget):
+    """
+    Example custom widget combining a slider with a date label,
+    plus a short animation on changes.
+    """
+    valueChanged = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.start_date: Optional[datetime] = None
+        self.end_date: Optional[datetime] = None
+        self.initUI()
+
+    def initUI(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        layout.setSpacing(4)
+
+        # Date label
+        self.date_label = QLabel("YYYY-MM-DD")
+        self.date_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.date_label)
+
+        # Slider
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 100)
+        self.slider.valueChanged.connect(self.onSliderValueChanged)
+        layout.addWidget(self.slider)
+
+        # Animation
+        self.animation = QPropertyAnimation(self.slider, b"value")
+        self.animation.setDuration(300)
+        self.animation.setEasingCurve(QEasingCurve.OutCubic)
+
+    def setDateRange(self, start_date: datetime, end_date: datetime):
+        self.start_date = start_date
+        self.end_date = end_date
+        # Immediately update label
+        self.updateDateLabel()
+
+    def onSliderValueChanged(self, value: int):
+        self.updateDateLabel()
+        self.valueChanged.emit(value)
+
+    def updateDateLabel(self):
+        if self.start_date and self.end_date:
+            total_days = (self.end_date - self.start_date).days
+            # current_days is fraction of total_days
+            fraction = self.slider.value() / 100.0
+            pass_days = int(total_days * fraction)
+            current_date = self.start_date + timedelta(days=pass_days)
+            self.date_label.setText(current_date.strftime("%Y-%m-%d"))
+
+    def setValueAnimated(self, value: int):
+        """Example usage of an animated setValue."""
+        self.animation.stop()
+        self.animation.setStartValue(self.slider.value())
+        self.animation.setEndValue(value)
+        self.animation.start()
+
+# ---------------------------
+# ScrollableFrame
+# ---------------------------
+class ScrollableFrame(QScrollArea):
+    """
+    A scrollable container with a vertical layout in PySide6.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.content = QWidget()
+        self.setWidget(self.content)
+
+        self.vlayout = QVBoxLayout(self.content)
+        self.vlayout.setContentsMargins(10, 10, 10, 10)
+        self.vlayout.setSpacing(10)
+
+# ---------------------------
+# FloatingCard example
+# ---------------------------
+class FloatingCard(GlassWidget):
+    """
+    A floating glass-like widget that can display info or a chart.
+    """
+    def __init__(self, title="", parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.setupUI()
+
+    def setupUI(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15,15,15,15)
+        layout.setSpacing(8)
+
+        title_label = QLabel(f"✨ {self.title}")
+        title_label.setStyleSheet("""
+            font-size: 16px;
+            font-weight: bold;
+        """)
+        layout.addWidget(title_label)
+
+        # Placeholder content
+        self.body_label = QLabel("This is a floating card body.\nYou can put charts, info, etc. here.")
+        layout.addWidget(self.body_label)
+
+# ---------------------------
+# Main Window
+# ---------------------------
+class MainWindow(QMainWindow):
+    """
+    This main window demonstrates how we’ll gradually
+    port your large Tkinter script to PySide6 with a modern style.
+    """
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Ultra-Mega Reconciliation (iOS-style PySide6)")
+        self.setMinimumSize(1200, 700)
+        
+        # Apply iOS-like stylesheet
+        self.setStyleSheet(STYLESHEET)
+
+        # Central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+
+        # Logging area or status bar (optional)
+        self.memory_label = QLabel("Memory usage: ...")
+        main_layout.addWidget(self.memory_label)
+
+        # Tab widget
+        self.tab_widget = QTabWidget()
+        main_layout.addWidget(self.tab_widget, stretch=1)
+
+        # Create our tabs (ERP, Master, Compare, Dashboard, etc.)
+        self.createPathsTab()
+        self.createErpPreviewTab()
+        self.createMasterPreviewTab()
+        self.createCompareTab()
+        self.createDashboardTab()
+
+        # Refresh memory usage every second
+        if psutil:
+            self.memory_timer = QTimer(self)
+            self.memory_timer.timeout.connect(self.updateMemoryUsage)
+            self.memory_timer.start(1000)
+
+    def updateMemoryUsage(self):
+        """Show memory usage in MB if psutil is available."""
+        process = psutil.Process()
+        mem_info = process.memory_info().rss / (1024 * 1024)
+        self.memory_label.setText(f"Memory usage: {mem_info:.1f} MB")
+
+    # ---------------------------
+    # TABS
+    # ---------------------------
+    def createPathsTab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        
+        layout.addWidget(QLabel("Paths / Config Tab"))
+        
+        # Example iOS-like button
+        btn = ModernButton("Browse Config")
+        btn.clicked.connect(self.onBrowseConfig)
+        layout.addWidget(btn)
+        
+        # Timeline slider example
+        self.timeline_slider = TimelineSlider()
+        self.timeline_slider.setDateRange(
+            datetime.now() - timedelta(days=30),
+            datetime.now()
+        )
+        layout.addWidget(self.timeline_slider)
+        
+        # Floating Card example
+        card = FloatingCard("Path Info")
+        layout.addWidget(card)
+
+        layout.addStretch(1)
+        self.tab_widget.addTab(tab, "Paths")
+
+    def onBrowseConfig(self):
+        # Example file dialog usage
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Config JSON", "", "JSON Files (*.json);;All Files (*)"
+        )
+        if file_path:
+            QMessageBox.information(self, "Config Selected", f"You chose: {file_path}")
+
+    def createErpPreviewTab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.addWidget(QLabel("ERP Preview Goes Here"))
+        
+        # Possibly a table or a chart
+        card = FloatingCard("ERP Table or Chart")
+        layout.addWidget(card)
+
+        layout.addStretch(1)
+        self.tab_widget.addTab(tab, "ERP Preview")
+
+    def createMasterPreviewTab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.addWidget(QLabel("Master Preview Goes Here"))
+        
+        # Possibly another table or chart
+        card = FloatingCard("Master Table or Chart")
+        layout.addWidget(card)
+
+        layout.addStretch(1)
+        self.tab_widget.addTab(tab, "Master Preview")
+
+    def createCompareTab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        
+        layout.addWidget(QLabel("Compare Tab"))
+        
+        # Example: Refresh All Data
+        btn_refresh = ModernButton("🔄 Refresh All Data")
+        btn_refresh.clicked.connect(self.onRefreshAllData)
+        layout.addWidget(btn_refresh)
+
+        # Example progress bar
+        self.progress = ModernProgressBar()
+        layout.addWidget(self.progress)
+
+        layout.addStretch(1)
+        self.tab_widget.addTab(tab, "Compare")
+
+    def onRefreshAllData(self):
+        # This is where you'd read your ERP & Master data again
+        # and re-run meltdown logic
+        QMessageBox.information(self, "Refresh", "Refreshing all data (placeholder).")
+        # Animate progress bar to 100 for demonstration
+        self.progress.setValueAnimated(100)
+
+    def createDashboardTab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.addWidget(QLabel("Dashboard / Advanced Charts Tab"))
+
+        # Possibly we’ll embed multiple floating cards or QFrames
+        card1 = FloatingCard("Missing Items Heatmap?")
+        layout.addWidget(card1)
+
+        card2 = FloatingCard("Another Chart Example")
+        layout.addWidget(card2)
+
+        layout.addStretch(1)
+        self.tab_widget.addTab(tab, "Dashboard")
+
+# ---------------------------
+# MAIN / ENTRY
+# ---------------------------
+def main():
+    app = QApplication(sys.argv)
+    # Optionally set an app-wide font or icon here
+
+    window = MainWindow()
+    window.show()
+    
+    sys.exit(app.exec())
+    
+if __name__ == "__main__":
+    main()

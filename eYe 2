@@ -1,0 +1,1572 @@
+# eYe 2
+"""
+Ultra-Mega Reconciliation: Enhanced iOS-style UI with Advanced Dashboard
+Key Improvements:
+ - iOS-style modern UI with smooth animations & color palette
+ - Scrollable tabs with intuitive navigation (emoji-based)
+ - PDF export with detailed analytics (cover page, dimension & attribute stats, all charts)
+ - Option to browse for PDF export path
+ - Session management to restore filters
+ - Keyboard shortcuts (Ctrl+R, Ctrl+S, Ctrl+E, F5)
+ - Memory usage display via psutil
+ - Full meltdown, parameter, and compare logic from the original script
+"""
+
+import sys
+import os
+import json
+import logging
+import zipfile
+import shutil
+import io
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Dict, Set, List, Optional
+
+import pandas as pd
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+
+# Attempt psutil import for memory usage
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+
+# Qt / PySide6
+from PySide6.QtCore import (
+    Qt, QTimer, QRect, QSize, QDateTime, Signal, Slot,
+    QPropertyAnimation, QEasingCurve, QEvent
+)
+from PySide6.QtGui import (
+    QAction, QKeySequence, QIcon, QPainter, QColor,
+    QFont, QFontDatabase, QCloseEvent
+)
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
+    QFileDialog, QMessageBox, QLabel, QPushButton, QPlainTextEdit, QStatusBar,
+    QLineEdit, QCheckBox, QScrollArea, QFrame, QFormLayout, QTableWidget,
+    QTableWidgetItem, QDialog, QDialogButtonBox, QTableView, QHeaderView,
+    QAbstractItemView, QProgressBar, QStyle, QGridLayout, QComboBox,
+    QScrollBar, QStackedWidget, QBoxLayout
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+
+# ==============================================
+# 1) DEFAULT CONFIG & PATHS
+# ==============================================
+DEFAULT_PATHS = {
+    "ERP_EXCEL_PATH": "data/ERP_Config.xlsx",
+    "MASTER_ZIP_PATH": "data/Master_Config.zip",
+    "EXCEPTION_PATH": "data/Exception_Table.xlsx",
+    "OUTPUT_PATH": "output/missing_items.xlsx",
+    "CONFIG_PATH": "config/ui_config.json",
+    "PARAMETER_PATH": "data/parameters.xlsx",
+    "MASTER_CSV_OUTPUT": "temp_master_csv",
+    "PDF_EXPORT_PATH": "output/dashboard_reports"  # default PDF directory
+}
+
+def default_config() -> Dict:
+    return {
+        "paths": DEFAULT_PATHS.copy(),
+        "comparison_option": 2,
+        "erp_grid": {"columns": [], "filters": {}},
+        "master_grid": {"columns": [], "filters": {}}
+    }
+
+def load_config(path: Path) -> Dict:
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load config: {e}")
+    return default_config()
+
+def save_config(cfg: Dict, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        logging.info(f"Saved config to {path}")
+    except Exception as e:
+        logging.error(f"Error saving config: {e}")
+
+
+# ==============================================
+# 2) PARAMS, MELTDOWN, COMPARISON LOGIC
+# ==============================================
+def read_param_file(path: Path) -> Dict[str, object]:
+    """
+    Read dimension & attribute parameters from Excel (2 sheets).
+    """
+    param = {
+        "dim_erp_keep": set(),
+        "dim_erp_map": {},
+        "dim_master_map": {},
+        "attr_erp_map": {},
+        "attr_master_map": {}
+    }
+    if not path.is_file():
+        logging.warning(f"Param file not found => {path}")
+        return param
+    try:
+        dim_df = pd.read_excel(path, sheet_name="Dimension Parameters")
+        dim_df.columns = dim_df.columns.astype(str).str.strip()
+
+        def s(x): return str(x).strip() if pd.notna(x) else ""
+        for _, row in dim_df.iterrows():
+            fn = s(row.get("FileName",""))
+            vsc= s(row.get("V S C",""))
+            dim= s(row.get("Dimension",""))
+            ev = s(row.get("ERP Values",""))
+            if ev.lower()=="x" and vsc and dim:
+                param["dim_erp_keep"].add(vsc)
+            if vsc and dim:
+                param["dim_erp_map"][vsc] = dim
+            if fn and dim and ev.lower()=="x":
+                param["dim_master_map"][fn] = dim
+
+        attr_df = pd.read_excel(path, sheet_name="Attribute Parameters")
+        attr_df.columns = attr_df.columns.astype(str).str.strip()
+        for _, row in attr_df.iterrows():
+            e_orig = s(row.get("ERP Original Attributes",""))
+            m_orig = s(row.get("Master Original Attributes",""))
+            final_ = s(row.get("Attribute",""))
+            onoff = s(row.get("On/Off",""))
+            if onoff.lower()=="x" and final_:
+                if e_orig:
+                    param["attr_erp_map"][e_orig] = final_
+                if m_orig:
+                    param["attr_master_map"][m_orig] = final_
+        return param
+    except Exception as e:
+        logging.error(f"Error reading param file => {e}")
+        return param
+
+def read_erp_excel(path: Path) -> pd.DataFrame:
+    if not path.is_file():
+        logging.warning(f"ERP Excel not found => {path}")
+        return pd.DataFrame()
+    try:
+        df = pd.read_excel(path, skiprows=3)
+        df.columns = df.columns.str.strip()
+        if "Enabled_Flag" in df.columns:
+            df = df[df["Enabled_Flag"]=="Enabled"]
+        return df
+    except Exception as e:
+        logging.error(f"Error reading ERP => {e}")
+        return pd.DataFrame()
+
+def read_txt_2encodings(raw: bytes) -> pd.DataFrame:
+    for enc in ["utf-8-sig","utf-16-le"]:
+        try:
+            buf = io.BytesIO(raw)
+            df = pd.read_csv(buf, encoding=enc, on_bad_lines="skip", engine="python")
+            df.dropna(how="all", axis=0, inplace=True)
+            df.dropna(how="all", axis=1, inplace=True)
+            df.columns = df.columns.astype(str).str.strip()
+            logging.info(f"[read_txt_2encodings] success with {enc}, shape={df.shape}")
+            return df
+        except Exception as e:
+            logging.debug(f"[read_txt_2encodings] fail with {enc} => {e}")
+    logging.error("[read_txt_2encodings] cannot parse .txt => empty.")
+    return pd.DataFrame()
+
+def convert_master_txt_to_csv(zip_path: Path, out_dir: Path) -> List[Path]:
+    if not zip_path.is_file():
+        logging.warning(f"[Master] ZIP not found => {zip_path}")
+        return []
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csvs = []
+    with zipfile.ZipFile(zip_path,"r") as z:
+        txt_files= [f for f in z.namelist() if f.lower().endswith(".txt")]
+        for txt_file in txt_files:
+            base_name = os.path.basename(txt_file)
+            if not base_name:
+                continue
+            try:
+                with z.open(txt_file) as fo:
+                    raw = fo.read()
+                df = read_txt_2encodings(raw)
+                if df.empty:
+                    continue
+                df["RawFileName"] = base_name
+                if "Name" not in df.columns and len(df.columns)>0:
+                    first_col= df.columns[0]
+                    df.rename(columns={first_col:"Name"}, inplace=True)
+                out_csv = out_dir / (base_name.replace(".txt",".csv"))
+                df.to_csv(out_csv, index=False, encoding="utf-8")
+                csvs.append(out_csv)
+            except Exception as e:
+                logging.error(f"[Master] error reading {txt_file} => {e}")
+    return csvs
+
+def unify_master_csvs(csvs: List[Path]) -> pd.DataFrame:
+    frames=[]
+    for cp in csvs:
+        if not cp.is_file():
+            continue
+        try:
+            df = pd.read_csv(cp, encoding="utf-8", on_bad_lines="skip")
+            df.columns = df.columns.str.strip()
+            frames.append(df)
+        except Exception as e:
+            logging.error(f"[unify_master_csvs] reading {cp} => {e}")
+    if frames:
+        return pd.concat(frames, ignore_index=True)
+    return pd.DataFrame()
+
+def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.DataFrame:
+    if "V_S_C" not in df.columns:
+        return pd.DataFrame()
+    keep = param.get("dim_erp_keep", set())
+    dmap = param.get("dim_erp_map", {})
+    amap = param.get("attr_erp_map", {})
+
+    df2 = df[df["V_S_C"].isin(keep)].copy()
+    if df2.empty:
+        return pd.DataFrame()
+
+    skip_cols = {"V_S_C","Enabled_Flag"}
+    id_vars= []
+    if "Value" in df2.columns:
+        id_vars.append("Value")
+        skip_cols.add("Value")
+    df2["DimRaw"] = df2["V_S_C"]
+    skip_cols.add("DimRaw")
+    id_vars.insert(0, "DimRaw")
+
+    meltdown_cols = [c for c in df2.columns if c not in skip_cols]
+    melted = df2.melt(
+        id_vars=id_vars,
+        value_vars=meltdown_cols,
+        var_name="OrigAttr",
+        value_name="ValX"
+    )
+
+    def rename_dim(v):
+        return dmap.get(v, v)
+    melted["Dimension"] = melted["DimRaw"].apply(rename_dim)
+    if "Value" in id_vars:
+        melted.rename(columns={"Value":"Name"}, inplace=True)
+    else:
+        melted["Name"] = ""
+
+    melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
+    melted["Attribute"] = melted["OrigAttr"].map(amap)
+
+    def strip_t(val):
+        if isinstance(val,str) and "T" in val:
+            return val.split("T")[0]
+        return val
+    melted["Value"] = np.where(
+        melted["Attribute"].isin(["Start Date","End Date"]),
+        melted["ValX"].apply(strip_t),
+        melted["ValX"]
+    )
+
+    return melted[["Dimension","Name","Attribute","Value"]]
+
+def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.DataFrame:
+    if df.empty or "RawFileName" not in df.columns:
+        return pd.DataFrame()
+    keep_map = param.get("dim_master_map", {})
+    amap = param.get("attr_master_map", {})
+
+    df2 = df[df["RawFileName"].isin(keep_map.keys())].copy()
+    if df2.empty:
+        return pd.DataFrame()
+
+    df2["DimRaw"] = df2["RawFileName"]
+    skip_cols = {"RawFileName","DimRaw"}
+    id_vars = ["DimRaw"]
+    if "Name" in df2.columns:
+        id_vars.append("Name")
+        skip_cols.add("Name")
+
+    meltdown_cols = [c for c in df2.columns if c not in skip_cols]
+    melted = df2.melt(
+        id_vars=id_vars,
+        value_vars=meltdown_cols,
+        var_name="OrigAttr",
+        value_name="ValX"
+    )
+    def rename_dim(fn):
+        return keep_map.get(fn, fn)
+    melted["Dimension"] = melted["DimRaw"].apply(rename_dim)
+
+    if "Name" in id_vars:
+        melted.rename(columns={"Name":"Name"}, inplace=True)
+    else:
+        melted["Name"] = ""
+
+    melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
+    melted["Attribute"] = melted["OrigAttr"].map(amap)
+
+    def strip_t(val):
+        if isinstance(val,str) and "T" in val:
+            return val.split("T")[0]
+        return val
+    melted["Value"] = np.where(
+        melted["Attribute"].isin(["Start Date","End Date"]),
+        melted["ValX"].apply(strip_t),
+        melted["ValX"]
+    )
+    return melted[["Dimension","Name","Attribute","Value"]]
+
+def pivot_for_preview(df: pd.DataFrame) -> pd.DataFrame:
+    df2 = df.copy()
+    if not df2.empty and {"Dimension","Name","Attribute"}.issubset(df2.columns):
+        df2.drop_duplicates(subset=["Dimension","Name","Attribute"], inplace=True)
+        try:
+            df2 = df2.pivot(
+                index=["Dimension","Name"],
+                columns="Attribute",
+                values="Value"
+            ).reset_index()
+        except Exception as e:
+            logging.error(f"Pivot error => {e}")
+    return df2
+
+def melt_back(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "Dimension" not in df.columns or "Name" not in df.columns:
+        return pd.DataFrame()
+    skip_cols = {"Dimension","Name"}
+    meltdown_cols = [c for c in df.columns if c not in skip_cols]
+    melted = df.melt(
+        id_vars=["Dimension","Name"],
+        value_vars=meltdown_cols,
+        var_name="Attribute",
+        value_name="Value"
+    )
+    return melted[["Dimension","Name","Attribute","Value"]]
+
+def build_keys(df: pd.DataFrame)-> pd.DataFrame:
+    df = df.copy()
+    for c in ["Dimension","Name","Attribute","Value"]:
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].fillna("").astype(str).str.strip()
+    df["GroupKey"] = df["Dimension"] + " | " + df["Name"]
+    df["Key"] = df["Dimension"] + " | " + df["Name"] + " | " + df["Attribute"] + " | " + df["Value"]
+    df["Comments_1"] = ""
+    df["Comments_2"] = ""
+    df["Action Item"] = ""
+    df["Missing In"] = ""
+    return df
+
+def compare_mode2(df_erp: pd.DataFrame, df_mst: pd.DataFrame) -> pd.DataFrame:
+    def to_dict(d):
+        out = {}
+        for gk, grp in d.groupby("GroupKey"):
+            rec = {}
+            nm = grp["Name"].iloc[0] if not grp.empty else ""
+            rec["Name"] = nm
+            for _, row in grp.iterrows():
+                rec[row["Attribute"]] = row["Value"]
+            out[gk] = rec
+        return out
+
+    e_dict = to_dict(df_erp)
+    m_dict = to_dict(df_mst)
+    all_gk = set(e_dict.keys()) | set(m_dict.keys())
+    results = []
+    for gk in all_gk:
+        dim= gk.split(" | ")[0]
+        a_data= e_dict.get(gk,{})
+        b_data= m_dict.get(gk,{})
+        name_a= a_data.get("Name","")
+        name_b= b_data.get("Name","")
+        if name_a and name_b and name_a==name_b:
+            all_attrs= (set(a_data.keys())| set(b_data.keys())) - {"Name"}
+            for at in all_attrs:
+                va= a_data.get(at,"")
+                vb= b_data.get(at,"")
+                if va!=vb:
+                    if va and not vb:
+                        results.append({
+                            "Dimension":dim,"Name":name_a,"Attribute":at,
+                            "Value":va,"Missing In":"MASTER"
+                        })
+                    elif vb and not va:
+                        results.append({
+                            "Dimension":dim,"Name":name_a,"Attribute":at,
+                            "Value":vb,"Missing In":"ERP"
+                        })
+                    else:
+                        results.append({
+                            "Dimension":dim,"Name":name_a,"Attribute":at,
+                            "Value":va,"Missing In":"MASTER"
+                        })
+                        results.append({
+                            "Dimension":dim,"Name":name_a,"Attribute":at,
+                            "Value":vb,"Missing In":"ERP"
+                        })
+        else:
+            # name mismatch or one is empty
+            if name_a and not name_b:
+                results.append({
+                    "Dimension":dim,"Name":name_a,"Attribute":"Name",
+                    "Value":name_a,"Missing In":"MASTER"
+                })
+            elif name_b and not name_a:
+                results.append({
+                    "Dimension":dim,"Name":name_b,"Attribute":"Name",
+                    "Value":name_b,"Missing In":"ERP"
+                })
+
+    df_res= pd.DataFrame(results)
+    if not df_res.empty:
+        df_res["Key"]= (df_res["Dimension"].str.strip()+" | "+
+                        df_res["Name"].str.strip()+" | "+
+                        df_res["Attribute"].str.strip()+" | "+
+                        df_res["Value"].str.strip())
+    return df_res
+
+def read_exception_table(path: Path)-> pd.DataFrame:
+    if not path.is_file():
+        logging.warning(f"Exception table not found => {path}")
+        return pd.DataFrame()
+    try:
+        df = pd.read_excel(path)
+        df.columns = df.columns.astype(str).str.strip()
+        return df
+    except Exception as e:
+        logging.error(f"Error reading exception => {e}")
+        return pd.DataFrame()
+
+def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame)-> pd.DataFrame:
+    if df.empty or df_exc.empty or "Key" not in df.columns:
+        return df
+    keep = [c for c in df_exc.columns if c in ["Key","Comments_1","Comments_2","hide exception"]]
+    if not keep:
+        return df
+    exc = df_exc[keep].copy()
+    exc["Key"] = exc["Key"].astype(str).str.strip()
+    merged = df.merge(exc, on="Key", how="left", suffixes=("","_exc"))
+    merged["hide exception"] = merged.get("hide exception","").fillna("").str.lower()
+    final = merged[merged["hide exception"]!="yes"].copy()
+    if "Comments_1_exc" in final.columns:
+        final["Comments_1"] = np.where(final["Comments_1_exc"].notna(), final["Comments_1_exc"], final["Comments_1"])
+        final.drop(columns=["Comments_1_exc"], inplace=True)
+    if "Comments_2_exc" in final.columns:
+        final["Comments_2"] = np.where(final["Comments_2_exc"].notna(), final["Comments_2_exc"], final["Comments_2"])
+        final.drop(columns=["Comments_2_exc"], inplace=True)
+    if "hide exception" in final.columns:
+        final.drop(columns=["hide exception"], inplace=True)
+    return final
+
+def write_missing_items(df: pd.DataFrame, out_path: Path):
+    if df.empty:
+        logging.info("No missing items => skip writing.")
+        return
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    final_cols= [
+        "Key","Dimension","Name","Attribute","Value",
+        "Comments_1","Comments_2","Action Item","Missing In"
+    ]
+    for c in final_cols:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[final_cols]
+    wb= Workbook()
+    ws= wb.active
+    ws.title= "Missing Items"
+    ws.append(final_cols)
+    for rowvals in df.itertuples(index=False):
+        ws.append(rowvals)
+    header_font= Font(bold=True)
+    fill= PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
+    for cell in ws[1]:
+        cell.font= header_font
+        cell.fill= fill
+        cell.alignment= Alignment(horizontal="center")
+    for col in ws.columns:
+        max_len=0
+        letter= col[0].column_letter
+        for cell in col:
+            val = str(cell.value) if cell.value else ""
+            max_len= max(max_len, len(val))
+        ws.column_dimensions[letter].width = max_len+2
+    ws.freeze_panes = "A2"
+    wb.save(out_path)
+    logging.info(f"Missing items => {out_path}")
+
+
+# ==============================================
+# 3) iOS-STYLE SCROLLABLE TAB WIDGET
+# ==============================================
+class ScrollableTabWidget(QWidget):
+    """
+    iOS-style scrollable tab widget with smooth horizontal scrolling for the tab bar.
+    Each tab has an optional emoji icon + text.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setLayout(QVBoxLayout(self))
+        self.layout().setContentsMargins(0,0,0,0)
+        self.layout().setSpacing(0)
+
+        # Tab header area
+        self.header_scroll = QScrollArea()
+        self.header_scroll.setWidgetResizable(True)
+        self.header_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.header_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.header_scroll.setFixedHeight(60)
+        self.header_widget = QWidget()
+        self.header_layout = QHBoxLayout(self.header_widget)
+        self.header_layout.setContentsMargins(10,10,10,10)
+        self.header_layout.setSpacing(10)
+        self.header_scroll.setWidget(self.header_widget)
+
+        # Content stack
+        self.content_stack = QStackedWidget()
+
+        self.layout().addWidget(self.header_scroll)
+        self.layout().addWidget(self.content_stack)
+
+        self.tabs = []
+        self.current_index = -1
+
+    def addTab(self, widget: QWidget, text: str, icon: str = ""):
+        index = self.content_stack.addWidget(widget)
+
+        # Tab button
+        btn = QPushButton(f"{icon} {text}" if icon else text)
+        btn.setCheckable(True)
+        btn.setAutoExclusive(True)
+        btn.setStyleSheet("""
+            QPushButton {
+                background: #EFEFF4;
+                border-radius: 15px;
+                padding: 8px 16px;
+                color: #8E8E93;
+            }
+            QPushButton:checked {
+                background: #007AFF;
+                color: white;
+            }
+        """)
+        btn.clicked.connect(lambda: self.setCurrentIndex(index))
+
+        self.header_layout.addWidget(btn)
+        self.tabs.append((btn, widget))
+        if self.current_index < 0:  # first tab
+            self.setCurrentIndex(index)
+
+    def setCurrentIndex(self, index: int):
+        if 0 <= index < self.content_stack.count():
+            if self.current_index != -1 and self.current_index < len(self.tabs):
+                old_btn, _ = self.tabs[self.current_index]
+                old_btn.setChecked(False)
+
+            self.content_stack.setCurrentIndex(index)
+            new_btn, _ = self.tabs[index]
+            new_btn.setChecked(True)
+            self.current_index = index
+
+            # Make sure button is visible
+            self.header_scroll.ensureWidgetVisible(new_btn)
+
+
+# ==============================================
+# 4) PREVIEW TABLE FOR ERP/MASTER
+# ==============================================
+class PreviewTable(QWidget):
+    """
+    Shows the pivoted data in a QTableWidget with filtering for date columns.
+    """
+    FILTERABLE = {"Start Date","End Date"}
+
+    def __init__(self, parent: Optional[QWidget] = None, title: str = "Preview"):
+        super().__init__(parent)
+        self.title = title
+        self.df = pd.DataFrame()
+        self.filters: Dict[str, Set] = {}
+
+        main_layout = QVBoxLayout(self)
+        lbl_title = QLabel(f"{title} Preview")
+        lbl_title.setStyleSheet("font-weight: bold; font-size: 16px;")
+        main_layout.addWidget(lbl_title)
+
+        # Buttons
+        hl = QHBoxLayout()
+        btn_info = QPushButton("ⓘ")
+        btn_info.setFixedWidth(30)
+        btn_info.clicked.connect(self.show_info)
+        hl.addWidget(btn_info)
+
+        btn_clear = QPushButton("Clear Date Filters")
+        btn_clear.clicked.connect(self.clear_filters)
+        hl.addWidget(btn_clear)
+        hl.addStretch()
+        main_layout.addLayout(hl)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        main_layout.addWidget(self.table)
+
+        # Status label
+        self.status_label = QLabel("0 rows")
+        main_layout.addWidget(self.status_label)
+
+    def show_info(self):
+        QMessageBox.information(self, "Info", f"{self.title} data after meltdown & param.\nOnly Start/End Date columns filterable.")
+
+    def set_data(self, df: pd.DataFrame):
+        self.filters.clear()
+        self.df = df.copy()
+        self.refresh_table()
+
+    def refresh_table(self):
+        df_filtered = self.apply_filters()
+
+        self.table.clear()
+        if df_filtered.empty:
+            self.table.setRowCount(0)
+            self.table.setColumnCount(0)
+            self.status_label.setText("0 rows")
+            return
+
+        cols = list(df_filtered.columns)
+        self.table.setColumnCount(len(cols))
+        self.table.setRowCount(len(df_filtered))
+        self.table.setHorizontalHeaderLabels(cols)
+
+        for r in range(len(df_filtered)):
+            rowvals = df_filtered.iloc[r]
+            for c, colname in enumerate(cols):
+                item = QTableWidgetItem(str(rowvals[colname]))
+                self.table.setItem(r, c, item)
+
+        self.table.resizeColumnsToContents()
+        self.status_label.setText(f"{len(df_filtered)} rows")
+
+        # Connect header for filtering
+        hdr = self.table.horizontalHeader()
+        hdr.sectionClicked.connect(self.on_header_click)
+
+    def on_header_click(self, idx: int):
+        if self.df.empty:
+            return
+        col_name = self.df.columns[idx]
+        if col_name in self.FILTERABLE:
+            self.show_filter_popup(col_name)
+
+    def show_filter_popup(self, col_name: str):
+        df_col = self.df[col_name].dropna().unique()
+        sorted_vals = sorted(df_col, key=lambda x: str(x).lower())
+        curr_filter = self.filters.get(col_name, set(sorted_vals))
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Filter: {col_name}")
+        layout = QVBoxLayout(dialog)
+
+        chk_all = QCheckBox("Select All")
+        layout.addWidget(chk_all)
+
+        scroll = QScrollArea()
+        scrw = QWidget()
+        scrlay = QVBoxLayout(scrw)
+        scroll.setWidget(scrw)
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll)
+
+        cbs = {}
+        for v in sorted_vals:
+            cb = QCheckBox(str(v))
+            cb.setChecked(v in curr_filter)
+            scrlay.addWidget(cb)
+            cbs[v] = cb
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(btn_box)
+
+        def on_select_all(state):
+            checked = (state == Qt.Checked)
+            for x in cbs.values():
+                x.setChecked(checked)
+
+        chk_all.stateChanged.connect(on_select_all)
+
+        def on_ok():
+            sel = set()
+            for valx, cbox in cbs.items():
+                if cbox.isChecked():
+                    sel.add(valx)
+            # If all or none => remove filter
+            if sel == set(sorted_vals) or not sel:
+                self.filters.pop(col_name, None)
+            else:
+                self.filters[col_name] = sel
+            dialog.accept()
+            self.refresh_table()
+
+        def on_cancel():
+            dialog.reject()
+
+        btn_box.accepted.connect(on_ok)
+        btn_box.rejected.connect(on_cancel)
+
+        dialog.exec()
+
+    def apply_filters(self) -> pd.DataFrame:
+        df_f = self.df.copy()
+        for col, allowed in self.filters.items():
+            if col in df_f.columns:
+                df_f = df_f[df_f[col].isin(allowed)]
+        return df_f
+
+    def clear_filters(self):
+        self.filters.clear()
+        self.refresh_table()
+
+    def get_filtered_df(self) -> pd.DataFrame:
+        return self.apply_filters()
+
+
+# ==============================================
+# 5) ADVANCED DASHBOARD (8 CHARTS)
+# ==============================================
+class AdvancedDashboard(QWidget):
+    """
+    iOS-style advanced dashboard with 8 chart tabs, dimension/attribute/time filtering,
+    PDF export, etc.
+    """
+    def __init__(self, parent=None, config_dict: Dict = {}):
+        super().__init__(parent)
+        self.config_dict = config_dict
+        self.df_current = pd.DataFrame()
+        self.df_history = pd.DataFrame()
+        self.selected_dims: Set[str] = set()
+        self.selected_attrs: Set[str] = set()
+
+        main_layout = QVBoxLayout(self)
+
+        topbar = QHBoxLayout()
+        main_layout.addLayout(topbar)
+
+        self.metric_label = QLabel("Metrics: 0 missing, 0 dimension")
+        self.metric_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        topbar.addWidget(self.metric_label)
+
+        # Filter dimension
+        btn_dim = QPushButton("Filter Dimension")
+        btn_dim.clicked.connect(lambda: self.show_filter_popup("Dimension"))
+        topbar.addWidget(btn_dim)
+
+        # Filter attribute
+        btn_attr = QPushButton("Filter Attribute")
+        btn_attr.clicked.connect(lambda: self.show_filter_popup("Attribute"))
+        topbar.addWidget(btn_attr)
+
+        # Quick date filters
+        btn_7 = QPushButton("Last 7 Days")
+        btn_7.clicked.connect(lambda: self.set_quick_range(7))
+        topbar.addWidget(btn_7)
+
+        btn_30 = QPushButton("Last 30 Days")
+        btn_30.clicked.connect(lambda: self.set_quick_range(30))
+        topbar.addWidget(btn_30)
+
+        btn_90 = QPushButton("Last 90 Days")
+        btn_90.clicked.connect(lambda: self.set_quick_range(90))
+        topbar.addWidget(btn_90)
+
+        btn_all = QPushButton("All Time")
+        btn_all.clicked.connect(lambda: self.set_quick_range(9999))
+        topbar.addWidget(btn_all)
+
+        self.start_date_edit = QLineEdit((datetime.now()-timedelta(days=30)).strftime("%Y-%m-%d"))
+        self.end_date_edit = QLineEdit(datetime.now().strftime("%Y-%m-%d"))
+        topbar.addWidget(self.start_date_edit)
+        topbar.addWidget(self.end_date_edit)
+
+        btn_update = QPushButton("Update Timeline")
+        btn_update.clicked.connect(self.update_data_filters)
+        topbar.addWidget(btn_update)
+
+        btn_export = QPushButton("Export PDF")
+        btn_export.clicked.connect(self.export_dashboard_pdf)
+        topbar.addWidget(btn_export)
+
+        # Tab widget for 8 charts
+        self.chart_tab = QTabWidget()
+        main_layout.addWidget(self.chart_tab)
+
+        # Create placeholders for the 8 charts
+        self.frames = {}
+        chart_names = [
+            "Heatmap","Lollipop","Circular","Scatter",
+            "Radar","Normal Pie","Normal Bar","Band Chart"
+        ]
+        for nm in chart_names:
+            w = QWidget()
+            wlay = QVBoxLayout(w)
+            self.chart_tab.addTab(w, nm)
+            self.frames[nm] = w
+
+        self.setLayout(main_layout)
+
+    def set_quick_range(self, days: int):
+        if days>9000:
+            self.start_date_edit.setText("1900-01-01")
+            self.end_date_edit.setText("2100-12-31")
+        else:
+            dt_end = datetime.now()
+            dt_start = dt_end - timedelta(days=days)
+            self.start_date_edit.setText(dt_start.strftime("%Y-%m-%d"))
+            self.end_date_edit.setText(dt_end.strftime("%Y-%m-%d"))
+        self.update_data_filters()
+
+    def show_filter_popup(self, col: str):
+        base_df = self.df_history if not self.df_history.empty else self.df_current
+        if base_df.empty or col not in base_df.columns:
+            return
+        # Unique values
+        unique_vals = base_df[col].dropna().unique()
+        sorted_vals = sorted(unique_vals, key=lambda x: str(x).lower())
+        if col == "Dimension":
+            current_set = self.selected_dims
+        else:
+            current_set = self.selected_attrs
+        if not current_set:
+            current_set = set(sorted_vals)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Filter: {col}")
+        dlay = QVBoxLayout(dialog)
+
+        chk_all = QCheckBox("Select All")
+        dlay.addWidget(chk_all)
+
+        scroll = QScrollArea()
+        sw = QWidget()
+        swlay = QVBoxLayout(sw)
+        scroll.setWidget(sw)
+        scroll.setWidgetResizable(True)
+        dlay.addWidget(scroll)
+
+        cbs = {}
+        for val in sorted_vals:
+            cb = QCheckBox(str(val))
+            cb.setChecked(val in current_set)
+            swlay.addWidget(cb)
+            cbs[val] = cb
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        dlay.addWidget(btn_box)
+
+        def on_all(state):
+            c = (state == Qt.Checked)
+            for v in cbs.values():
+                v.setChecked(c)
+
+        chk_all.stateChanged.connect(on_all)
+
+        def on_ok():
+            sel = set()
+            for vx, cbox in cbs.items():
+                if cbox.isChecked():
+                    sel.add(vx)
+            if col == "Dimension":
+                self.selected_dims = sel
+            else:
+                self.selected_attrs = sel
+            dialog.accept()
+            self.update_data_filters()
+
+        def on_cancel():
+            dialog.reject()
+
+        btn_box.accepted.connect(on_ok)
+        btn_box.rejected.connect(on_cancel)
+        dialog.exec()
+
+    def update_data(self, df_current: pd.DataFrame, df_history: pd.DataFrame):
+        self.df_current = df_current.copy()
+        self.df_history = df_history.copy()
+        self.update_data_filters()
+
+    def update_data_filters(self):
+        dfc = self.df_current.copy()
+        if not dfc.empty:
+            # dimension, attribute
+            if self.selected_dims:
+                dfc = dfc[dfc["Dimension"].isin(self.selected_dims)]
+            if self.selected_attrs:
+                dfc = dfc[dfc["Attribute"].isin(self.selected_attrs)]
+            # date range
+            if "RunDate" in dfc.columns:
+                try:
+                    st = datetime.strptime(self.start_date_edit.text(), "%Y-%m-%d")
+                    en = datetime.strptime(self.end_date_edit.text(), "%Y-%m-%d")
+                    dfc["RunDate_dt"] = pd.to_datetime(dfc["RunDate"], errors="coerce")
+                    dfc = dfc[(dfc["RunDate_dt"] >= st) & (dfc["RunDate_dt"] <= en)]
+                except Exception as e:
+                    logging.error(f"Date filter error => {e}")
+
+        # Metrics
+        mismatch = len(dfc)
+        dims = dfc["Dimension"].nunique() if not dfc.empty else 0
+        self.metric_label.setText(f"Mismatches: {mismatch}, Dims: {dims}")
+
+        # Plot
+        self.plotHeatmap(dfc)
+        self.plotLollipop(dfc)
+        self.plotCircular(dfc)
+        self.plotScatter(dfc)
+        self.plotRadar(dfc)
+        self.plotNormalPie(dfc)
+        self.plotNormalBar(dfc)
+        self.plotBandChart()
+
+    def clear_layout(self, w: QWidget):
+        lay = w.layout()
+        if lay is not None:
+            while lay.count():
+                item = lay.takeAt(0)
+                wid = item.widget()
+                if wid:
+                    wid.setParent(None)
+
+    # ----- 8 charts -----
+    def plotHeatmap(self, dfc: pd.DataFrame):
+        w = self.frames["Heatmap"]
+        self.clear_layout(w)
+        if dfc.empty or "Missing In" not in dfc.columns:
+            return
+        df_m = dfc[dfc["Missing In"]!=""]
+        if df_m.empty or not {"Dimension","Attribute"}.issubset(df_m.columns):
+            return
+        pivot = df_m.groupby(["Dimension","Attribute"]).size().unstack(fill_value=0)
+        fig, ax = plt.subplots(figsize=(6,5))
+        cax = ax.imshow(pivot, aspect="auto", cmap="Reds")
+        ax.set_xticks(range(len(pivot.columns)))
+        ax.set_xticklabels(pivot.columns, rotation=90)
+        ax.set_yticks(range(len(pivot.index)))
+        ax.set_yticklabels(pivot.index)
+        fig.colorbar(cax, ax=ax)
+        ax.set_title("Heatmap: Missing Items")
+
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        canvas = FigureCanvasQTAgg(fig)
+        w.layout().addWidget(canvas)
+
+    def plotLollipop(self, dfc: pd.DataFrame):
+        w = self.frames["Lollipop"]
+        self.clear_layout(w)
+        if dfc.empty or "Missing In" not in dfc.columns:
+            return
+        df_m = dfc[dfc["Missing In"]!=""]
+        if df_m.empty:
+            return
+        cdim= df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False).head(10)
+        if cdim.empty:
+            return
+        fig, ax= plt.subplots(figsize=(6,5))
+        ax.hlines(y=cdim.index, xmin=0, xmax=cdim.values, color="skyblue")
+        ax.plot(cdim.values, cdim.index, "o", color="skyblue")
+        ax.set_title("Lollipop: Missing Dimensions")
+        ax.set_xlabel("Missing Count")
+
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        canvas = FigureCanvasQTAgg(fig)
+        w.layout().addWidget(canvas)
+
+    def plotCircular(self, dfc: pd.DataFrame):
+        w = self.frames["Circular"]
+        self.clear_layout(w)
+        if dfc.empty or "Missing In" not in dfc.columns:
+            return
+        df_m = dfc[dfc["Missing In"]!=""]
+        if df_m.empty:
+            return
+        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
+        if cattr.empty:
+            return
+        cat = cattr.index.tolist()
+        val = cattr.values
+        angles = np.linspace(0, 2*np.pi, len(cat), endpoint=False)
+        fig= plt.figure(figsize=(6,6))
+        ax= fig.add_subplot(111, polar=True)
+        ax.set_theta_offset(np.pi/2)
+        ax.set_theta_direction(-1)
+        ax.set_xticks(angles)
+        ax.set_xticklabels(cat, fontsize=9)
+        ax.bar(angles, val, width=0.4, color="orange", alpha=0.6)
+        ax.set_title("Circular: Missing Attributes", y=1.05)
+
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        canvas = FigureCanvasQTAgg(fig)
+        w.layout().addWidget(canvas)
+
+    def plotScatter(self, dfc: pd.DataFrame):
+        w = self.frames["Scatter"]
+        self.clear_layout(w)
+        if dfc.empty or "Missing In" not in dfc.columns:
+            return
+        df_m= dfc[dfc["Missing In"]!=""]
+        if df_m.empty:
+            return
+        cdim= df_m.groupby("Dimension")["Key"].count().reset_index(name="Count")
+        cdim.sort_values("Count", ascending=False, inplace=True)
+        if cdim.empty:
+            return
+        xvals= np.arange(len(cdim))
+        yvals= cdim["Count"].values
+        labels= cdim["Dimension"].values
+        fig, ax= plt.subplots(figsize=(6,5))
+        ax.scatter(xvals,yvals,color="green")
+        for i, txt in enumerate(labels):
+            ax.text(xvals[i], yvals[i], txt, ha="center", va="bottom", rotation=60)
+        ax.set_xticks([])
+        ax.set_ylabel("Missing Count")
+        ax.set_title("Scatter: Missing by Dimension")
+
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        canvas = FigureCanvasQTAgg(fig)
+        w.layout().addWidget(canvas)
+
+    def plotRadar(self, dfc: pd.DataFrame):
+        w = self.frames["Radar"]
+        self.clear_layout(w)
+        if dfc.empty or "Missing In" not in dfc.columns:
+            return
+        df_m= dfc[dfc["Missing In"]!=""]
+        if df_m.empty:
+            return
+        cdim= df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False).head(5)
+        if cdim.empty:
+            return
+        cat= cdim.index.tolist()
+        val= cdim.values.tolist()
+        N= len(cat)
+        angles= np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
+        angles+= angles[:1]
+        val+= val[:1]
+        fig= plt.figure(figsize=(6,6))
+        ax= fig.add_subplot(111, polar=True)
+        ax.set_theta_offset(np.pi/2)
+        ax.set_theta_direction(-1)
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(cat, fontsize=9)
+        ax.plot(angles, val, color="red", linewidth=2)
+        ax.fill(angles, val, color="red", alpha=0.3)
+        ax.set_title("Radar: top 5 missing dims", y=1.08)
+
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        canvas = FigureCanvasQTAgg(fig)
+        w.layout().addWidget(canvas)
+
+    def plotNormalPie(self, dfc: pd.DataFrame):
+        w = self.frames["Normal Pie"]
+        self.clear_layout(w)
+        if dfc.empty or "Missing In" not in dfc.columns:
+            return
+        df_m= dfc[dfc["Missing In"]!=""]
+        if df_m.empty:
+            return
+        dist= df_m["Missing In"].value_counts()
+        fig, ax= plt.subplots(figsize=(5,5))
+        ax.pie(dist.values, labels=dist.index, autopct="%.1f%%", startangle=140)
+        ax.set_title("Pie: Missing In distribution")
+
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        canvas = FigureCanvasQTAgg(fig)
+        w.layout().addWidget(canvas)
+
+    def plotNormalBar(self, dfc: pd.DataFrame):
+        w = self.frames["Normal Bar"]
+        self.clear_layout(w)
+        if dfc.empty or "Missing In" not in dfc.columns:
+            return
+        df_m= dfc[dfc["Missing In"]!=""]
+        if df_m.empty:
+            return
+        cattr= df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
+        fig, ax= plt.subplots(figsize=(6,4))
+        cattr.plot(kind="bar", ax=ax, color="blue")
+        ax.set_ylabel("Missing Count")
+        ax.set_title("Bar: top 10 missing attributes")
+
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        canvas = FigureCanvasQTAgg(fig)
+        w.layout().addWidget(canvas)
+
+    def plotBandChart(self):
+        w = self.frames["Band Chart"]
+        self.clear_layout(w)
+        if self.df_history.empty or "RunDate" not in self.df_history.columns:
+            return
+        date_ct= self.df_history.groupby("RunDate")["Key"].count().reset_index(name="Count")
+        date_ct.sort_values("RunDate", inplace=True)
+        date_ct["Count_min"] = date_ct["Count"]*0.9
+        date_ct["Count_max"] = date_ct["Count"]*1.1
+        fig, ax= plt.subplots(figsize=(6,4))
+        ax.plot(date_ct["RunDate"], date_ct["Count"], color="purple", marker="o", label="Missing Count")
+        ax.fill_between(date_ct["RunDate"], date_ct["Count_min"], date_ct["Count_max"],
+                        color="purple", alpha=0.2, label="±10% band")
+        ax.set_title("Band Chart Over Time")
+        ax.set_xlabel("RunDate")
+        ax.set_ylabel("Missing Count")
+        plt.xticks(rotation=45)
+        ax.legend()
+        for i, row in date_ct.iterrows():
+            ax.text(row["RunDate"], row["Count"], str(row["Count"]), ha="center", va="bottom")
+
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        canvas = FigureCanvasQTAgg(fig)
+        w.layout().addWidget(canvas)
+
+    def export_dashboard_pdf(self):
+        """
+        Ask user for a PDF path, then export cover page, dimension stats, attribute stats, all charts
+        """
+        # Browse for PDF path
+        dlg = QFileDialog(self, "Select PDF export file", str(self.config_dict["paths"].get("PDF_EXPORT_PATH","")), "PDF Files (*.pdf);;All Files (*)")
+        dlg.setAcceptMode(QFileDialog.AcceptSave)
+        if dlg.exec():
+            pdf_path = dlg.selectedFiles()[0]
+        else:
+            return
+
+        dfc = self.df_current.copy()
+        # Create PDF
+        with PdfPages(pdf_path) as pdf:
+            # Cover page
+            plt.figure(figsize=(8.5, 11))
+            plt.axis('off')
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            plt.text(0.5, 0.8, "Reconciliation Dashboard Report", ha='center', fontsize=20)
+            plt.text(0.5, 0.7, f"Generated: {timestamp}", ha='center')
+            if not dfc.empty:
+                plt.text(0.5, 0.6, f"Records in Current Run: {len(dfc)}", ha='center')
+            pdf.savefig()
+            plt.close()
+
+            # Summaries
+            # 1) Dimension / Attribute stats
+            if not dfc.empty:
+                dim_ct = dfc["Dimension"].nunique()
+                attr_ct = dfc["Attribute"].nunique()
+            else:
+                dim_ct = 0
+                attr_ct = 0
+            plt.figure(figsize=(8.5, 11))
+            plt.axis('off')
+            lines = [
+                f"Total mismatches in current filtered data: {len(dfc)}",
+                f"Unique Dimensions: {dim_ct}",
+                f"Unique Attributes: {attr_ct}"
+            ]
+            for i, line in enumerate(lines):
+                plt.text(0.1, 0.8 - i*0.05, line, fontsize=14)
+            pdf.savefig()
+            plt.close()
+
+            # Then each chart from the 8 frames
+            for nm, wid in self.frames.items():
+                lay = wid.layout()
+                if lay is None:
+                    continue
+                for i in range(lay.count()):
+                    item = lay.itemAt(i)
+                    c = item.widget()
+                    # If it's a matplotlib canvas, export
+                    if hasattr(c, 'figure'):
+                        pdf.savefig(c.figure)
+
+        QMessageBox.information(self, "Success", f"PDF exported to: {pdf_path}")
+
+
+# ==============================================
+# 6) MAIN WINDOW
+# ==============================================
+class UltraMegaWindow(QMainWindow):
+    """
+    iOS-style main window with a bottom log box and status bar (memory usage),
+    plus a ScrollableTabWidget for config, ERP, Master, Compare, Dashboard.
+    """
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("📊 Ultra-Mega Reconciliation (iOS-style)")
+
+        # Attempt to load config and param
+        self.config_dict = load_config(Path(DEFAULT_PATHS["CONFIG_PATH"]))
+        self.param_dict = read_param_file(Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"])))
+        self.history_df = pd.DataFrame()  # store multiple runs
+
+        # Main layout
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(0,0,0,0)
+        main_layout.setSpacing(0)
+
+        # iOS-style tab widget
+        self.tab_widget = ScrollableTabWidget()
+        main_layout.addWidget(self.tab_widget, stretch=1)
+
+        # 1) Paths tab
+        self.w_paths = QWidget()
+        self.build_paths_tab(self.w_paths)
+        self.tab_widget.addTab(self.w_paths, "Paths", "⚙️")
+
+        # 2) ERP tab
+        self.w_erp = QWidget()
+        self.erp_preview = PreviewTable(self.w_erp, "ERP")
+        lay_erp = QVBoxLayout(self.w_erp)
+        lay_erp.addWidget(self.erp_preview)
+        self.tab_widget.addTab(self.w_erp, "ERP", "💼")
+
+        # 3) Master tab
+        self.w_master = QWidget()
+        self.master_preview = PreviewTable(self.w_master, "Master")
+        lay_master = QVBoxLayout(self.w_master)
+        lay_master.addWidget(self.master_preview)
+        self.tab_widget.addTab(self.w_master, "Master", "📦")
+
+        # 4) Compare tab
+        self.w_compare = QWidget()
+        self.build_compare_tab(self.w_compare)
+        self.tab_widget.addTab(self.w_compare, "Compare", "🔍")
+
+        # 5) Dashboard
+        self.dashboard = AdvancedDashboard(None, self.config_dict)
+        dash_container = QWidget()
+        dash_lay = QVBoxLayout(dash_container)
+        dash_lay.addWidget(self.dashboard)
+        self.tab_widget.addTab(dash_container, "Dashboard", "📈")
+
+        # Logging box
+        self.log_box = QPlainTextEdit()
+        self.log_box.setReadOnly(True)
+        main_layout.addWidget(self.log_box, stretch=0)
+
+        # Attach logging handler
+        class QtLogHandler(logging.Handler):
+            def __init__(self, editor: QPlainTextEdit):
+                super().__init__()
+                self.editor = editor
+            def emit(self, record):
+                msg = self.format(record) + "\n"
+                self.editor.appendPlainText(msg)
+        handler = QtLogHandler(self.log_box)
+        handler.setLevel(logging.INFO)
+        logging.getLogger().addHandler(handler)
+
+        # Status bar
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_label = QLabel("Ready")
+        self.status_bar.addWidget(self.status_label)
+        self.memory_label = QLabel("")
+        self.status_bar.addPermanentWidget(self.memory_label)
+
+        self.update_memory_usage()
+        self.mem_timer = QTimer(self)
+        self.mem_timer.timeout.connect(self.update_memory_usage)
+        self.mem_timer.start(1000)
+
+        # Create directories if needed
+        csv_dir = Path(self.config_dict["paths"].get("MASTER_CSV_OUTPUT","temp_master_csv"))
+        csv_dir.mkdir(parents=True, exist_ok=True)
+
+        # Auto load meltdown
+        self.refresh_erp()
+        self.refresh_master()
+
+        # Keyboard shortcuts
+        self.setup_shortcuts()
+
+        # Session management
+        self.load_session()
+
+    def build_paths_tab(self, parent: QWidget):
+        lay = QVBoxLayout(parent)
+        lay.setContentsMargins(10,10,10,10)
+        lbl = QLabel("Paths / Config")
+        lbl.setStyleSheet("font-weight: bold; font-size: 16px;")
+        lay.addWidget(lbl)
+
+        form = QFormLayout()
+        lay.addLayout(form)
+
+        self.erp_var = QLineEdit(self.config_dict["paths"].get("ERP_EXCEL_PATH", DEFAULT_PATHS["ERP_EXCEL_PATH"]))
+        form.addRow("ERP Excel Path:", self.erp_var)
+
+        self.mast_var = QLineEdit(self.config_dict["paths"].get("MASTER_ZIP_PATH", DEFAULT_PATHS["MASTER_ZIP_PATH"]))
+        form.addRow("Master ZIP Path:", self.mast_var)
+
+        self.exc_var = QLineEdit(self.config_dict["paths"].get("EXCEPTION_PATH", DEFAULT_PATHS["EXCEPTION_PATH"]))
+        form.addRow("Exception Path:", self.exc_var)
+
+        self.out_var = QLineEdit(self.config_dict["paths"].get("OUTPUT_PATH", DEFAULT_PATHS["OUTPUT_PATH"]))
+        form.addRow("Missing Items Output:", self.out_var)
+
+        self.cfg_var = QLineEdit(self.config_dict["paths"].get("CONFIG_PATH", DEFAULT_PATHS["CONFIG_PATH"]))
+        form.addRow("JSON Config Path:", self.cfg_var)
+
+        self.par_var = QLineEdit(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"]))
+        form.addRow("Parameter File:", self.par_var)
+
+        self.csv_var = QLineEdit(self.config_dict["paths"].get("MASTER_CSV_OUTPUT", DEFAULT_PATHS["MASTER_CSV_OUTPUT"]))
+        form.addRow("Master CSV Folder:", self.csv_var)
+
+        bf = QHBoxLayout()
+        lay.addLayout(bf)
+        btn_save = QPushButton("Save Config")
+        btn_save.clicked.connect(self.save_all_config)
+        bf.addWidget(btn_save)
+
+        btn_erp = QPushButton("Refresh ERP")
+        btn_erp.clicked.connect(self.refresh_erp)
+        bf.addWidget(btn_erp)
+
+        btn_master = QPushButton("Refresh Master")
+        btn_master.clicked.connect(self.refresh_master)
+        bf.addWidget(btn_master)
+
+        lay.addStretch()
+
+    def build_compare_tab(self, parent: QWidget):
+        lay = QVBoxLayout(parent)
+        lay.setContentsMargins(10,10,10,10)
+
+        lbl = QLabel("Compare / Reconciliation")
+        lbl.setStyleSheet("font-weight: bold; font-size: 16px;")
+        lay.addWidget(lbl)
+
+        btn_all = QPushButton("🔄 Refresh All Data")
+        btn_all.clicked.connect(self.refresh_all_data)
+        lay.addWidget(btn_all)
+
+        lbl2 = QLabel("Generate Missing Items Report")
+        lbl2.setStyleSheet("font-size: 14px; font-weight: bold;")
+        lay.addWidget(lbl2)
+
+        btn_run = QPushButton("Run Reconciliation")
+        btn_run.clicked.connect(self.run_comparison)
+        lay.addWidget(btn_run)
+
+        self.last_run_label = QLabel("Last Run: Never")
+        lay.addWidget(self.last_run_label)
+
+        lay.addStretch()
+
+    def setup_shortcuts(self):
+        # Ctrl+R => refresh all
+        act_refresh = QAction(self)
+        act_refresh.setShortcut(QKeySequence("Ctrl+R"))
+        act_refresh.triggered.connect(self.refresh_all_data)
+        self.addAction(act_refresh)
+
+        # Ctrl+S => save config
+        act_save = QAction(self)
+        act_save.setShortcut(QKeySequence("Ctrl+S"))
+        act_save.triggered.connect(self.save_all_config)
+        self.addAction(act_save)
+
+        # Ctrl+E => export PDF
+        act_export = QAction(self)
+        act_export.setShortcut(QKeySequence("Ctrl+E"))
+        def do_pdf():
+            self.dashboard.export_dashboard_pdf()
+        act_export.triggered.connect(do_pdf)
+        self.addAction(act_export)
+
+        # F5 => refresh all
+        act_f5 = QAction(self)
+        act_f5.setShortcut(QKeySequence(Qt.Key_F5))
+        act_f5.triggered.connect(self.refresh_all_data)
+        self.addAction(act_f5)
+
+    def refresh_erp(self):
+        p = Path(self.config_dict["paths"].get("ERP_EXCEL_PATH", DEFAULT_PATHS["ERP_EXCEL_PATH"])).resolve()
+        raw_erp = read_erp_excel(p)
+        if raw_erp.empty:
+            self.erp_preview.set_data(pd.DataFrame())
+            return
+        param = {
+            "dim_erp_keep": self.param_dict.get("dim_erp_keep", set()),
+            "dim_erp_map": self.param_dict.get("dim_erp_map", {}),
+            "attr_erp_map": self.param_dict.get("attr_erp_map", {})
+        }
+        melted = meltdown_erp_for_preview(raw_erp, param)
+        pivoted = pivot_for_preview(melted)
+        self.erp_preview.set_data(pivoted)
+
+    def refresh_master(self):
+        zpath = Path(self.config_dict["paths"].get("MASTER_ZIP_PATH", DEFAULT_PATHS["MASTER_ZIP_PATH"])).resolve()
+        outdir = Path(self.config_dict["paths"].get("MASTER_CSV_OUTPUT", DEFAULT_PATHS["MASTER_CSV_OUTPUT"])).resolve()
+        csvs = convert_master_txt_to_csv(zpath, outdir)
+        raw_mast = unify_master_csvs(csvs)
+        if raw_mast.empty:
+            self.master_preview.set_data(pd.DataFrame())
+            return
+        param = {
+            "dim_master_map": self.param_dict.get("dim_master_map", {}),
+            "attr_master_map": self.param_dict.get("attr_master_map", {})
+        }
+        melted = meltdown_master_for_preview(raw_mast, param)
+        pivoted = pivot_for_preview(melted)
+        self.master_preview.set_data(pivoted)
+
+    def refresh_all_data(self):
+        try:
+            self.param_dict = read_param_file(
+                Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"]))
+            )
+            self.refresh_erp()
+            self.refresh_master()
+            now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.last_run_label.setText(f"Last Refresh: {now_s}")
+            QMessageBox.information(self, "Success", "All data refreshed successfully!")
+        except Exception as e:
+            logging.error(f"Error refreshing data: {e}")
+            QMessageBox.critical(self, "Error", f"Error: {str(e)}")
+
+    def run_comparison(self):
+        df_erp_wide = self.erp_preview.get_filtered_df()
+        df_mast_wide = self.master_preview.get_filtered_df()
+
+        erp_long = melt_back(df_erp_wide)
+        erp_long = build_keys(erp_long)
+        mast_long= melt_back(df_mast_wide)
+        mast_long= build_keys(mast_long)
+
+        diff = compare_mode2(erp_long, mast_long)
+        exc_path= Path(self.config_dict["paths"].get("EXCEPTION_PATH", DEFAULT_PATHS["EXCEPTION_PATH"])).resolve()
+        df_exc= read_exception_table(exc_path)
+        final= merge_exceptions(diff, df_exc)
+
+        outp= Path(self.config_dict["paths"].get("OUTPUT_PATH", DEFAULT_PATHS["OUTPUT_PATH"])).resolve()
+        write_missing_items(final, outp)
+
+        # Update dashboard
+        run_date= datetime.now().strftime("%Y-%m-%d")
+        final["RunDate"] = run_date
+        if self.history_df.empty:
+            self.history_df = final.copy()
+        else:
+            self.history_df = pd.concat([self.history_df, final], ignore_index=True)
+
+        self.dashboard.update_data(final, self.history_df)
+        now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.last_run_label.setText(f"Last Run: {now_s}")
+
+        # Switch to dashboard tab
+        self.tab_widget.setCurrentIndex(self.tab_widget.current_index + 1)  # or find the dashboard index
+        QMessageBox.information(self, "Done", f"Missing items => {outp}")
+
+    def save_all_config(self):
+        self.config_dict["paths"]["ERP_EXCEL_PATH"] = self.erp_var.text().strip()
+        self.config_dict["paths"]["MASTER_ZIP_PATH"] = self.mast_var.text().strip()
+        self.config_dict["paths"]["EXCEPTION_PATH"] = self.exc_var.text().strip()
+        self.config_dict["paths"]["OUTPUT_PATH"] = self.out_var.text().strip()
+        self.config_dict["paths"]["CONFIG_PATH"] = self.cfg_var.text().strip()
+        self.config_dict["paths"]["PARAMETER_PATH"] = self.par_var.text().strip()
+        self.config_dict["paths"]["MASTER_CSV_OUTPUT"] = self.csv_var.text().strip()
+
+        save_config(self.config_dict, Path(self.config_dict["paths"]["CONFIG_PATH"]))
+        QMessageBox.information(self, "Saved", "Config saved successfully.")
+
+    def update_memory_usage(self):
+        if psutil:
+            process = psutil.Process()
+            mem_mb = process.memory_info().rss / (1024*1024)
+            self.memory_label.setText(f"Memory: {mem_mb:.1f} MB")
+        else:
+            self.memory_label.setText("psutil not installed")
+
+    # ---------------------------
+    # SESSION MANAGEMENT
+    # ---------------------------
+    def save_session(self):
+        session = {
+            'config': self.config_dict,
+            'filters': {
+                'erp': list(self.erp_preview.filters.items()),
+                'master': list(self.master_preview.filters.items()),
+            },
+            'selected_dims': list(self.dashboard.selected_dims),
+            'selected_attrs': list(self.dashboard.selected_attrs),
+            'date_range': {
+                'start': self.dashboard.start_date_edit.text(),
+                'end': self.dashboard.end_date_edit.text()
+            }
+        }
+        cfg_path = Path(self.config_dict["paths"].get("CONFIG_PATH", DEFAULT_PATHS["CONFIG_PATH"]))
+        session_file = cfg_path.parent / "last_session.json"
+        try:
+            with open(session_file, 'w', encoding='utf-8') as f:
+                json.dump(session, f, indent=2)
+            logging.info(f"Session saved to {session_file}")
+        except Exception as e:
+            logging.error(f"Error saving session: {e}")
+
+    def load_session(self):
+        cfg_path = Path(self.config_dict["paths"].get("CONFIG_PATH", DEFAULT_PATHS["CONFIG_PATH"]))
+        session_file = cfg_path.parent / "last_session.json"
+        if session_file.is_file():
+            try:
+                with open(session_file, 'r', encoding='utf-8') as f:
+                    sess = json.load(f)
+                self.config_dict = sess['config']
+                # restore table filters
+                erp_filters = dict(sess['filters']['erp'])
+                mast_filters = dict(sess['filters']['master'])
+                self.erp_preview.filters = erp_filters
+                self.master_preview.filters = mast_filters
+
+                # restore dash filters
+                self.dashboard.selected_dims = set(sess['selected_dims'])
+                self.dashboard.selected_attrs = set(sess['selected_attrs'])
+                dr = sess['date_range']
+                self.dashboard.start_date_edit.setText(dr['start'])
+                self.dashboard.end_date_edit.setText(dr['end'])
+
+                logging.info("Session loaded.")
+            except Exception as e:
+                logging.error(f"Error loading session: {e}")
+
+    def closeEvent(self, event: QCloseEvent):
+        self.save_session()
+        super().closeEvent(event)
+
+
+# ==============================================
+# 7) MAIN
+# ==============================================
+def main():
+    app = QApplication(sys.argv)
+
+    # Optionally set an iOS-style font if you have it (e.g. "SF Pro")
+    # font_id = QFontDatabase.addApplicationFont("SF-Pro-Text-Regular.otf")
+    # if font_id != -1:
+    #     families = QFontDatabase.applicationFontFamilies(font_id)
+    #     if families:
+    #         app.setFont(QFont(families[0], 10))
+
+    win = UltraMegaWindow()
+    win.resize(1600, 900)
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

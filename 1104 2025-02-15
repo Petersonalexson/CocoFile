@@ -7,11 +7,17 @@ This version includes:
   - PDF export: Each PDF page is letter size (8.5×11 in) with a 1-inch margin,
     so the chart is plotted in one single axes covering the page (without a nested chart).
   - Run history is stored in the JSON config for the Band Chart.
-  
-Key Enhancements:
-  1. Matplotlib is embedded into the Tkinter (CustomTkinter) UI using FigureCanvasTkAgg.
-  2. Filtering of “Start Date” and “End Date” is performed in the meltdown functions using a helper 
-     (strip_t) to remove any time-part (everything after a "T") from ISO datetime strings.
+
+Additional Details:
+  - The dashboard uses Matplotlib embedded in a Tkinter (with CustomTkinter enhancements)
+    interface to display charts. In particular, the code imports Matplotlib and then uses
+    the FigureCanvasTkAgg from matplotlib.backends.backend_tkagg to integrate Matplotlib figures
+    into the Tkinter UI.
+  - For filtering the “Start Date” and “End Date” values in the ERP and Master previews,
+    the code “melts” (reshapes) the DataFrame and then applies a filtering function.
+    The helper function `strip_t` checks if the value contains a "T" (common in ISO datetime strings)
+    and splits the string at that point to keep only the date part. This filtering is applied only
+    to rows where the attribute is "Start Date" or "End Date", using NumPy’s np.where.
 """
 
 import os
@@ -34,6 +40,7 @@ import pandas as pd
 import numpy as np
 
 import matplotlib
+# Use TkAgg backend to integrate with Tkinter
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -70,6 +77,7 @@ DEFAULT_PATHS = {
     "CONFIG_PATH": "config/ui_config.json",
     "PARAMETER_PATH": "data/parameters.xlsx",
     "MASTER_CSV_OUTPUT": "temp_master_csv",
+    # For PDF export, we store the directory (our script will timestamp the filename)
     "PDF_EXPORT_PATH": "output/dashboard_reports",
     "LOGO_PATH": "images/company_logo.png"
 }
@@ -79,7 +87,8 @@ def default_config() -> Dict:
         "paths": DEFAULT_PATHS.copy(),
         "erp_grid": {"filters": {}},
         "master_grid": {"filters": {}},
-        "run_history": []  # list of dicts: {"date": ..., "missing": ...}
+        # run_history will be a list of dicts with run timestamp and count
+        "run_history": []
     }
 
 def load_config(path: Path) -> Dict:
@@ -94,11 +103,18 @@ def load_config(path: Path) -> Dict:
 def save_config(cfg: Dict, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        # Convert sets to lists for JSON serialization.
+        # Convert sets -> lists in erp/master filters
         if "erp_grid" in cfg and "filters" in cfg["erp_grid"]:
-            cfg["erp_grid"]["filters"] = {col: list(vals) for col, vals in cfg["erp_grid"]["filters"].items()}
+            nf = {}
+            for col, svals in cfg["erp_grid"]["filters"].items():
+                nf[col] = list(svals)
+            cfg["erp_grid"]["filters"] = nf
         if "master_grid" in cfg and "filters" in cfg["master_grid"]:
-            cfg["master_grid"]["filters"] = {col: list(vals) for col, vals in cfg["master_grid"]["filters"].items()}
+            nf = {}
+            for col, svals in cfg["master_grid"]["filters"].items():
+                nf[col] = list(svals)
+            cfg["master_grid"]["filters"] = nf
+
         with open(path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
         logging.info(f"Saved config to {path}")
@@ -138,8 +154,7 @@ def read_param_file(path: Path) -> Dict[str, object]:
     try:
         dim_df = pd.read_excel(path, sheet_name="Dimension Parameters")
         dim_df.columns = dim_df.columns.astype(str).str.strip()
-        def s(x): 
-            return str(x).strip() if pd.notna(x) else ""
+        def s(x): return str(x).strip() if pd.notna(x) else ""
         for _, row in dim_df.iterrows():
             fn = s(row.get("FileName", ""))
             vsc = s(row.get("V S C", ""))
@@ -282,13 +297,16 @@ def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.D
         melted["Name"] = ""
     melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
     melted["Attribute"] = melted["OrigAttr"].map(amap)
-    # Helper function to strip time from ISO datetime strings.
+    # --------------------------------------------------------------------------
+    # Date Filtering: Using the helper function strip_t with np.where to remove
+    # the time portion from ISO datetime strings for Start Date and End Date.
     def strip_t(val):
         if isinstance(val, str) and "T" in val:
             return val.split("T")[0]
         return val
     melted["Value"] = np.where(melted["Attribute"].isin(["Start Date", "End Date"]),
                                melted["ValX"].apply(strip_t), melted["ValX"])
+    # --------------------------------------------------------------------------
     return melted[["Dimension", "Name", "Attribute", "Value"]]
 
 def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.DataFrame:
@@ -321,12 +339,16 @@ def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> p
         melted["Name"] = ""
     melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
     melted["Attribute"] = melted["OrigAttr"].map(amap)
+    # --------------------------------------------------------------------------
+    # Date Filtering for Master: Apply strip_t to remove the time part for the 
+    # Start Date and End Date fields.
     def strip_t(val):
         if isinstance(val, str) and "T" in val:
             return val.split("T")[0]
         return val
     melted["Value"] = np.where(melted["Attribute"].isin(["Start Date", "End Date"]),
                                melted["ValX"].apply(strip_t), melted["ValX"])
+    # --------------------------------------------------------------------------
     return melted[["Dimension", "Name", "Attribute", "Value"]]
 
 def pivot_for_preview(df: pd.DataFrame) -> pd.DataFrame:

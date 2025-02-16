@@ -2,11 +2,15 @@
 """
 Ultra-Mega Reconciliation: Parameter-based with advanced Dashboard (8 charts).
 This version includes:
-  - Dashboard filters that correctly handle (NaN) for Start Date / End Date.
+  - ERP and Master preview filtering for Start Date / End Date (time parts removed).
   - A dashboard that shows 8 charts as before.
   - PDF export: Each PDF page is letter size (8.5×11 in) with a 1-inch margin,
-    so the chart is plotted in one single axes covering the page (without a nested chart).
+    so each chart is drawn on a single axes covering the page.
   - Run history is stored in the JSON config for the Band Chart.
+  
+Visual design:
+  - Top bars and buttons use a burgundy background (#800020) with white text.
+  - Main content areas use a light background with dark text.
 """
 
 import os
@@ -65,7 +69,6 @@ DEFAULT_PATHS = {
     "CONFIG_PATH": "config/ui_config.json",
     "PARAMETER_PATH": "data/parameters.xlsx",
     "MASTER_CSV_OUTPUT": "temp_master_csv",
-    # For PDF export, we store the directory (our script will timestamp the filename)
     "PDF_EXPORT_PATH": "output/dashboard_reports",
     "LOGO_PATH": "images/company_logo.png"
 }
@@ -75,7 +78,6 @@ def default_config() -> Dict:
         "paths": DEFAULT_PATHS.copy(),
         "erp_grid": {"filters": {}},
         "master_grid": {"filters": {}},
-        # run_history will be a list of dicts with run timestamp and count
         "run_history": []
     }
 
@@ -91,7 +93,6 @@ def load_config(path: Path) -> Dict:
 def save_config(cfg: Dict, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        # Convert sets -> lists in erp/master filters
         if "erp_grid" in cfg and "filters" in cfg["erp_grid"]:
             nf = {}
             for col, svals in cfg["erp_grid"]["filters"].items():
@@ -285,6 +286,7 @@ def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.D
         melted["Name"] = ""
     melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
     melted["Attribute"] = melted["OrigAttr"].map(amap)
+    # Remove time part from ISO datetime strings for Start Date and End Date.
     def strip_t(val):
         if isinstance(val, str) and "T" in val:
             return val.split("T")[0]
@@ -323,6 +325,7 @@ def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> p
         melted["Name"] = ""
     melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
     melted["Attribute"] = melted["OrigAttr"].map(amap)
+    # Remove time part from Start Date and End Date columns.
     def strip_t(val):
         if isinstance(val, str) and "T" in val:
             return val.split("T")[0]
@@ -495,13 +498,15 @@ class SimplePreview(ctk.CTkFrame):
         self.create_statusbar()
 
     def create_toolbar(self):
-        bar = ctk.CTkFrame(self, corner_radius=10, fg_color="#f0f0f0")
+        # Use burgundy background with white text for toolbar
+        bar = ctk.CTkFrame(self, corner_radius=10, fg_color="#800020")
         bar.pack(fill="x", padx=5, pady=5)
-        ctk.CTkLabel(bar, text=f"{self.name} Preview", fg_color="#800020", corner_radius=8).pack(side="left", padx=5)
+        ctk.CTkLabel(bar, text=f"{self.name} Preview", fg_color="#800020", text_color="white",
+                     corner_radius=8).pack(side="left", padx=5)
         ctk.CTkButton(bar, text="ⓘ", width=30, command=self.show_info,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
         ctk.CTkButton(bar, text="Clear Date Filters", command=self.clear_filters,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
 
     def show_info(self):
         messagebox.showinfo("Info", f"{self.name} data after meltdown & param.\nOnly Start/End Date columns are filterable.")
@@ -524,7 +529,7 @@ class SimplePreview(ctk.CTkFrame):
         self.status_label.pack(fill="x")
 
     def set_data(self, df: pd.DataFrame):
-        self.filters.clear()  # reset filters each time new data is set
+        self.filters.clear()
         self.df = df.copy()
         self.refresh_table()
 
@@ -549,7 +554,6 @@ class SimplePreview(ctk.CTkFrame):
 
     def apply_filters(self) -> pd.DataFrame:
         df_f = self.df.copy()
-        # For Start/End Date, if allowed contains NaN, include rows where the column is NaN or blank.
         for col, allowed in self.filters.items():
             if col in df_f.columns:
                 if col in {"Start Date", "End Date"}:
@@ -592,7 +596,7 @@ class SimplePreview(ctk.CTkFrame):
             for vb in var_dict.values():
                 vb.set(check)
         ctk.CTkCheckBox(frame, text="Select All", variable=selall_var, command=toggle_all,
-                        fg_color="#800020", hover_color="#a52a2a").pack(anchor="w", pady=5)
+                        fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(anchor="w", pady=5)
         scroll = ctk.CTkScrollableFrame(frame, width=250, height=250)
         scroll.pack(fill="both", expand=True, padx=5, pady=5)
         var_dict = {}
@@ -601,7 +605,7 @@ class SimplePreview(ctk.CTkFrame):
             bvar = tk.BooleanVar(value=in_filter)
             var_dict[rv] = bvar
             ctk.CTkCheckBox(scroll, text=display_map[rv], variable=bvar,
-                            fg_color="#800020", hover_color="#a52a2a").pack(anchor="w")
+                            fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(anchor="w")
         def apply_():
             sel = {rv for rv, vb in var_dict.items() if vb.get()}
             if sel == set(sorted_vals) or not sel:
@@ -613,9 +617,9 @@ class SimplePreview(ctk.CTkFrame):
         bf = ctk.CTkFrame(frame)
         bf.pack(fill="x", pady=5)
         ctk.CTkButton(bf, text="Apply", command=apply_,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
         ctk.CTkButton(bf, text="Cancel", command=popup.destroy,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
 
     def clear_filters(self):
         self.filters.clear()
@@ -629,9 +633,8 @@ class SimplePreview(ctk.CTkFrame):
 # ----------------------------------------------------------------------------
 class EnhancedPDFReport:
     """
-    Creates a PDF report with letter-sized pages (8.5×11 in). Each page (except the cover,
-    summary, and top dims/attrs) displays one chart in a single axes that fills the page with
-    1-inch margins.
+    Creates a PDF report with letter-sized pages (8.5×11 in). Each page displays one chart
+    in a single axes with a 1-inch margin.
     """
     def __init__(self, df_current: pd.DataFrame, df_history: pd.DataFrame, config: Dict):
         self.df_current = df_current
@@ -644,12 +647,10 @@ class EnhancedPDFReport:
             'background': '#FFFFFF'
         }
         self.logo_path = self.config["paths"].get("LOGO_PATH", "images/company_logo.png")
-        # For letter size at 72 dpi: 8.5×11 inches
         self.PAGE_WIDTH = 8.5
         self.PAGE_HEIGHT = 11
-        # Watermark: 1 inch from left, 1 inch from top
-        self.WATERMARK_X = 1  # in inches
-        self.WATERMARK_Y = 11 - 1  # in inches
+        self.WATERMARK_X = 1
+        self.WATERMARK_Y = 11 - 1
 
     def generate(self) -> Path:
         pdf_dir = Path(self.config["paths"].get("PDF_EXPORT_PATH"))
@@ -669,7 +670,6 @@ class EnhancedPDFReport:
             return
         try:
             img = plt.imread(self.logo_path)
-            # Convert inches to normalized figure coordinates:
             left = self.WATERMARK_X / self.PAGE_WIDTH
             top = 1 - (self.WATERMARK_Y / self.PAGE_HEIGHT)
             fig.figimage(img, xo=int(self.WATERMARK_X*72), yo=int((self.PAGE_HEIGHT - self.WATERMARK_Y)*72), alpha=0.15, zorder=10)
@@ -685,7 +685,7 @@ class EnhancedPDFReport:
 
     def _title_at_1inch(self, text, fontsize=18):
         fig = plt.gcf()
-        plt.text(0.5, 1 - (1/ self.PAGE_HEIGHT), text, ha='center', fontsize=fontsize, fontweight='bold',
+        plt.text(0.5, 1 - (1/self.PAGE_HEIGHT), text, ha='center', fontsize=fontsize, fontweight='bold',
                  color=self.colors['primary'], transform=fig.transFigure)
 
     def _add_cover_page(self, pdf: PdfPages):
@@ -732,12 +732,10 @@ class EnhancedPDFReport:
         plt.close(fig)
 
     def _add_chart_page(self, pdf: PdfPages, title: str, plot_func, **kwargs):
-        # Create a letter-size page with 1-inch margins all around.
         fig = plt.figure(figsize=(self.PAGE_WIDTH, self.PAGE_HEIGHT))
         self._title_at_1inch(title, fontsize=14)
-        # Define axes to occupy the area inside 1-inch margins:
-        left = 1 / self.PAGE_WIDTH
-        bottom = 1 / self.PAGE_HEIGHT
+        left = 1/self.PAGE_WIDTH
+        bottom = 1/self.PAGE_HEIGHT
         width = (self.PAGE_WIDTH - 2) / self.PAGE_WIDTH
         height = (self.PAGE_HEIGHT - 2) / self.PAGE_HEIGHT
         ax = fig.add_axes([left, bottom, width, height])
@@ -750,7 +748,6 @@ class EnhancedPDFReport:
         finally:
             plt.close(fig)
 
-    # Define individual plot functions (using similar methods as in the dashboard)
     def _plot_heatmap(self, ax, pivot):
         im = ax.imshow(pivot, aspect="auto", cmap="Reds")
         ax.set_xticks(range(len(pivot.columns)))
@@ -802,12 +799,32 @@ class EnhancedPDFReport:
             cattr = cattr.head(10)
         if not cattr.empty:
             self._add_chart_page(pdf, "Circular", self._plot_circular, cattr=cattr)
-        # For brevity, only Heatmap, Lollipop, Circular, and Band Chart are shown.
         if not self.df_history.empty and "RunDate" in self.df_history.columns:
             date_ct = self.df_history.groupby("RunDate")["Key"].count().reset_index(name="Count")
             date_ct.sort_values("RunDate", inplace=True)
             if not date_ct.empty:
                 self._add_chart_page(pdf, "Band Chart Over Time", self._plot_bandchart, date_ct=date_ct)
+
+    def export_dashboard_pdf(self):
+        pdf_dir = Path(self.master.config_dict["paths"].get("PDF_EXPORT_PATH"))
+        pdf_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pdf_path = pdf_dir / f"dashboard_report_{timestamp}.pdf"
+        with PdfPages(pdf_path) as pdf:
+            fig = plt.figure(figsize=(8.5, 11))
+            plt.axis('off')
+            plt.text(0.5, 0.8, "Reconciliation Dashboard Report", ha='center', fontsize=16)
+            plt.text(0.5, 0.7, f"Generated: {timestamp}", ha='center')
+            if not self.df_current.empty:
+                plt.text(0.5, 0.6, f"Records in Current Run: {len(self.df_current)}", ha='center')
+            pdf.savefig(fig)
+            plt.close(fig)
+            for key in self.frames:
+                frame = self.frames[key]
+                for widget in frame.winfo_children():
+                    if isinstance(widget, FigureCanvasTkAgg):
+                        pdf.savefig(widget.figure)
+        messagebox.showinfo("PDF Export", f"Dashboard exported to PDF:\n{pdf_path}")
 
 # ----------------------------------------------------------------------------
 # ADVANCED DASHBOARD
@@ -819,28 +836,30 @@ class AdvancedDashboard(ctk.CTkFrame):
         self.df_history = pd.DataFrame()
         self.selected_dims: Set[str] = set()
         self.selected_attrs: Set[str] = set()
-        # Flag to control top-N filtering; True = show Top N (e.g. top 10), False = show All.
+        # Flag to control Top N filtering; True = show Top N, False = show all data.
         self.top_n = True
 
-        topbar = ctk.CTkFrame(self, corner_radius=10, fg_color="#f0f0f0")
+        # Use burgundy background for top bar with white text.
+        topbar = ctk.CTkFrame(self, corner_radius=10, fg_color="#800020")
         topbar.pack(fill="x", padx=5, pady=5)
 
-        self.metric_label = ctk.CTkLabel(topbar, text="Metrics: 0 missing, 0 dimension", width=300)
+        self.metric_label = ctk.CTkLabel(topbar, text="Metrics: 0 missing, 0 dimension", width=300,
+                                         text_color="white")
         self.metric_label.pack(side="left", padx=5)
 
         ctk.CTkButton(topbar, text="Filter Dimension", command=self.show_dimension_filter,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
         ctk.CTkButton(topbar, text="Filter Attribute", command=self.show_attribute_filter,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
 
         ctk.CTkButton(topbar, text="Last 7 Days", command=lambda: self.set_quick_range(7),
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
         ctk.CTkButton(topbar, text="Last 30 Days", command=lambda: self.set_quick_range(30),
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
         ctk.CTkButton(topbar, text="Last 90 Days", command=lambda: self.set_quick_range(90),
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
         ctk.CTkButton(topbar, text="All Time", command=lambda: self.set_quick_range(9999),
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
 
         self.start_date_var = tk.StringVar(value=(datetime.now()-timedelta(days=30)).strftime("%Y-%m-%d"))
         self.end_date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
@@ -849,11 +868,11 @@ class AdvancedDashboard(ctk.CTkFrame):
         ctk.CTkEntry(topbar, textvariable=self.end_date_var, width=100).pack(side="left", padx=5)
 
         ctk.CTkButton(topbar, text="Update Timeline", command=self.update_data_filters,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
         ctk.CTkButton(topbar, text="Toggle Top 10 / All", command=self.toggle_top_n,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
         ctk.CTkButton(topbar, text="Export PDF", command=self.export_dashboard_pdf,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
@@ -866,7 +885,6 @@ class AdvancedDashboard(ctk.CTkFrame):
             self.frames[lbl] = fr
 
     def toggle_top_n(self):
-        # Toggle the flag between showing Top N and All data.
         self.top_n = not self.top_n
         state = "Top N" if self.top_n else "All"
         logging.info(f"Toggle Top 10 / All: Now showing {state} data")
@@ -918,7 +936,7 @@ class AdvancedDashboard(ctk.CTkFrame):
             for vb in var_dict.values():
                 vb.set(check)
         ctk.CTkCheckBox(frame, text="Select All", variable=selall_var, command=toggle_all,
-                        fg_color="#800020", hover_color="#a52a2a").pack(anchor="w", pady=5)
+                        fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(anchor="w", pady=5)
         scroll = ctk.CTkScrollableFrame(frame, width=250, height=250)
         scroll.pack(fill="both", expand=True, padx=5, pady=5)
         var_dict = {}
@@ -927,7 +945,7 @@ class AdvancedDashboard(ctk.CTkFrame):
             bvar = tk.BooleanVar(value=in_filter)
             var_dict[rv] = bvar
             ctk.CTkCheckBox(scroll, text=display_map[rv], variable=bvar,
-                            fg_color="#800020", hover_color="#a52a2a").pack(anchor="w")
+                            fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(anchor="w")
         def apply_():
             sel = {rv for rv, vb in var_dict.items() if vb.get()}
             if col == "Dimension":
@@ -939,9 +957,9 @@ class AdvancedDashboard(ctk.CTkFrame):
         bf = ctk.CTkFrame(frame)
         bf.pack(fill="x", pady=5)
         ctk.CTkButton(bf, text="Apply", command=apply_,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
         ctk.CTkButton(bf, text="Cancel", command=popup.destroy,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
 
     def update_data(self, df_current: pd.DataFrame, df_history: pd.DataFrame):
         self.df_current = df_current.copy()
@@ -1130,7 +1148,7 @@ class AdvancedDashboard(ctk.CTkFrame):
         fig, ax = plt.subplots(figsize=(6,4))
         cattr.plot(kind="bar", ax=ax, color="blue")
         ax.set_ylabel("Missing Count")
-        ax.set_title("Bar: Missing Attributes")
+        ax.set_title("Bar: Top 10 Missing Attributes")
         self.plot_chart(fr, fig)
 
     def plotBandChart(self):
@@ -1157,13 +1175,11 @@ class AdvancedDashboard(ctk.CTkFrame):
         self.plot_chart(fr, fig)
 
     def export_dashboard_pdf(self):
-        # Export all dashboard chart figures to a PDF.
         pdf_dir = Path(self.master.config_dict["paths"].get("PDF_EXPORT_PATH"))
         pdf_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         pdf_path = pdf_dir / f"dashboard_report_{timestamp}.pdf"
         with PdfPages(pdf_path) as pdf:
-            # Cover Page
             fig = plt.figure(figsize=(8.5, 11))
             plt.axis('off')
             plt.text(0.5, 0.8, "Reconciliation Dashboard Report", ha='center', fontsize=16)
@@ -1172,7 +1188,6 @@ class AdvancedDashboard(ctk.CTkFrame):
                 plt.text(0.5, 0.6, f"Records in Current Run: {len(self.df_current)}", ha='center')
             pdf.savefig(fig)
             plt.close(fig)
-            # For each chart frame, if it contains a FigureCanvasTkAgg, save its figure.
             for key in self.frames:
                 frame = self.frames[key]
                 for widget in frame.winfo_children():
@@ -1194,41 +1209,34 @@ class MainApp(ctk.CTk):
         self.param_dict = read_param_file(Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"])))
         self.history_df = pd.DataFrame()
 
-        # Initialize run_history in config if not present
         if "run_history" not in self.config_dict:
             self.config_dict["run_history"] = []
 
         self.tabs = ttk.Notebook(self)
         self.tabs.pack(fill="both", expand=True)
 
-        # Paths Tab
         self.tab_paths = ctk.CTkFrame(self.tabs)
         self.tabs.add(self.tab_paths, text="Paths")
         self.build_paths_tab(self.tab_paths)
 
-        # ERP Preview
         self.tab_erp = ctk.CTkFrame(self.tabs)
         self.erp_preview = SimplePreview(self.tab_erp, "ERP")
         self.erp_preview.pack(fill="both", expand=True)
         self.tabs.add(self.tab_erp, text="ERP Preview")
 
-        # Master Preview
         self.tab_master = ctk.CTkFrame(self.tabs)
         self.master_preview = SimplePreview(self.tab_master, "Master")
         self.master_preview.pack(fill="both", expand=True)
         self.tabs.add(self.tab_master, text="Master Preview")
 
-        # Compare
         self.tab_compare = ctk.CTkFrame(self.tabs)
         self.build_compare_tab(self.tab_compare)
         self.tabs.add(self.tab_compare, text="Compare")
 
-        # Dashboard
         self.dashboard_tab = AdvancedDashboard(self.tabs)
-        self.dashboard_tab.master = self  # so dashboard can refer back to MainApp
+        self.dashboard_tab.master = self
         self.tabs.add(self.dashboard_tab, text="Dashboard")
 
-        # Logging
         self.log_box = ctk.CTkTextbox(self, height=120)
         self.log_box.pack(fill="both")
         self.log_box.configure(state="disabled")
@@ -1244,7 +1252,6 @@ class MainApp(ctk.CTk):
         self.refresh_erp()
         self.refresh_master()
 
-        # Keyboard shortcuts and session management could be added here as needed.
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def add_status_bar(self):
@@ -1285,7 +1292,7 @@ class MainApp(ctk.CTk):
                 if p:
                     var.set(p)
             ctk.CTkButton(row, text="Browse", command=br,
-                          fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                          fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
         mkrow("ERP Excel:", self.erp_var)
         mkrow("Master ZIP:", self.mast_var)
         mkrow("Exception Path:", self.exc_var)
@@ -1296,11 +1303,11 @@ class MainApp(ctk.CTk):
         bf = ctk.CTkFrame(frm)
         bf.pack(fill="x", pady=10)
         ctk.CTkButton(bf, text="Save Config", command=self.save_all_config,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
         ctk.CTkButton(bf, text="Refresh ERP", command=self.refresh_erp,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
         ctk.CTkButton(bf, text="Refresh Master", command=self.refresh_master,
-                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a").pack(side="left", padx=5)
 
     def build_compare_tab(self, parent):
         frm = ctk.CTkFrame(parent)
@@ -1308,12 +1315,12 @@ class MainApp(ctk.CTk):
         btn_frame = ctk.CTkFrame(frm)
         btn_frame.pack(fill="x", pady=5)
         ctk.CTkButton(btn_frame, text="Refresh All Data", command=self.refresh_all_data,
-                      fg_color="#800020", hover_color="#a52a2a", height=40).pack(side="left", padx=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a", height=40).pack(side="left", padx=5)
         comp_frame = ctk.CTkFrame(frm)
         comp_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(comp_frame, text="Generate Missing Items Report", font=("Arial",16)).pack(pady=5)
         ctk.CTkButton(comp_frame, text="Run Reconciliation", command=self.run_comparison,
-                      fg_color="#800020", hover_color="#a52a2a", height=40).pack(pady=5)
+                      fg_color="#800020", text_color="white", hover_color="#a52a2a", height=40).pack(pady=5)
         self.status_frame = ctk.CTkFrame(frm)
         self.status_frame.pack(fill="x", pady=5)
         self.last_run_label = ctk.CTkLabel(self.status_frame, text="Last Run: Never")
@@ -1381,7 +1388,6 @@ class MainApp(ctk.CTk):
             self.history_df = final.copy()
         else:
             self.history_df = pd.concat([self.history_df, final], ignore_index=True)
-        # Also update run_history in config for persistence
         run_summary = {"date": run_date, "missing": len(final)}
         self.config_dict.setdefault("run_history", [])
         self.config_dict["run_history"].append(run_summary)
@@ -1409,7 +1415,6 @@ class MainApp(ctk.CTk):
         messagebox.showinfo("Success", "All data refreshed successfully!")
 
     def on_close(self):
-        # Optionally, save session here
         save_config(self.config_dict, Path(self.config_dict["paths"]["CONFIG_PATH"]))
         self.destroy()
 

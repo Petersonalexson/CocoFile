@@ -7,17 +7,6 @@ This version includes:
   - PDF export: Each PDF page is letter size (8.5×11 in) with a 1-inch margin,
     so the chart is plotted in one single axes covering the page (without a nested chart).
   - Run history is stored in the JSON config for the Band Chart.
-
-Additional Details:
-  - The dashboard uses Matplotlib embedded in a Tkinter (with CustomTkinter enhancements)
-    interface to display charts. In particular, the code imports Matplotlib and then uses
-    the FigureCanvasTkAgg from matplotlib.backends.backend_tkagg to integrate Matplotlib figures
-    into the Tkinter UI.
-  - For filtering the “Start Date” and “End Date” values in the ERP and Master previews,
-    the code “melts” (reshapes) the DataFrame and then applies a filtering function.
-    The helper function `strip_t` checks if the value contains a "T" (common in ISO datetime strings)
-    and splits the string at that point to keep only the date part. This filtering is applied only
-    to rows where the attribute is "Start Date" or "End Date", using NumPy’s np.where.
 """
 
 import os
@@ -40,7 +29,6 @@ import pandas as pd
 import numpy as np
 
 import matplotlib
-# Use TkAgg backend to integrate with Tkinter
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -297,16 +285,12 @@ def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.D
         melted["Name"] = ""
     melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
     melted["Attribute"] = melted["OrigAttr"].map(amap)
-    # --------------------------------------------------------------------------
-    # Date Filtering: Using the helper function strip_t with np.where to remove
-    # the time portion from ISO datetime strings for Start Date and End Date.
     def strip_t(val):
         if isinstance(val, str) and "T" in val:
             return val.split("T")[0]
         return val
     melted["Value"] = np.where(melted["Attribute"].isin(["Start Date", "End Date"]),
                                melted["ValX"].apply(strip_t), melted["ValX"])
-    # --------------------------------------------------------------------------
     return melted[["Dimension", "Name", "Attribute", "Value"]]
 
 def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.DataFrame:
@@ -339,16 +323,12 @@ def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> p
         melted["Name"] = ""
     melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
     melted["Attribute"] = melted["OrigAttr"].map(amap)
-    # --------------------------------------------------------------------------
-    # Date Filtering for Master: Apply strip_t to remove the time part for the 
-    # Start Date and End Date fields.
     def strip_t(val):
         if isinstance(val, str) and "T" in val:
             return val.split("T")[0]
         return val
     melted["Value"] = np.where(melted["Attribute"].isin(["Start Date", "End Date"]),
                                melted["ValX"].apply(strip_t), melted["ValX"])
-    # --------------------------------------------------------------------------
     return melted[["Dimension", "Name", "Attribute", "Value"]]
 
 def pivot_for_preview(df: pd.DataFrame) -> pd.DataFrame:
@@ -812,10 +792,14 @@ class EnhancedPDFReport:
             pivot = df_m.groupby(["Dimension", "Attribute"]).size().unstack(fill_value=0)
             if not pivot.empty:
                 self._add_chart_page(pdf, "Heatmap", self._plot_heatmap, pivot=pivot)
-        cdim = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False).head(10)
+        cdim = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False)
+        if self.top_n:
+            cdim = cdim.head(10)
         if not cdim.empty:
             self._add_chart_page(pdf, "Lollipop", self._plot_lollipop, cdim=cdim)
-        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
+        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False)
+        if self.top_n:
+            cattr = cattr.head(10)
         if not cattr.empty:
             self._add_chart_page(pdf, "Circular", self._plot_circular, cattr=cattr)
         # For brevity, only Heatmap, Lollipop, Circular, and Band Chart are shown.
@@ -835,6 +819,8 @@ class AdvancedDashboard(ctk.CTkFrame):
         self.df_history = pd.DataFrame()
         self.selected_dims: Set[str] = set()
         self.selected_attrs: Set[str] = set()
+        # Flag to control top-N filtering; True = show Top N (e.g. top 10), False = show All.
+        self.top_n = True
 
         topbar = ctk.CTkFrame(self, corner_radius=10, fg_color="#f0f0f0")
         topbar.pack(fill="x", padx=5, pady=5)
@@ -879,6 +865,13 @@ class AdvancedDashboard(ctk.CTkFrame):
             self.notebook.add(fr, text=lbl)
             self.frames[lbl] = fr
 
+    def toggle_top_n(self):
+        # Toggle the flag between showing Top N and All data.
+        self.top_n = not self.top_n
+        state = "Top N" if self.top_n else "All"
+        logging.info(f"Toggle Top 10 / All: Now showing {state} data")
+        self.update_data_filters()
+
     def set_quick_range(self, days: int):
         if days > 9000:
             self.start_date_var.set("1900-01-01")
@@ -916,10 +909,7 @@ class AdvancedDashboard(ctk.CTkFrame):
                 dsp = str(v)
             display_map[v] = dsp
         sorted_vals = sorted(display_map.keys(), key=lambda x: display_map[x].lower())
-        if col == "Dimension":
-            curr = self.selected_dims
-        else:
-            curr = self.selected_attrs
+        curr = self.selected_dims if col == "Dimension" else self.selected_attrs
         if not curr:
             curr = set(unique_vals)
         selall_var = tk.BooleanVar(value=True)
@@ -1021,7 +1011,9 @@ class AdvancedDashboard(ctk.CTkFrame):
         df_m = dfc[dfc["Missing In"] != ""]
         if df_m.empty:
             return
-        cdim = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False).head(10)
+        cdim = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False)
+        if self.top_n:
+            cdim = cdim.head(10)
         if cdim.empty:
             return
         fig, ax = plt.subplots(figsize=(6,5))
@@ -1040,7 +1032,9 @@ class AdvancedDashboard(ctk.CTkFrame):
         df_m = dfc[dfc["Missing In"] != ""]
         if df_m.empty:
             return
-        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
+        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False)
+        if self.top_n:
+            cattr = cattr.head(10)
         if cattr.empty:
             return
         fig = plt.figure(figsize=(6,6))
@@ -1130,11 +1124,13 @@ class AdvancedDashboard(ctk.CTkFrame):
         df_m = dfc[dfc["Missing In"] != ""]
         if df_m.empty:
             return
-        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
+        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False)
+        if self.top_n:
+            cattr = cattr.head(10)
         fig, ax = plt.subplots(figsize=(6,4))
         cattr.plot(kind="bar", ax=ax, color="blue")
         ax.set_ylabel("Missing Count")
-        ax.set_title("Bar: Top 10 Missing Attributes")
+        ax.set_title("Bar: Missing Attributes")
         self.plot_chart(fr, fig)
 
     def plotBandChart(self):

@@ -614,7 +614,12 @@ class SimplePreview(ctk.CTkFrame):
         for col, allowed in self.filters.items():
             if col in df_f.columns and len(allowed) > 0:
                 if col in {"Start Date", "End Date"}:
-                    df_f = df_f[(df_f[col].isin(allowed)) | (df_f[col].isna())]
+                    # Check if missing is allowed (i.e. if allowed contains any NaN)
+                    missing_allowed = any(pd.isna(x) for x in allowed)
+                    if missing_allowed:
+                        df_f = df_f[(df_f[col].isin(allowed)) | (df_f[col].isna()) | (df_f[col] == "")]
+                    else:
+                        df_f = df_f[df_f[col].isin(allowed)]
                 else:
                     df_f = df_f[df_f[col].isin(allowed)]
         return df_f
@@ -661,18 +666,15 @@ class SimplePreview(ctk.CTkFrame):
             bvar = tk.BooleanVar(value=in_filter)
             var_dict[rv] = bvar
             ctk.CTkCheckBox(
-                scroll,
-                text=display_map[rv],
-                variable=bvar,
+                scroll, text=display_map[rv], variable=bvar,
                 fg_color="#800020", hover_color="#a52a2a", text_color="black"
             ).pack(anchor="w")
         def apply_():
             sel = {rv for rv, vb in var_dict.items() if vb.get()}
-            if sel == all_vals or len(sel) == 0:
-                if col_name in self.filters:
-                    del self.filters[col_name]
+            if col_name == "Dimension":
+                self.selected_dims = sel
             else:
-                self.filters[col_name] = sel
+                self.selected_attrs = sel
             popup.destroy()
             self.refresh_table()
         bf = ctk.CTkFrame(frame)
@@ -704,8 +706,8 @@ class SimplePreview(ctk.CTkFrame):
 class EnhancedPDFReport:
     """
     PDF report with full-page (8.5 x 11 inches) pages.
-    Each chart page centers a 16:9 graph scaled to 70% of the page width (i.e. 0.30 smaller than full size).
-    The grid lines on the chart are disabled.
+    Each chart page centers a 16:9 graph scaled to 70% of the page width (i.e. 0.30 smaller),
+    and grid lines are disabled.
     """
     def __init__(self, df_current: pd.DataFrame, df_history: pd.DataFrame, config: Dict):
         self.df_current = df_current
@@ -818,9 +820,8 @@ class EnhancedPDFReport:
     def _add_chart_page(self, pdf: PdfPages, title: str, plot_func, **kwargs):
         """
         Create an 8.5 x 11-inch figure.
-        Then compute a 16:9 graph that is scaled to 70% of the page width (i.e. 0.30 smaller)
-        and center it on the page.
-        The grid lines are disabled.
+        Then compute a 16:9 graph scaled to 70% of the page width (i.e. 0.30 smaller)
+        and center it on the page. Grid lines on the chart are disabled.
         """
         fig = plt.figure(figsize=(self.PAGE_WIDTH, self.PAGE_HEIGHT))
         plt.text(0.5, 0.92, title, ha='center', fontsize=14, fontweight='bold',
@@ -835,7 +836,7 @@ class EnhancedPDFReport:
         width = graph_width / self.PAGE_WIDTH
         height = graph_height / self.PAGE_HEIGHT
         ax = fig.add_axes([left, bottom, width, height])
-        ax.grid(False)  # disable grid lines
+        ax.grid(False)
         try:
             plot_func(ax, **kwargs)
             pdf.savefig(fig)
@@ -1474,9 +1475,7 @@ class MainApp(ctk.CTk):
         if self.history_df.empty:
             messagebox.showinfo("PDF Export", "No mismatch data to export (history is empty).")
             return
-        # Use full timestamp so each run is uniquely tracked.
         run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # If the current run timestamp exists in history, use it; otherwise, use all history.
         df_current = self.history_df[self.history_df["RunDate"] == run_timestamp].copy() if run_timestamp in self.history_df["RunDate"].values else self.history_df.copy()
         df_history = self.history_df.copy()
         rep = EnhancedPDFReport(df_current, df_history, self.config_dict)
@@ -1520,7 +1519,6 @@ class MainApp(ctk.CTk):
         final = merge_exceptions(df_diff, df_exc)
         out_path = Path(self.out_var.get().strip())
         write_missing_items(final, out_path)
-        # Record run time with full timestamp.
         run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         final["RunDate"] = run_timestamp
         if self.history_df.empty:

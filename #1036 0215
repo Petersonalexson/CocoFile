@@ -788,12 +788,20 @@ class EnhancedPDFReport:
             pivot = df_m.groupby(["Dimension", "Attribute"]).size().unstack(fill_value=0)
             if not pivot.empty:
                 self._add_chart_page(pdf, "Heatmap", self._plot_heatmap, pivot=pivot)
-        cdim = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False).head(10)
+        # Toggle top N charts based on self.top_n flag (default True)
+        # For Lollipop:
+        cdim = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False)
+        if getattr(self, "top_n", True):
+            cdim = cdim.head(10)
         if not cdim.empty:
             self._add_chart_page(pdf, "Lollipop", self._plot_lollipop, cdim=cdim)
-        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
+        # For Circular:
+        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False)
+        if getattr(self, "top_n", True):
+            cattr = cattr.head(10)
         if not cattr.empty:
             self._add_chart_page(pdf, "Circular", self._plot_circular, cattr=cattr)
+        # For Band Chart:
         if not self.df_history.empty and "RunDate" in self.df_history.columns:
             date_ct = self.df_history.groupby("RunDate")["Key"].count().reset_index(name="Count")
             date_ct.sort_values("RunDate", inplace=True)
@@ -801,7 +809,6 @@ class EnhancedPDFReport:
                 self._add_chart_page(pdf, "Band Chart Over Time", self._plot_bandchart, date_ct=date_ct)
 
     def export_dashboard_pdf(self):
-        # Use EnhancedPDFReport to generate fresh pages for each chart
         report = EnhancedPDFReport(self.df_current, self.df_history, self.master.config_dict)
         pdf_path = report.generate()
         messagebox.showinfo("PDF Export", f"Dashboard exported to PDF:\n{pdf_path}")
@@ -816,6 +823,7 @@ class AdvancedDashboard(ctk.CTkFrame):
         self.df_history = pd.DataFrame()
         self.selected_dims: Set[str] = set()
         self.selected_attrs: Set[str] = set()
+        self.top_n = True  # True = show top 10; False = show all
 
         topbar = ctk.CTkFrame(self, corner_radius=10, fg_color="#f0f0f0")
         topbar.pack(fill="x", padx=5, pady=5)
@@ -1002,7 +1010,9 @@ class AdvancedDashboard(ctk.CTkFrame):
         df_m = dfc[dfc["Missing In"] != ""]
         if df_m.empty:
             return
-        cdim = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False).head(10)
+        cdim = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False)
+        if self.top_n:
+            cdim = cdim.head(10)
         if cdim.empty:
             return
         fig, ax = plt.subplots(figsize=(6,5))
@@ -1021,7 +1031,9 @@ class AdvancedDashboard(ctk.CTkFrame):
         df_m = dfc[dfc["Missing In"] != ""]
         if df_m.empty:
             return
-        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
+        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False)
+        if self.top_n:
+            cattr = cattr.head(10)
         if cattr.empty:
             return
         fig = plt.figure(figsize=(6,6))
@@ -1111,7 +1123,9 @@ class AdvancedDashboard(ctk.CTkFrame):
         df_m = dfc[dfc["Missing In"] != ""]
         if df_m.empty:
             return
-        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
+        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False)
+        if self.top_n:
+            cattr = cattr.head(10)
         fig, ax = plt.subplots(figsize=(6,4))
         cattr.plot(kind="bar", ax=ax, color="blue")
         ax.set_ylabel("Missing Count")
@@ -1141,8 +1155,12 @@ class AdvancedDashboard(ctk.CTkFrame):
             ax.text(row["RunDate"], row["Count"], str(row["Count"]), ha="center", va="bottom")
         self.plot_chart(fr, fig)
 
+    def toggle_top_n(self):
+        # Toggle the top_n flag and refresh the dashboard plots
+        self.top_n = not self.top_n
+        self.update_data_filters()
+
     def export_dashboard_pdf(self):
-        # Use the EnhancedPDFReport to create fresh pages for each chart
         report = EnhancedPDFReport(self.df_current, self.df_history, self.master.config_dict)
         pdf_path = report.generate()
         messagebox.showinfo("PDF Export", f"Dashboard exported to PDF:\n{pdf_path}")
@@ -1348,7 +1366,7 @@ class MainApp(ctk.CTk):
             self.history_df = final.copy()
         else:
             self.history_df = pd.concat([self.history_df, final], ignore_index=True)
-        # Update run_history in the config for persistence
+        # Also update run_history in config for persistence
         run_summary = {"date": run_date, "missing": len(final)}
         self.config_dict.setdefault("run_history", [])
         self.config_dict["run_history"].append(run_summary)

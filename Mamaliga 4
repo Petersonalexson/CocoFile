@@ -4,9 +4,13 @@ Ultra-Mega Reconciliation: Single-file with:
  - ERP & Master Previews (date filters on Start/End)
  - Compare Tab => missing_items.xlsx
  - AdvancedDashboard (8 mismatch charts) in the GUI
- - EnhancedPDFReport with professional styling and advanced summary
+ - EnhancedPDFReport with professional styling:
+   * Charts shifted slightly to the right
+   * Heatmap with extra vertical spacing
+   * Logo placed slightly lower on all pages (not just cover)
+   * Page number and footer
+   * Title (header) on each page
  - HistoryTab to browse JSON run files
- - PDF Export & History paths are chosen as folders in the GUI
 """
 
 import os
@@ -31,7 +35,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.backends.backend_pdf import PdfPages
 
 from openpyxl import Workbook
@@ -44,7 +48,6 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-
 # ----------------------------------------------------------------------------
 # DEFAULT CONFIG & SAVE/LOAD
 # ----------------------------------------------------------------------------
@@ -56,9 +59,9 @@ DEFAULT_PATHS = {
     "CONFIG_PATH": "config/ui_config.json",
     "PARAMETER_PATH": "data/parameters.xlsx",
     "MASTER_CSV_OUTPUT": "temp_master_csv",
-    "PDF_EXPORT_FOLDER": "output",            # CHANGED: folder for PDF
+    "PDF_EXPORT_PATH": "output/dashboard_report.pdf",
     "LOGO_PATH": "images/company_logo.png",
-    "HISTORY_PATH": "history_runs"            # CHANGED: folder for JSON runs
+    "HISTORY_PATH": "history_runs"
 }
 
 def default_config() -> Dict:
@@ -624,6 +627,7 @@ class SimplePreview(ctk.CTkFrame):
         df_f= self.df.copy()
         for col, allowed in self.filters.items():
             if col in df_f.columns and len(allowed)>0:
+                # keep row if col in allowed or is NaN
                 df_f= df_f[df_f[col].isin(allowed) | df_f[col].isna()]
         return df_f
 
@@ -714,25 +718,24 @@ class SimplePreview(ctk.CTkFrame):
 
 
 # ----------------------------------------------------------------------------
-# ENHANCED PDF REPORT
+# PDF REPORT (separate from the Dashboard charts)
 # ----------------------------------------------------------------------------
 class EnhancedPDFReport:
     """
-    PDF with advanced summary, and 8 mismatch charts (slightly to the right).
-    We also show a trend arrow and average from the full history.
+    PDF: All pages have a logo (slightly lower) in the top-right corner with alpha=0.2
+    We shift charts slightly to the right, give heatmap more vertical space,
+    add page footers, and a top header with the same text on each page.
     """
     def __init__(self, df_current: pd.DataFrame, df_history: pd.DataFrame, config: Dict):
         self.df_current = df_current
         self.df_history = df_history
         self.config = config
 
+        # For page numbering:
         self.page_count = 0
 
-        # Custom colors: keep burgundy, add seaweed, etc.
         self.colors = {
-            'primary': '#800020',       # burgundy
-            'seaweed': '#0A7E8C',       # metallic seaweed
-            'orange': '#FFA500',
+            'primary': '#800020',
             'text': '#2C1810',
             'background': '#FFFFFF'
         }
@@ -740,14 +743,14 @@ class EnhancedPDFReport:
 
         self.PAGE_WIDTH = 8.5
         self.PAGE_HEIGHT= 11
-        # Scale factor for charts
+        # Scale for charts
         self.CHART_SCALE = 0.7
 
     def generate(self) -> Path:
         pdf_path= self._get_output_path()
         with PdfPages(pdf_path) as pdf:
             self._cover_page(pdf)
-            self._summary_page(pdf)        # advanced summary
+            self._summary_page(pdf)
             self._topdimsattrs_page(pdf)
             self._all_charts(pdf)
         logging.info(f"PDF => {pdf_path}")
@@ -755,39 +758,41 @@ class EnhancedPDFReport:
 
     def _get_output_path(self)-> Path:
         """
-        We'll take PDF_EXPORT_FOLDER from config,
-        create a file named Reconciliation_Report_{timestamp}.pdf inside it.
+        CHANGED:
+          - Instead of writing to the same directory as PDF_EXPORT_PATH,
+            we place the PDF into a folder named 'Reconciliation_pdf' 
+            with name 'Reconciliationpdf_<timestamp>.pdf'
         """
-        folder_str = self.config["paths"].get("PDF_EXPORT_FOLDER", "output")
-        folder = Path(folder_str)
-        folder.mkdir(parents=True, exist_ok=True)
-
-        stamp= datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"Reconciliation_Report_{stamp}.pdf"
-        return folder / filename
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pdf_dir = Path("Reconciliation_pdf")
+        pdf_dir.mkdir(parents=True, exist_ok=True)
+        pdf_name = f"Reconciliationpdf_{stamp}.pdf"
+        pdf_path = pdf_dir / pdf_name
+        return pdf_path
 
     def _new_page(self)-> plt.Figure:
+        """Create a new 8.5x11 figure, add logo, increment page count, add header & footer."""
         self.page_count += 1
         fig= plt.figure(figsize=(self.PAGE_WIDTH,self.PAGE_HEIGHT))
         fig.patch.set_facecolor(self.colors['background'])
         plt.axis('off')
-
-        # Insert the logo slightly lower in top-right
+        # Insert the logo slightly lower (just a bit from the top-right)
         if self.logo_path and os.path.exists(self.logo_path):
             try:
                 import matplotlib.image as mpimg
                 img= mpimg.imread(self.logo_path)
+                # place in top-right corner, but slightly lower => y=0.65
                 ax_img= fig.add_axes([0.65,0.65, 0.25, 0.25], anchor='NE', zorder=10)
                 ax_img.imshow(img, alpha=0.2)
                 ax_img.axis('off')
             except Exception as e:
                 logging.error(f"Logo => {e}")
 
-        # Common header (top)
+        # Common header text => top margin
         fig.text(0.5, 0.97, "Reconciliation Report", ha='center',
                  fontsize=10, color='gray')
 
-        # Footer with page number
+        # Page number & a simple footer
         fig.text(0.9, 0.03, f"Page {self.page_count}", ha='right', fontsize=8, color='gray')
         fig.text(0.5, 0.02, "© Ultra-Mega Reconciliation", ha='center', fontsize=8, color='gray')
         return fig
@@ -795,100 +800,43 @@ class EnhancedPDFReport:
     def _cover_page(self, pdf: PdfPages):
         fig= self._new_page()
         plt.text(0.5, 0.7, "Reconciliation Analysis Report",
-                 ha='center', fontsize=24, fontweight='bold',
-                 color=self.colors['primary'], transform=fig.transFigure)
+                 ha='center', fontsize=24, fontweight='bold', color=self.colors['primary'],
+                 transform=fig.transFigure)
         plt.text(0.5, 0.6, f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                  ha='center', fontsize=12, color=self.colors['text'], transform=fig.transFigure)
-        plt.text(0.5, 0.1, "CONFIDENTIAL", ha='center', fontsize=9,
-                 color=self.colors['text'], transform=fig.transFigure)
+        plt.text(0.5, 0.1, "CONFIDENTIAL", ha='center', fontsize=9, color=self.colors['text'],
+                 transform=fig.transFigure)
         pdf.savefig(fig)
         plt.close(fig)
 
     def _summary_page(self, pdf: PdfPages):
         fig= self._new_page()
-        plt.text(0.5, 0.92, "Reconciliation Summary", ha='center',
-                 fontsize=18, fontweight='bold', color=self.colors['primary'],
-                 transform=fig.transFigure)
-
-        # Basic stats
-        total_mismatch = len(self.df_current)
-        affected_dims = (self.df_current["Dimension"].nunique()
-                         if not self.df_current.empty and "Dimension" in self.df_current.columns
-                         else 0)
-        dist_series = self.df_current["Missing In"].value_counts() if not self.df_current.empty else pd.Series()
-        missing_erp = dist_series.get("ERP", 0)
-        missing_master = dist_series.get("MASTER", 0)
-
-        # Attempt historical trend
-        trend_text = "No prior runs"
-        if not self.df_history.empty and "RunDate" in self.df_history.columns:
-            all_runs = sorted(self.df_history["RunDate"].unique())
-            if len(all_runs) > 1:
-                last_run = all_runs[-1]
-                prev_run = all_runs[-2]
-                curr_count = len(self.df_history[self.df_history["RunDate"]==last_run])
-                prev_count = len(self.df_history[self.df_history["RunDate"]==prev_run])
-                diff = curr_count - prev_count
-                arrow = "↑" if diff>0 else ("↓" if diff<0 else "→")
-                # average
-                avg_ = self.df_history.groupby("RunDate")["Key"].count().mean()
-                trend_text = (
-                    f"Current: {curr_count}\n"
-                    f"Previous: {prev_count}\n"
-                    f"Trend: {arrow} (diff={diff})\n"
-                    f"Average: {avg_:.1f}"
-                )
-            else:
-                trend_text = "Insufficient historical runs"
-
-        # Key findings
-        key_findings = []
-        if total_mismatch>0:
-            # Which side has the most
-            if not dist_series.empty:
-                top_side = dist_series.idxmax()
-                key_findings.append(f"Most items missing in: {top_side}")
-            # Which dimension is the most affected
-            if "Dimension" in self.df_current.columns:
-                dim_counts = self.df_current["Dimension"].value_counts()
-                if not dim_counts.empty:
-                    top_dim = dim_counts.idxmax()
-                    top_val = dim_counts.max()
-                    key_findings.append(f"Most affected Dimension: '{top_dim}' with {top_val} mismatches")
+        plt.text(0.5, 0.92, "Reconciliation Summary", ha='center', fontsize=18, fontweight='bold',
+                 color=self.colors['primary'], transform=fig.transFigure)
+        y= 0.75
+        if self.df_current.empty:
+            plt.text(0.5, y, "No mismatches found this run.",
+                     ha='center', fontsize=14, color=self.colors['text'], transform=fig.transFigure)
         else:
-            key_findings.append("No mismatches found in this run.")
-
-        # Print to summary page
-        y = 0.78
-        lines = [
-            f"Total mismatches: {total_mismatch}",
-            f"Affected dimensions: {affected_dims}",
-            "Missing items distribution:",
-            f" - MASTER: {missing_master}",
-            f" - ERP: {missing_erp}",
-            "",
-            "Historical Trend:",
-            trend_text,
-            "",
-            "Key Findings:",
-        ] + [f" - {kf}" for kf in key_findings]
-
-        for line in lines:
-            plt.text(0.1, y, line, fontsize=12, color=self.colors['text'],
+            total= len(self.df_current)
+            e= (self.df_current["Missing In"]=="ERP").sum()
+            m= (self.df_current["Missing In"]=="MASTER").sum()
+            summary= (
+                f"Total Mismatches: {total}\n"
+                f"Missing in ERP: {e}\n"
+                f"Missing in Master: {m}"
+            )
+            plt.text(0.5, y, summary, ha='center', fontsize=14, color=self.colors['text'],
                      transform=fig.transFigure)
-            y -= 0.04
-
         pdf.savefig(fig)
         plt.close(fig)
 
     def _topdimsattrs_page(self, pdf: PdfPages):
         fig= self._new_page()
-        plt.text(0.5, 0.92, "Top Dimensions & Attributes",
-                 ha='center', fontsize=18, fontweight='bold',
+        plt.text(0.5, 0.92, "Top Dimensions & Attributes", ha='center', fontsize=18, fontweight='bold',
                  color=self.colors['primary'], transform=fig.transFigure)
         if self.df_current.empty:
-            plt.text(0.5, 0.7, "No data available.",
-                     ha='center', fontsize=12, color=self.colors['text'],
+            plt.text(0.5, 0.7, "No data available.", ha='center', fontsize=12, color=self.colors['text'],
                      transform=fig.transFigure)
         else:
             if "Dimension" in self.df_current.columns:
@@ -907,20 +855,24 @@ class EnhancedPDFReport:
         plt.close(fig)
 
     def _chart_page(self, pdf: PdfPages, title: str, plot_func, **kwargs):
+        """One chart page. We'll shift the chart more to the right for heatmap & give extra vertical space."""
         fig= self._new_page()
-        fig.suptitle(title, fontsize=14, fontweight='bold',
-                     color=self.colors['primary'], y=0.93)
+        fig.suptitle(title, fontsize=14, fontweight='bold', color=self.colors['primary'], y=0.93)
 
+        # We'll do a scale factor & offset
         w_inch= self.PAGE_WIDTH * self.CHART_SCALE
-        # Extra vertical for heatmap
+
+        # CHANGED => If "Heatmap" in the title, shift 0.4" & do w_inch *1.4
         if "Heatmap" in title:
-            h_inch= w_inch * 1.2
+            h_inch= w_inch * 1.4   # extra vertical
+            left_margin= (self.PAGE_WIDTH - w_inch)*0.5 + 0.4  # 0.4 inches ~ 1 cm
         else:
             h_inch= w_inch * (9.0/16.0)
+            left_margin= (self.PAGE_WIDTH - w_inch)*0.5 + 0.2
 
-        # shift chart slightly to the right
-        left_margin= (self.PAGE_WIDTH - w_inch)*0.5 + 0.2
         bottom_margin= (self.PAGE_HEIGHT - h_inch)*0.5
+
+        # convert to figure coords
         left_rel= left_margin / self.PAGE_WIDTH
         bottom_rel= bottom_margin / self.PAGE_HEIGHT
         width_rel= w_inch / self.PAGE_WIDTH
@@ -983,14 +935,16 @@ class EnhancedPDFReport:
         if not cattr_b.empty:
             self._chart_page(pdf, "Bar: Missing attributes", self._plot_bar, cattr=cattr_b)
 
-        # 8) Band Chart Over Time
+        # 8) Band Chart
         if not self.df_history.empty and "RunDate" in self.df_history.columns:
             date_ct= self.df_history.groupby("RunDate")["Key"].count().reset_index(name="Count")
             date_ct.sort_values("RunDate", inplace=True)
             if not date_ct.empty:
                 self._chart_page(pdf, "Band Chart Over Time", self._plot_bandchart, date_ct=date_ct)
 
-    # ---- Chart plot functions ----
+    # ------------------------------------------------------------------------
+    # Chart plot functions
+    # ------------------------------------------------------------------------
     def _plot_heatmap(self, ax, pivot):
         im= ax.imshow(pivot, aspect="auto", cmap="Reds")
         ax.set_xticks(range(len(pivot.columns)))
@@ -1000,9 +954,8 @@ class EnhancedPDFReport:
         plt.colorbar(im, ax=ax)
 
     def _plot_lollipop(self, ax, cdim):
-        # Use seaweed color, for example
-        ax.hlines(y=cdim.index, xmin=0, xmax=cdim.values, color=self.colors['seaweed'])
-        ax.plot(cdim.values, cdim.index, "o", color=self.colors['seaweed'])
+        ax.hlines(y=cdim.index, xmin=0, xmax=cdim.values, color="skyblue")
+        ax.plot(cdim.values, cdim.index, "o", color="skyblue")
         ax.set_xlabel("Missing Count")
 
     def _plot_circular(self, ax, cattr):
@@ -1011,7 +964,7 @@ class EnhancedPDFReport:
         ax.set_theta_direction(-1)
         ax.set_xticks(angles)
         ax.set_xticklabels(cattr.index, fontsize=9)
-        ax.bar(angles, cattr.values, width=0.4, color=self.colors['orange'], alpha=0.6)
+        ax.bar(angles, cattr.values, width=0.4, color="orange", alpha=0.6)
 
     def _plot_scatter(self, ax, cdim):
         xvals= np.arange(len(cdim))
@@ -1062,7 +1015,7 @@ class EnhancedPDFReport:
 
 
 # ----------------------------------------------------------------------------
-# ADVANCED DASHBOARD
+# ADVANCED DASHBOARD (GUI CHARTS)
 # ----------------------------------------------------------------------------
 class AdvancedDashboard(ctk.CTkFrame):
     """
@@ -1071,6 +1024,7 @@ class AdvancedDashboard(ctk.CTkFrame):
     """
     def __init__(self, parent, dashboard_cfg: Dict):
         super().__init__(parent)
+        # parse state from config
         self.selected_dims: Set[str] = set(dashboard_cfg.get("selected_dims", []))
         self.selected_attrs: Set[str] = set(dashboard_cfg.get("selected_attrs", []))
         self.top_n= dashboard_cfg.get("top_n", 10)
@@ -1259,6 +1213,7 @@ class AdvancedDashboard(ctk.CTkFrame):
         dims= dfc["Dimension"].nunique() if not dfc.empty and "Dimension" in dfc.columns else 0
         self.metric_label.configure(text=f"Mismatches: {mism}, Dims: {dims}")
 
+        # re-plot
         self.plotHeatmap(dfc)
         self.plotLollipop(dfc)
         self.plotCircular(dfc)
@@ -1269,11 +1224,26 @@ class AdvancedDashboard(ctk.CTkFrame):
         self.plotBandChart()
 
     def plot_chart(self, frame, fig):
+        """
+        CHANGED: Add a Matplotlib toolbar and ensure canvas.draw() is called.
+        Then close the figure to avoid multiple references.
+        """
         for w in frame.winfo_children():
             w.destroy()
+
         canvas= FigureCanvasTkAgg(fig, master=frame)
         canvas.draw()
+
+        # Add optional Navigation toolbar
+        toolbar_frame = ctk.CTkFrame(frame)
+        toolbar_frame.pack(side="top", fill="x")
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+        toolbar.update()
+
         canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # Close the figure to free memory
+        plt.close(fig)
 
     def _limit_if_needed(self, series: pd.Series)-> pd.Series:
         if self.top_n==10:
@@ -1321,9 +1291,8 @@ class AdvancedDashboard(ctk.CTkFrame):
             return
         fig, ax= plt.subplots(figsize=(6,5))
         try:
-            # Use seaweed color (example)
-            ax.hlines(y= cdim.index, xmin=0, xmax=cdim.values, color="#0A7E8C")
-            ax.plot(cdim.values, cdim.index, "o", color="#0A7E8C")
+            ax.hlines(y= cdim.index, xmin=0, xmax=cdim.values, color="skyblue")
+            ax.plot(cdim.values, cdim.index, "o", color="skyblue")
             ax.set_title("Lollipop: Missing Dimensions")
             ax.set_xlabel("Count")
             self.plot_chart(fr, fig)
@@ -1353,7 +1322,7 @@ class AdvancedDashboard(ctk.CTkFrame):
             ax.set_theta_direction(-1)
             ax.set_xticks(angles)
             ax.set_xticklabels(cat, fontsize=9)
-            ax.bar(angles, val, width=0.4, color="#FFA500", alpha=0.6)
+            ax.bar(angles, val, width=0.4, color="orange", alpha=0.6)
             ax.set_title("Circular: Missing Attributes")
             self.plot_chart(fr, fig)
         except IndexError as e:
@@ -1504,7 +1473,6 @@ class AdvancedDashboard(ctk.CTkFrame):
 class HistoryTab(ctk.CTkFrame):
     def __init__(self, parent):
         super().__init__(parent)
-        # We'll set a default, but the user can override in the GUI
         self.history_dir= Path("history_runs")
         self.tree= None
         self.build_ui()
@@ -1630,7 +1598,6 @@ class MainApp(ctk.CTk):
         frm= ctk.CTkFrame(parent)
         frm.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # ADDED: PDF folder & History folder
         self.erp_var= tk.StringVar(value=self.config_dict["paths"].get("ERP_EXCEL_PATH", DEFAULT_PATHS["ERP_EXCEL_PATH"]))
         self.mast_var= tk.StringVar(value=self.config_dict["paths"].get("MASTER_ZIP_PATH", DEFAULT_PATHS["MASTER_ZIP_PATH"]))
         self.exc_var= tk.StringVar(value=self.config_dict["paths"].get("EXCEPTION_PATH", DEFAULT_PATHS["EXCEPTION_PATH"]))
@@ -1638,8 +1605,7 @@ class MainApp(ctk.CTk):
         self.cfg_var= tk.StringVar(value=self.config_dict["paths"].get("CONFIG_PATH", DEFAULT_PATHS["CONFIG_PATH"]))
         self.par_var= tk.StringVar(value=self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"]))
         self.csv_var= tk.StringVar(value=self.config_dict["paths"].get("MASTER_CSV_OUTPUT", DEFAULT_PATHS["MASTER_CSV_OUTPUT"]))
-        self.pdf_folder_var= tk.StringVar(value=self.config_dict["paths"].get("PDF_EXPORT_FOLDER", "output"))
-        self.hist_var= tk.StringVar(value=self.config_dict["paths"].get("HISTORY_PATH", "history_runs"))
+        self.pdf_var= tk.StringVar(value=self.config_dict["paths"].get("PDF_EXPORT_PATH", DEFAULT_PATHS["PDF_EXPORT_PATH"]))
 
         def mkrow(lbl, var, is_dir=False):
             rowf= ctk.CTkFrame(frm)
@@ -1664,8 +1630,7 @@ class MainApp(ctk.CTk):
         mkrow("JSON Config Path:", self.cfg_var)
         mkrow("Parameter File:", self.par_var)
         mkrow("Master CSV Folder:", self.csv_var, is_dir=True)
-        mkrow("PDF Export Folder:", self.pdf_folder_var, is_dir=True)
-        mkrow("History Folder:", self.hist_var, is_dir=True)
+        mkrow("PDF Export Path:", self.pdf_var, is_dir=False)
 
         bf= ctk.CTkFrame(frm)
         bf.pack(fill="x", pady=10)
@@ -1749,9 +1714,8 @@ class MainApp(ctk.CTk):
         else:
             self.history_df= pd.concat([self.history_df, final], ignore_index=True)
 
-        # save JSON in the chosen HISTORY_PATH folder
-        hist_dir_str = self.hist_var.get().strip() or self.config_dict["paths"].get("HISTORY_PATH","history_runs")
-        hist_dir= Path(hist_dir_str)
+        # save JSON in history_runs
+        hist_dir= Path(self.config_dict["paths"].get("HISTORY_PATH","history_runs"))
         hist_dir.mkdir(parents=True, exist_ok=True)
         run_file= hist_dir / f"run_{run_timestamp.replace(':','-').replace(' ','_')}.json"
         try:
@@ -1759,10 +1723,6 @@ class MainApp(ctk.CTk):
             logging.info(f"Saved run => {run_file}")
         except Exception as e:
             logging.error(f"Error writing JSON => {e}")
-
-        # update local paths if needed
-        self.history_tab.history_dir = hist_dir
-        self.history_tab.refresh_history()
 
         # update dashboard
         self.dashboard_tab.update_data(final, self.history_df)
@@ -1778,10 +1738,7 @@ class MainApp(ctk.CTk):
         self.config_dict["paths"]["CONFIG_PATH"]= self.cfg_var.get().strip()
         self.config_dict["paths"]["PARAMETER_PATH"]= self.par_var.get().strip()
         self.config_dict["paths"]["MASTER_CSV_OUTPUT"]= self.csv_var.get().strip()
-
-        # Save PDF folder & History folder
-        self.config_dict["paths"]["PDF_EXPORT_FOLDER"]= self.pdf_folder_var.get().strip()
-        self.config_dict["paths"]["HISTORY_PATH"]= self.hist_var.get().strip()
+        self.config_dict["paths"]["PDF_EXPORT_PATH"]= self.pdf_var.get().strip()
 
         self.config_dict.setdefault("erp_grid", {})
         self.config_dict["erp_grid"]["filters"]= self.erp_preview.filters
@@ -1789,7 +1746,7 @@ class MainApp(ctk.CTk):
         self.config_dict.setdefault("master_grid", {})
         self.config_dict["master_grid"]["filters"]= self.master_preview.filters
 
-        # optional date filters in main config
+        # if we want to store date filters at main app level
         self.config_dict["date_filters"]= {
             "start_date": (datetime.now()-timedelta(days=30)).strftime("%Y-%m-%d"),
             "end_date": datetime.now().strftime("%Y-%m-%d")

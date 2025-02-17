@@ -1,0 +1,1503 @@
+"""
+Ultra-Mega Reconciliation: Parameter-based with advanced Dashboard (8 charts).
+Results are saved as JSON history files. Date filters for "Start Date" and "End Date" 
+include (NaN) when that option is selected. The dashboard displays the 8 original charts 
+at fixed sizes, and the PDF report (with a cover, summary, and charts) is generated 
+with all titles shifted downward slightly.
+"""
+
+import os
+import json
+import math
+import logging
+import zipfile
+import shutil
+import io
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Dict, Set, List
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import customtkinter as ctk
+
+import pandas as pd
+import numpy as np
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_pdf import PdfPages
+
+try:
+    import chardet
+except ImportError:
+    chardet = None
+
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+
+from PIL import Image
+
+# ----------------------------------------------------------------------------
+# LOGGING
+# ----------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# ----------------------------------------------------------------------------
+# Helper: Replace NaN with None recursively
+# ----------------------------------------------------------------------------
+def replace_nan(obj):
+    if isinstance(obj, float) and math.isnan(obj):
+        return None
+    elif isinstance(obj, dict):
+        return {k: replace_nan(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [replace_nan(v) for v in obj]
+    else:
+        return obj
+
+# ----------------------------------------------------------------------------
+# DEFAULT CONFIG & SAVE/LOAD
+# ----------------------------------------------------------------------------
+DEFAULT_PATHS = {
+    "ERP_EXCEL_PATH": "data/ERP_Config.xlsx",
+    "MASTER_ZIP_PATH": "data/Master_Config.zip",
+    "EXCEPTION_PATH": "data/Exception_Table.xlsx",
+    "OUTPUT_PATH": "output/missing_items.xlsx",
+    "CONFIG_PATH": "config/ui_config.json",
+    "PARAMETER_PATH": "data/parameters.xlsx",
+    "MASTER_CSV_OUTPUT": "temp_master_csv",
+    "PDF_EXPORT_PATH": "output/dashboard_report.pdf",
+    "LOGO_PATH": "images/company_logo.png",
+    "HISTORY_FOLDER": "history"
+}
+
+def default_config() -> Dict:
+    return {
+        "paths": DEFAULT_PATHS.copy(),
+        "erp_grid": {"filters": {}},
+        "master_grid": {"filters": {}},
+        "date_filters": {
+            "start_date": (datetime.now()-timedelta(days=30)).strftime("%Y-%m-%d"),
+            "end_date": datetime.now().strftime("%Y-%m-%d")
+        }
+    }
+
+def load_config(path: Path) -> Dict:
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load config: {e}")
+    return default_config()
+
+def save_config(cfg: Dict, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if "erp_grid" in cfg and "filters" in cfg["erp_grid"]:
+            nf = {}
+            for col, filt in cfg["erp_grid"]["filters"].items():
+                nf[col] = {"values": list(filt.get("values", [])), "include_nan": filt.get("include_nan", True)}
+            cfg["erp_grid"]["filters"] = nf
+        if "master_grid" in cfg and "filters" in cfg["master_grid"]:
+            nf = {}
+            for col, filt in cfg["master_grid"]["filters"].items():
+                nf[col] = {"values": list(filt.get("values", [])), "include_nan": filt.get("include_nan", True)}
+            cfg["master_grid"]["filters"] = nf
+        cfg = replace_nan(cfg)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        logging.info(f"Saved config to {path}")
+    except Exception as e:
+        logging.error(f"Error saving config: {e}")
+
+# ----------------------------------------------------------------------------
+# TEXT LOGGER HANDLER
+# ----------------------------------------------------------------------------
+class TextHandler(logging.Handler):
+    def __init__(self, widget: ctk.CTkTextbox):
+        super().__init__()
+        self.widget = widget
+    def emit(self, record):
+        msg = self.format(record) + "\n"
+        self.widget.after(0, self._append, msg)
+    def _append(self, msg):
+        self.widget.configure(state="normal")
+        self.widget.insert("end", msg)
+        self.widget.see("end")
+        self.widget.configure(state="disabled")
+
+# ----------------------------------------------------------------------------
+# PARAM READING
+# ----------------------------------------------------------------------------
+def read_param_file(path: Path) -> Dict[str, object]:
+    param = {
+        "dim_erp_keep": set(),
+        "dim_erp_map": {},
+        "dim_master_map": {},
+        "attr_erp_map": {},
+        "attr_master_map": {}
+    }
+    if not path.is_file():
+        logging.warning(f"Param file not found => {path}")
+        return param
+    try:
+        dim_df = pd.read_excel(path, sheet_name="Dimension Parameters")
+        dim_df.columns = dim_df.columns.astype(str).str.strip()
+        def s(x): return str(x).strip() if pd.notna(x) else ""
+        for _, row in dim_df.iterrows():
+            fn = s(row.get("FileName", ""))
+            vsc = s(row.get("V S C", ""))
+            dim = s(row.get("Dimension", ""))
+            ev  = s(row.get("ERP Values", ""))
+            if ev.lower() == "x" and vsc and dim:
+                param["dim_erp_keep"].add(vsc)
+            if vsc and dim:
+                param["dim_erp_map"][vsc] = dim
+            if fn and dim and ev.lower() == "x":
+                param["dim_master_map"][fn] = dim
+        attr_df = pd.read_excel(path, sheet_name="Attribute Parameters")
+        attr_df.columns = attr_df.columns.astype(str).str.strip()
+        for _, row in attr_df.iterrows():
+            e_orig = s(row.get("ERP Original Attributes", ""))
+            m_orig = s(row.get("Master Original Attributes", ""))
+            final_ = s(row.get("Attribute", ""))
+            onoff  = s(row.get("On/Off", ""))
+            if onoff.lower() == "x" and final_:
+                if e_orig:
+                    param["attr_erp_map"][e_orig] = final_
+                if m_orig:
+                    param["attr_master_map"][m_orig] = final_
+        return param
+    except Exception as e:
+        logging.error(f"Error reading param file => {e}")
+        return param
+
+# ----------------------------------------------------------------------------
+# ERP
+# ----------------------------------------------------------------------------
+def read_erp_excel(path: Path) -> pd.DataFrame:
+    if not path.is_file():
+        logging.warning(f"ERP Excel not found => {path}")
+        return pd.DataFrame()
+    try:
+        df = pd.read_excel(path, skiprows=3)
+        df.columns = df.columns.str.strip()
+        if "Enabled_Flag" in df.columns:
+            df = df[df["Enabled_Flag"] == "Enabled"]
+        return df
+    except Exception as e:
+        logging.error(f"Error reading ERP => {e}")
+        return pd.DataFrame()
+
+# ----------------------------------------------------------------------------
+# MASTER => read from .txt in ZIP
+# ----------------------------------------------------------------------------
+def read_txt_2encodings(raw: bytes) -> pd.DataFrame:
+    import io
+    for enc in ["utf-8-sig", "utf-16-le"]:
+        try:
+            buf = io.BytesIO(raw)
+            df = pd.read_csv(buf, encoding=enc, on_bad_lines="skip", engine="python")
+            df.dropna(how="all", axis=0, inplace=True)
+            df.dropna(how="all", axis=1, inplace=True)
+            df.columns = df.columns.astype(str).str.strip()
+            logging.info(f"[read_txt_2encodings] success with {enc}, shape={df.shape}")
+            return df
+        except Exception as e:
+            logging.debug(f"[read_txt_2encodings] fail with {enc} => {e}")
+    logging.error("[read_txt_2encodings] cannot parse .txt => empty.")
+    return pd.DataFrame()
+
+def convert_master_txt_to_csv(zip_path: Path, out_dir: Path) -> List[Path]:
+    if not zip_path.is_file():
+        logging.warning(f"[Master] ZIP not found => {zip_path}")
+        return []
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csvs = []
+    with zipfile.ZipFile(zip_path, "r") as z:
+        txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+        for txt_file in txt_files:
+            base_name = os.path.basename(txt_file)
+            if not base_name:
+                continue
+            try:
+                with z.open(txt_file) as fo:
+                    raw = fo.read()
+                df = read_txt_2encodings(raw)
+                if df.empty:
+                    continue
+                df["RawFileName"] = base_name
+                if "Name" not in df.columns and len(df.columns) > 0:
+                    first_col = df.columns[0]
+                    df.rename(columns={first_col: "Name"}, inplace=True)
+                out_csv = out_dir / (base_name.replace(".txt", ".csv"))
+                df.to_csv(out_csv, index=False, encoding="utf-8")
+                csvs.append(out_csv)
+            except Exception as e:
+                logging.error(f"[Master] error reading {txt_file} => {e}")
+    return csvs
+
+def unify_master_csvs(csvs: List[Path]) -> pd.DataFrame:
+    frames = []
+    for cp in csvs:
+        if not cp.is_file():
+            continue
+        try:
+            df = pd.read_csv(cp, encoding="utf-8", on_bad_lines="skip")
+            df.columns = df.columns.str.strip()
+            frames.append(df)
+        except Exception as e:
+            logging.error(f"[unify_master_csvs] reading {cp} => {e}")
+    if frames:
+        return pd.concat(frames, ignore_index=True)
+    return pd.DataFrame()
+
+# ----------------------------------------------------------------------------
+# MELTDOWN FUNCTIONS
+# ----------------------------------------------------------------------------
+def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.DataFrame:
+    if "V_S_C" not in df.columns:
+        return pd.DataFrame()
+    keep = param.get("dim_erp_keep", set())
+    dmap = param.get("dim_erp_map", {})
+    amap = param.get("attr_erp_map", {})
+    df2 = df[df["V_S_C"].isin(keep)].copy()
+    if df2.empty:
+        return pd.DataFrame()
+    skip_cols = {"V_S_C", "Enabled_Flag"}
+    id_vars = []
+    if "Value" in df2.columns:
+        id_vars.append("Value")
+        skip_cols.add("Value")
+    df2["DimRaw"] = df2["V_S_C"]
+    skip_cols.add("DimRaw")
+    id_vars.insert(0, "DimRaw")
+    meltdown_cols = [c for c in df2.columns if c not in skip_cols]
+    melted = df2.melt(id_vars=id_vars, value_vars=meltdown_cols, var_name="OrigAttr", value_name="ValX")
+    def rename_dim(v):
+        return dmap.get(v, v)
+    melted["Dimension"] = melted["DimRaw"].apply(rename_dim)
+    if "Value" in id_vars:
+        melted.rename(columns={"Value": "Name"}, inplace=True)
+    else:
+        melted["Name"] = ""
+    melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
+    melted["Attribute"] = melted["OrigAttr"].map(amap)
+    def strip_t(val):
+        if isinstance(val, str) and "T" in val:
+            return val.split("T")[0]
+        return val
+    melted["Value"] = np.where(melted["Attribute"].isin(["Start Date", "End Date"]),
+                               melted["ValX"].apply(strip_t), melted["ValX"])
+    return melted[["Dimension", "Name", "Attribute", "Value"]]
+
+def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.DataFrame:
+    if df.empty or "RawFileName" not in df.columns:
+        return pd.DataFrame()
+    keep_map = param.get("dim_master_map", {})
+    amap = param.get("attr_master_map", {})
+    df2 = df[df["RawFileName"].isin(keep_map.keys())].copy()
+    if df2.empty:
+        return pd.DataFrame()
+    df2["DimRaw"] = df2["RawFileName"]
+    skip_cols = {"RawFileName", "DimRaw"}
+    id_vars = ["DimRaw"]
+    if "Name" in df2.columns:
+        id_vars.append("Name")
+        skip_cols.add("Name")
+    meltdown_cols = [c for c in df2.columns if c not in skip_cols]
+    melted = df2.melt(id_vars=id_vars, value_vars=meltdown_cols, var_name="OrigAttr", value_name="ValX")
+    def rename_dim(fn):
+        return keep_map.get(fn, fn)
+    melted["Dimension"] = melted["DimRaw"].apply(rename_dim)
+    if "Name" in id_vars:
+        melted.rename(columns={"Name": "Name"}, inplace=True)
+    else:
+        melted["Name"] = ""
+    melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
+    melted["Attribute"] = melted["OrigAttr"].map(amap)
+    def strip_t(val):
+        if isinstance(val, str) and "T" in val:
+            return val.split("T")[0]
+        return val
+    melted["Value"] = np.where(melted["Attribute"].isin(["Start Date", "End Date"]),
+                               melted["ValX"].apply(strip_t), melted["ValX"])
+    return melted[["Dimension", "Name", "Attribute", "Value"]]
+
+def pivot_for_preview(df: pd.DataFrame) -> pd.DataFrame:
+    if not df.empty and {"Dimension", "Name", "Attribute"}.issubset(df.columns):
+        df = df.drop_duplicates(subset=["Dimension", "Name", "Attribute"])
+        try:
+            df = df.pivot(index=["Dimension", "Name"], columns="Attribute", values="Value").reset_index()
+        except Exception as e:
+            logging.error(f"Pivot error => {e}")
+    return df
+
+# ----------------------------------------------------------------------------
+# COMPARE FUNCTIONS
+# ----------------------------------------------------------------------------
+def melt_back(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "Dimension" not in df.columns or "Name" not in df.columns:
+        return pd.DataFrame()
+    skip_cols = {"Dimension", "Name"}
+    meltdown_cols = [c for c in df.columns if c not in skip_cols]
+    melted = df.melt(id_vars=["Dimension", "Name"], value_vars=meltdown_cols, var_name="Attribute", value_name="Value")
+    return melted[["Dimension", "Name", "Attribute", "Value"]]
+
+def build_keys(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for c in ["Dimension", "Name", "Attribute", "Value"]:
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].fillna("").astype(str).str.strip()
+    df["GroupKey"] = df["Dimension"] + " | " + df["Name"]
+    df["Key"] = df["Dimension"] + " | " + df["Name"] + " | " + df["Attribute"] + " | " + df["Value"]
+    df["Comments_1"] = ""
+    df["Comments_2"] = ""
+    df["Action Item"] = ""
+    df["Missing In"] = ""
+    return df
+
+def compare_mode2(df_erp: pd.DataFrame, df_mst: pd.DataFrame) -> pd.DataFrame:
+    def to_dict(d):
+        out = {}
+        for gk, grp in d.groupby("GroupKey"):
+            rec = {}
+            nm = grp["Name"].iloc[0] if not grp.empty else ""
+            rec["Name"] = nm
+            for _, row in grp.iterrows():
+                rec[row["Attribute"]] = row["Value"]
+            out[gk] = rec
+        return out
+    e_dict = to_dict(df_erp)
+    m_dict = to_dict(df_mst)
+    all_gk = set(e_dict.keys()) | set(m_dict.keys())
+    results = []
+    for gk in all_gk:
+        dim = gk.split(" | ")[0]
+        a_data = e_dict.get(gk, {})
+        b_data = m_dict.get(gk, {})
+        name_a = a_data.get("Name", "")
+        name_b = b_data.get("Name", "")
+        if name_a and name_b and name_a == name_b:
+            all_attrs = (set(a_data.keys()) | set(b_data.keys())) - {"Name"}
+            for at in all_attrs:
+                va = a_data.get(at, "")
+                vb = b_data.get(at, "")
+                if va != vb:
+                    if va and not vb:
+                        results.append({"Dimension": dim, "Name": name_a, "Attribute": at, "Value": va, "Missing In": "MASTER"})
+                    elif vb and not va:
+                        results.append({"Dimension": dim, "Name": name_a, "Attribute": at, "Value": vb, "Missing In": "ERP"})
+                    else:
+                        results.append({"Dimension": dim, "Name": name_a, "Attribute": at, "Value": va, "Missing In": "MASTER"})
+                        results.append({"Dimension": dim, "Name": name_a, "Attribute": at, "Value": vb, "Missing In": "ERP"})
+        else:
+            if name_a and not name_b:
+                results.append({"Dimension": dim, "Name": name_a, "Attribute": "Name", "Value": name_a, "Missing In": "MASTER"})
+            elif name_b and not name_a:
+                results.append({"Dimension": dim, "Name": name_b, "Attribute": "Name", "Value": name_b, "Missing In": "ERP"})
+    df_res = pd.DataFrame(results)
+    if not df_res.empty:
+        df_res["Key"] = (df_res["Dimension"].str.strip() + " | " +
+                         df_res["Name"].str.strip() + " | " +
+                         df_res["Attribute"].str.strip() + " | " +
+                         df_res["Value"].str.strip())
+    return df_res
+
+def read_exception_table(path: Path) -> pd.DataFrame:
+    if not path.is_file():
+        logging.warning(f"Exception table not found => {path}")
+        return pd.DataFrame()
+    try:
+        df = pd.read_excel(path)
+        df.columns = df.columns.astype(str).str.strip()
+        return df
+    except Exception as e:
+        logging.error(f"Error reading exception => {e}")
+        return pd.DataFrame()
+
+def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or df_exc.empty or "Key" not in df.columns:
+        return df
+    keep = [c for c in df_exc.columns if c in ["Key", "Comments_1", "Comments_2", "hide exception"]]
+    if not keep:
+        return df
+    exc = df_exc[keep].copy()
+    exc["Key"] = exc["Key"].astype(str).str.strip()
+    merged = df.merge(exc, on="Key", how="left", suffixes=("", "_exc"))
+    merged["hide exception"] = merged.get("hide exception", "").fillna("").str.lower()
+    final = merged[merged["hide exception"] != "yes"].copy()
+    if "Comments_1_exc" in final.columns:
+        final["Comments_1"] = np.where(final["Comments_1_exc"].notna(), final["Comments_1_exc"], final["Comments_1"])
+        final.drop(columns=["Comments_1_exc"], inplace=True)
+    if "Comments_2_exc" in final.columns:
+        final["Comments_2"] = np.where(final["Comments_2_exc"].notna(), final["Comments_2_exc"], final["Comments_2"])
+        final.drop(columns=["Comments_2_exc"], inplace=True)
+    if "hide exception" in final.columns:
+        final.drop(columns=["hide exception"], inplace=True)
+    return final
+
+def write_missing_items(df: pd.DataFrame, out_path: Path):
+    if df.empty:
+        logging.info("No missing items => skip writing.")
+        return
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    final_cols = ["Key", "Dimension", "Name", "Attribute", "Value", "Comments_1", "Comments_2", "Action Item", "Missing In"]
+    for c in final_cols:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[final_cols]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Missing Items"
+    ws.append(final_cols)
+    for rowvals in df.itertuples(index=False):
+        ws.append(rowvals)
+    header_font = Font(bold=True)
+    fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = fill
+        cell.alignment = Alignment(horizontal="center")
+    for col in ws.columns:
+        max_len = 0
+        letter = col[0].column_letter
+        for cell in col:
+            val = str(cell.value) if cell.value else ""
+            max_len = max(max_len, len(val))
+        ws.column_dimensions[letter].width = max_len + 2
+    ws.freeze_panes = "A2"
+    wb.save(out_path)
+    logging.info(f"Missing items => {out_path}")
+
+# ----------------------------------------------------------------------------
+# Dashboard Charts Function for PDF and Dashboard
+# ----------------------------------------------------------------------------
+def plot_dashboard_charts(df_current: pd.DataFrame, df_history: pd.DataFrame) -> Dict[str, plt.Figure]:
+    charts = {}
+
+    # 1. Heatmap Chart
+    def create_heatmap(df):
+        if df.empty or "Missing In" not in df.columns:
+            return None
+        df_m = df[df["Missing In"] != ""]
+        if df_m.empty or not {"Dimension", "Attribute"}.issubset(df_m.columns):
+            return None
+        pivot = df_m.groupby(["Dimension", "Attribute"]).size().unstack(fill_value=0)
+        if pivot.empty:
+            return None
+        fig, ax = plt.subplots(figsize=(8, 5))
+        im = ax.imshow(pivot, aspect="auto", cmap="Reds")
+        ax.set_xticks(np.arange(len(pivot.columns)))
+        ax.set_xticklabels(pivot.columns, rotation=45, ha='right')
+        ax.set_yticks(np.arange(len(pivot.index)))
+        ax.set_yticklabels(pivot.index)
+        for i in range(len(pivot.index)):
+            for j in range(len(pivot.columns)):
+                ax.text(j, i, str(pivot.iloc[i, j]), ha="center", va="center", fontsize=8)
+        plt.colorbar(im, ax=ax)
+        ax.set_title("Missing Items Heatmap", y=0.90)
+        return fig
+
+    charts["heatmap"] = create_heatmap(df_current)
+
+    # 2. Lollipop Chart
+    def create_lollipop(df):
+        if df.empty or "Missing In" not in df.columns:
+            return None
+        df_m = df[df["Missing In"] != ""]
+        if df_m.empty:
+            return None
+        cdim = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=True)
+        cdim = cdim.tail(10)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.hlines(y=range(len(cdim)), xmin=0, xmax=cdim.values, color='skyblue', alpha=0.7, linewidth=2)
+        ax.plot(cdim.values, range(len(cdim)), 'o', color='skyblue', markersize=8)
+        ax.set_yticks(range(len(cdim)))
+        ax.set_yticklabels(cdim.index)
+        for idx, value in enumerate(cdim.values):
+            ax.text(value, idx, f' {int(value)}', va='center')
+        ax.set_title("Top 10 Dimensions - Lollipop Chart", y=0.90)
+        ax.set_xlabel("Count")
+        return fig
+
+    charts["lollipop"] = create_lollipop(df_current)
+
+    # 3. Circular Chart
+    def create_circular(df):
+        if df.empty or "Missing In" not in df.columns:
+            return None
+        df_m = df[df["Missing In"] != ""]
+        if df_m.empty:
+            return None
+        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(8)
+        fig = plt.figure(figsize=(8, 8))
+        ax = fig.add_subplot(111, polar=True)
+        angles = np.linspace(0, 2*np.pi, len(cattr), endpoint=False)
+        values = cattr.values
+        bars = ax.bar(angles, values, width=0.5, bottom=0.0, alpha=0.7, color=plt.cm.Set3(np.linspace(0, 1, len(cattr))))
+        ax.set_xticks(angles)
+        ax.set_xticklabels(cattr.index, rotation=45)
+        for angle, value in zip(angles, values):
+            ax.text(angle, value, f'{int(value)}', ha='center', va='bottom')
+        ax.set_title("Top 8 Attributes - Circular Chart", y=0.90)
+        return fig
+
+    charts["circular"] = create_circular(df_current)
+
+    # 4. Scatter Plot
+    def create_scatter(df):
+        if df.empty or "Missing In" not in df.columns:
+            return None
+        df_m = df[df["Missing In"] != ""]
+        if df_m.empty:
+            return None
+        cdim = df_m.groupby("Dimension")["Key"].count().reset_index()
+        cdim = cdim.sort_values("Key", ascending=False).head(10)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.scatter(range(len(cdim)), cdim["Key"], s=80, c=plt.cm.viridis(np.linspace(0, 1, len(cdim))))
+        ax.set_xticks(range(len(cdim)))
+        ax.set_xticklabels(cdim["Dimension"], rotation=45, ha='right')
+        for i, value in enumerate(cdim["Key"]):
+            ax.text(i, value, f'{int(value)}', ha='center', va='bottom')
+        ax.set_title("Top 10 Dimensions - Scatter Plot", y=0.90)
+        ax.set_ylabel("Count")
+        return fig
+
+    charts["scatter"] = create_scatter(df_current)
+
+    # 5. Radar Chart
+    def create_radar(df):
+        if df.empty or "Missing In" not in df.columns:
+            return None
+        df_m = df[df["Missing In"] != ""]
+        if df_m.empty:
+            return None
+        cdim = df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False).head(8)
+        angles = np.linspace(0, 2*np.pi, len(cdim), endpoint=False)
+        values = cdim.values
+        angles = np.concatenate((angles, [angles[0]]))
+        values = np.concatenate((values, [values[0]]))
+        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(projection='polar'))
+        ax.plot(angles, values, color='red', linewidth=2)
+        ax.fill(angles, values, color='red', alpha=0.25)
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(cdim.index)
+        for angle, value in zip(angles[:-1], values[:-1]):
+            ax.text(angle, value, f'{int(value)}', ha='center', va='bottom')
+        ax.set_title("Top 8 Dimensions - Radar Chart", y=0.90)
+        return fig
+
+    charts["radar"] = create_radar(df_current)
+
+    # 6. Pie Chart
+    def create_pie(df):
+        if df.empty or "Missing In" not in df.columns:
+            return None
+        df_m = df[df["Missing In"] != ""]
+        if df_m.empty:
+            return None
+        missing_dist = df_m["Missing In"].value_counts()
+        fig, ax = plt.subplots(figsize=(8, 6))
+        wedges, texts, autotexts = ax.pie(missing_dist.values, labels=missing_dist.index,
+                                          autopct='%1.1f%%', colors=plt.cm.Set3(np.linspace(0, 1, len(missing_dist))))
+        ax.set_title("Missing Items Distribution - Pie Chart", y=0.90)
+        plt.setp(autotexts, size=9, weight="bold")
+        plt.setp(texts, size=9)
+        return fig
+
+    charts["pie"] = create_pie(df_current)
+
+    # 7. Bar Chart
+    def create_bar(df):
+        if df.empty or "Missing In" not in df.columns:
+            return None
+        df_m = df[df["Missing In"] != ""]
+        if df_m.empty:
+            return None
+        cattr = df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
+        fig, ax = plt.subplots(figsize=(10, 6))
+        bars = ax.bar(range(len(cattr)), cattr.values, color=plt.cm.Set3(np.linspace(0, 1, len(cattr))))
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height, f'{int(height)}', ha='center', va='bottom')
+        ax.set_xticks(range(len(cattr)))
+        ax.set_xticklabels(cattr.index, rotation=45, ha='right')
+        ax.set_title("Top 10 Attributes - Bar Chart", y=0.90)
+        ax.set_ylabel("Count")
+        return fig
+
+    charts["bar"] = create_bar(df_current)
+
+    # 8. Band Chart (Trend Analysis)
+    def create_band_chart(df_hist):
+        if df_hist.empty or "RunDate" not in df_hist.columns:
+            return None
+        date_ct = df_hist.groupby("RunDate")["Key"].count().reset_index(name="Count")
+        date_ct.sort_values("RunDate", inplace=True)
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(date_ct["RunDate"], date_ct["Count"], color='purple', marker='o', linewidth=2, label='Count')
+        ax.fill_between(date_ct["RunDate"], date_ct["Count"]*0.9, date_ct["Count"]*1.1,
+                        color='purple', alpha=0.2, label='±10% band')
+        for i, row in date_ct.iterrows():
+            ax.text(row["RunDate"], row["Count"], f'{int(row["Count"])}', ha='center', va='bottom')
+        ax.set_title("Trend Analysis with Confidence Band", y=0.90)
+        ax.set_xlabel("Run Date")
+        ax.set_ylabel("Count")
+        plt.xticks(rotation=45)
+        ax.legend()
+        return fig
+
+    charts["band"] = create_band_chart(df_history)
+
+    return charts
+
+# ----------------------------------------------------------------------------
+# HISTORY BROWSER (lists JSON files and shows info on double-click)
+# ----------------------------------------------------------------------------
+class HistoryBrowser(ctk.CTkFrame):
+    def __init__(self, parent, history_dir: str):
+        super().__init__(parent)
+        self.history_dir = history_dir
+        self.create_widgets()
+        self.refresh_file_list()
+
+    def create_widgets(self):
+        self.file_listbox = tk.Listbox(self, width=80)
+        self.file_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = tk.Scrollbar(self, command=self.file_listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.file_listbox.config(yscrollcommand=scrollbar.set)
+        self.file_listbox.bind("<Double-Button-1>", self.on_click)
+        refresh_btn = ctk.CTkButton(self, text="Refresh", command=self.refresh_file_list,
+                                    fg_color="#800020", hover_color="#a52a2a", text_color="white")
+        refresh_btn.pack(side="bottom", pady=5)
+
+    def refresh_file_list(self):
+        self.file_listbox.delete(0, tk.END)
+        if not os.path.exists(self.history_dir):
+            os.makedirs(self.history_dir)
+        for file in sorted(os.listdir(self.history_dir)):
+            if file.endswith(".json"):
+                file_path = os.path.join(self.history_dir, file)
+                try:
+                    with open(file_path, "r") as f:
+                        data = json.load(f)
+                        count = len(data.get("mismatches", []))
+                        display_text = f"{file} - {count} missing items"
+                except Exception:
+                    display_text = file
+                self.file_listbox.insert(tk.END, display_text)
+
+    def on_click(self, event):
+        selection = self.file_listbox.curselection()
+        if selection:
+            entry = self.file_listbox.get(selection[0])
+            file_name = entry.split(" - ")[0]
+            file_path = os.path.join(self.history_dir, file_name)
+            try:
+                with open(file_path, "r") as f:
+                    data = json.load(f)
+                timestamp = data.get("timestamp", "N/A")
+                count = len(data.get("mismatches", []))
+                messagebox.showinfo("History Info", f"Timestamp: {timestamp}\nMissing items: {count}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open history file: {e}")
+
+# ----------------------------------------------------------------------------
+# ADVANCED DASHBOARD (displays 8 fixed-size charts)
+# ----------------------------------------------------------------------------
+class AdvancedDashboard(ctk.CTkFrame):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.df_current = pd.DataFrame()
+        self.df_history = pd.DataFrame()
+        self.selected_dims: Set[str] = set()
+        self.selected_attrs: Set[str] = set()
+        self.top_n = 10
+
+        self.topbar_scroll = ctk.CTkScrollableFrame(self, orientation="horizontal", height=60)
+        self.topbar_scroll.pack(fill="x", pady=5)
+        self.metric_label = ctk.CTkLabel(self.topbar_scroll, text="Metrics: 0 missing, 0 dimension", width=300)
+        self.metric_label.pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Filter Dimension", command=self.show_dimension_filter,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Filter Attribute", command=self.show_attribute_filter,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Last 7 Days", command=lambda: self.set_quick_range(7),
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Last 30 Days", command=lambda: self.set_quick_range(30),
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Last 90 Days", command=lambda: self.set_quick_range(90),
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="All Time", command=lambda: self.set_quick_range(9999),
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        self.start_date_var = tk.StringVar(value=(datetime.now()-timedelta(days=30)).strftime("%Y-%m-%d"))
+        self.end_date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+        ctk.CTkEntry(self.topbar_scroll, textvariable=self.start_date_var, width=100, text_color="black").pack(side="left", padx=5)
+        ctk.CTkEntry(self.topbar_scroll, textvariable=self.end_date_var, width=100, text_color="black").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Update Timeline", command=self.update_data_filters,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Toggle Top 10 / All", command=self.toggle_top_n,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
+        self.frames = {}
+        chart_names = ["Heatmap", "Lollipop", "Circular", "Scatter", "Radar", "Normal Pie", "Normal Bar", "Band Chart"]
+        for lbl in chart_names:
+            fr = ctk.CTkFrame(self.notebook)
+            self.notebook.add(fr, text=lbl)
+            self.frames[lbl] = fr
+
+    def toggle_top_n(self):
+        if self.top_n == 10:
+            self.top_n = None
+        else:
+            self.top_n = 10
+        self.update_data_filters()
+
+    def set_quick_range(self, days: int):
+        if days > 9000:
+            self.start_date_var.set("1900-01-01")
+            self.end_date_var.set("2100-12-31")
+        else:
+            dt_end = datetime.now()
+            dt_start = dt_end - timedelta(days=days)
+            self.start_date_var.set(dt_start.strftime("%Y-%m-%d"))
+            self.end_date_var.set(dt_end.strftime("%Y-%m-%d"))
+        self.update_data_filters()
+
+    def show_dimension_filter(self):
+        self.show_filter_popup("Dimension")
+
+    def show_attribute_filter(self):
+        self.show_filter_popup("Attribute")
+
+    def show_filter_popup(self, col: str):
+        base_df = self.df_history if not self.df_history.empty else self.df_current
+        if base_df.empty or col not in base_df.columns:
+            return
+        popup = tk.Toplevel(self)
+        popup.title(f"Filter: {col}")
+        popup.geometry("300x400")
+        frame = ctk.CTkFrame(popup)
+        frame.pack(fill="both", expand=True, padx=5, pady=5)
+        unique_vals = self.df_current[col].dropna().unique().tolist()
+        if self.df_current[col].isna().any():
+            unique_vals.append("(NaN)")
+        display_map = {str(v): str(v) for v in unique_vals}
+        sorted_vals = sorted(display_map.keys(), key=lambda x: x.lower())
+        if col == "Dimension":
+            curr = self.selected_dims
+        else:
+            curr = self.selected_attrs
+        if not curr:
+            curr = set(sorted_vals)
+        selall_var = tk.BooleanVar(value=True)
+        def toggle_all():
+            check = selall_var.get()
+            for vb in var_dict.values():
+                vb.set(check)
+        ctk.CTkCheckBox(frame, text="Select All", variable=selall_var, command=toggle_all,
+                        fg_color="#800020", hover_color="#a52a2a", text_color="black").pack(anchor="w", pady=5)
+        scroll = ctk.CTkScrollableFrame(frame, width=250, height=250)
+        scroll.pack(fill="both", expand=True, padx=5, pady=5)
+        var_dict = {}
+        for key in sorted_vals:
+            in_filter = key in curr
+            bvar = tk.BooleanVar(value=in_filter)
+            var_dict[key] = bvar
+            ctk.CTkCheckBox(scroll, text=display_map[key], variable=bvar,
+                             fg_color="#800020", hover_color="#a52a2a", text_color="black").pack(anchor="w")
+        def apply_():
+            sel = {key for key, vb in var_dict.items() if vb.get()}
+            if col == "Dimension":
+                self.selected_dims = sel
+            else:
+                self.selected_attrs = sel
+            popup.destroy()
+            self.update_data_filters()
+        bf = ctk.CTkFrame(frame)
+        bf.pack(fill="x", pady=5)
+        ctk.CTkButton(bf, text="Apply", command=apply_,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(bf, text="Cancel", command=popup.destroy,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+
+    def update_data_filters(self):
+        dfc = self.df_current.copy()
+        if not dfc.empty:
+            if self.selected_dims:
+                dfc = dfc[dfc["Dimension"].isin(self.selected_dims)]
+            if self.selected_attrs:
+                dfc = dfc[dfc["Attribute"].isin(self.selected_attrs)]
+            if "RunDate" in dfc.columns:
+                try:
+                    start = datetime.strptime(self.start_date_var.get(), "%Y-%m-%d")
+                    end = datetime.strptime(self.end_date_var.get(), "%Y-%m-%d")
+                    dfc["RunDate_dt"] = pd.to_datetime(dfc["RunDate"], errors="coerce")
+                    dfc = dfc[(dfc["RunDate_dt"] >= start) & (dfc["RunDate_dt"] <= end)]
+                except Exception as e:
+                    logging.error(f"Date filter error => {e}")
+        mism = len(dfc)
+        dims = dfc["Dimension"].nunique() if not dfc.empty and "Dimension" in dfc.columns else 0
+        self.metric_label.configure(text=f"Mismatches: {mism}, Dims: {dims}")
+        charts = plot_dashboard_charts(dfc, self.df_history)
+        for key, fig in charts.items():
+            if fig is not None and key in self.frames:
+                self.plot_chart(self.frames[key], fig)
+
+    def plot_chart(self, frame, fig):
+        for w in frame.winfo_children():
+            w.destroy()
+        canvas = FigureCanvasTkAgg(fig, master=frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+# ----------------------------------------------------------------------------
+# HISTORY BROWSER (lists JSON files and shows info on double-click)
+# ----------------------------------------------------------------------------
+class HistoryBrowser(ctk.CTkFrame):
+    def __init__(self, parent, history_dir: str):
+        super().__init__(parent)
+        self.history_dir = history_dir
+        self.create_widgets()
+        self.refresh_file_list()
+
+    def create_widgets(self):
+        self.file_listbox = tk.Listbox(self, width=80)
+        self.file_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = tk.Scrollbar(self, command=self.file_listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.file_listbox.config(yscrollcommand=scrollbar.set)
+        self.file_listbox.bind("<Double-Button-1>", self.on_click)
+        refresh_btn = ctk.CTkButton(self, text="Refresh", command=self.refresh_file_list,
+                                    fg_color="#800020", hover_color="#a52a2a", text_color="white")
+        refresh_btn.pack(side="bottom", pady=5)
+
+    def refresh_file_list(self):
+        self.file_listbox.delete(0, tk.END)
+        if not os.path.exists(self.history_dir):
+            os.makedirs(self.history_dir)
+        for file in sorted(os.listdir(self.history_dir)):
+            if file.endswith(".json"):
+                file_path = os.path.join(self.history_dir, file)
+                try:
+                    with open(file_path, "r") as f:
+                        data = json.load(f)
+                        count = len(data.get("mismatches", []))
+                        display_text = f"{file} - {count} missing items"
+                except Exception:
+                    display_text = file
+                self.file_listbox.insert(tk.END, display_text)
+
+    def on_click(self, event):
+        selection = self.file_listbox.curselection()
+        if selection:
+            entry = self.file_listbox.get(selection[0])
+            file_name = entry.split(" - ")[0]
+            file_path = os.path.join(self.history_dir, file_name)
+            try:
+                with open(file_path, "r") as f:
+                    data = json.load(f)
+                timestamp = data.get("timestamp", "N/A")
+                count = len(data.get("mismatches", []))
+                messagebox.showinfo("History Info", f"Timestamp: {timestamp}\nMissing items: {count}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open history file: {e}")
+
+# ----------------------------------------------------------------------------
+# ENHANCED PDF REPORT (with comprehensive layout)
+# ----------------------------------------------------------------------------
+class EnhancedPDFReport:
+    def __init__(self, df_current: pd.DataFrame, df_history: pd.DataFrame, config_dict: Dict):
+        self.df_current = df_current
+        self.df_history = df_history
+        self.config_dict = config_dict
+        self.logo_path = Path(config_dict["paths"].get("LOGO_PATH", "images/company_logo.png"))
+        self.pdf_path = Path(config_dict["paths"].get("PDF_EXPORT_PATH", "output/dashboard_report.pdf"))
+        self.PAGE_WIDTH = 11
+        self.PAGE_HEIGHT = 8.5
+
+    def generate(self) -> Path:
+        self.pdf_path.parent.mkdir(parents=True, exist_ok=True)
+        with PdfPages(self.pdf_path) as pdf:
+            self._create_cover_page(pdf)
+            self._create_summary_page(pdf)
+            charts = plot_dashboard_charts(self.df_current, self.df_history)
+            for name, fig in charts.items():
+                if fig is not None:
+                    fig.set_size_inches(self.PAGE_WIDTH, self.PAGE_HEIGHT)
+                    pdf.savefig(fig, bbox_inches='tight', dpi=300)
+                    plt.close(fig)
+            d = pdf.infodict()
+            d['Title'] = 'Reconciliation Report'
+            d['Author'] = 'Ultra-Mega Reconciliation System'
+            d['Subject'] = 'Data Reconciliation Analysis'
+            d['Keywords'] = 'reconciliation, analysis, data quality'
+            d['CreationDate'] = datetime.now()
+            d['ModDate'] = datetime.now()
+        return self.pdf_path
+
+    def _create_cover_page(self, pdf: PdfPages):
+        fig = plt.figure(figsize=(self.PAGE_WIDTH, self.PAGE_HEIGHT))
+        fig.set_facecolor('white')
+        plt.axis('off')
+        if self.logo_path.exists():
+            try:
+                img = Image.open(self.logo_path)
+                plt.figimage(img, xo=100, yo=fig.get_figheight()*72*0.55, alpha=0.15, zorder=10)
+            except Exception as e:
+                logging.warning(f"Could not load logo: {e}")
+        plt.text(0.5, 0.50, 'Reconciliation Report', fontsize=24, ha='center', transform=fig.transFigure)
+        run_date = self.df_current["RunDate"].iloc[0] if not self.df_current.empty else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        plt.text(0.5, 0.40, f'Generated on: {run_date}', fontsize=12, ha='center', transform=fig.transFigure)
+        plt.text(0.5, 0.30, 'Ultra-Mega Reconciliation System', fontsize=14, ha='center', transform=fig.transFigure)
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
+
+    def _create_summary_page(self, pdf: PdfPages):
+        fig = plt.figure(figsize=(self.PAGE_WIDTH, self.PAGE_HEIGHT))
+        fig.set_facecolor('white')
+        plt.axis('off')
+        total_mismatches = len(self.df_current)
+        total_dimensions = self.df_current["Dimension"].nunique() if not self.df_current.empty else 0
+        missing_distribution = self.df_current["Missing In"].value_counts() if not self.df_current.empty else pd.Series()
+        historical_counts = self.df_history.groupby("RunDate")["Key"].count() if not self.df_history.empty else pd.Series()
+        trend = "↑" if len(historical_counts) >= 2 and historical_counts.iloc[-1] > historical_counts.iloc[-2] else "↓"
+        summary_text = [
+            "Executive Summary",
+            "==================",
+            f"\nTotal Mismatches: {total_mismatches}",
+            f"Affected Dimensions: {total_dimensions}",
+            "\nMissing Items Distribution:"
+        ]
+        for system, count in missing_distribution.items():
+            summary_text.append(f"- {system}: {count} items")
+        if not historical_counts.empty:
+            summary_text.extend([
+                "\nHistorical Trend:",
+                f"- Current: {historical_counts.iloc[-1]} mismatches",
+                f"- Trend: {trend} compared to previous run",
+                f"- Average: {historical_counts.mean():.1f} mismatches"
+            ])
+        summary_text.extend([
+            "\nKey Findings:",
+            "- " + self._generate_main_finding(),
+            "- " + self._generate_dimension_finding(),
+            "- " + self._generate_trend_finding(historical_counts)
+        ])
+        plt.text(0.1, 0.90, "\n".join(summary_text), fontsize=12, va='top',
+                 transform=fig.transFigure, family='monospace')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
+
+    def _generate_main_finding(self) -> str:
+        if self.df_current.empty:
+            return "No mismatches found in the current analysis"
+        main_system = self.df_current["Missing In"].mode().iloc[0]
+        main_count = self.df_current["Missing In"].value_counts().iloc[0]
+        total = len(self.df_current)
+        return f"Most mismatches ({main_count}/{total}, {main_count/total*100:.1f}%) are missing in {main_system}"
+
+    def _generate_dimension_finding(self) -> str:
+        if self.df_current.empty:
+            return "No dimension-specific findings available"
+        dim_counts = self.df_current["Dimension"].value_counts()
+        if dim_counts.empty:
+            return "No dimension-specific findings available"
+        top_dim = dim_counts.index[0]
+        top_count = dim_counts.iloc[0]
+        return f"The most affected dimension is '{top_dim}' with {top_count} mismatches"
+
+    def _generate_trend_finding(self, historical_counts: pd.Series) -> str:
+        if len(historical_counts) < 2:
+            return "Insufficient historical data for trend analysis"
+        current = historical_counts.iloc[-1]
+        previous = historical_counts.iloc[-2]
+        change_pct = (current - previous) / previous * 100
+        if change_pct > 0:
+            return f"Mismatches increased by {abs(change_pct):.1f}% compared to previous run"
+        else:
+            return f"Mismatches decreased by {abs(change_pct):.1f}% compared to previous run"
+
+# ----------------------------------------------------------------------------
+# HISTORY BROWSER (lists JSON files and shows info on double-click)
+# ----------------------------------------------------------------------------
+class HistoryBrowser(ctk.CTkFrame):
+    def __init__(self, parent, history_dir: str):
+        super().__init__(parent)
+        self.history_dir = history_dir
+        self.create_widgets()
+        self.refresh_file_list()
+
+    def create_widgets(self):
+        self.file_listbox = tk.Listbox(self, width=80)
+        self.file_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = tk.Scrollbar(self, command=self.file_listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.file_listbox.config(yscrollcommand=scrollbar.set)
+        self.file_listbox.bind("<Double-Button-1>", self.on_click)
+        refresh_btn = ctk.CTkButton(self, text="Refresh", command=self.refresh_file_list,
+                                    fg_color="#800020", hover_color="#a52a2a", text_color="white")
+        refresh_btn.pack(side="bottom", pady=5)
+
+    def refresh_file_list(self):
+        self.file_listbox.delete(0, tk.END)
+        if not os.path.exists(self.history_dir):
+            os.makedirs(self.history_dir)
+        for file in sorted(os.listdir(self.history_dir)):
+            if file.endswith(".json"):
+                file_path = os.path.join(self.history_dir, file)
+                try:
+                    with open(file_path, "r") as f:
+                        data = json.load(f)
+                        count = len(data.get("mismatches", []))
+                        display_text = f"{file} - {count} missing items"
+                except Exception:
+                    display_text = file
+                self.file_listbox.insert(tk.END, display_text)
+
+    def on_click(self, event):
+        selection = self.file_listbox.curselection()
+        if selection:
+            entry = self.file_listbox.get(selection[0])
+            file_name = entry.split(" - ")[0]
+            file_path = os.path.join(self.history_dir, file_name)
+            try:
+                with open(file_path, "r") as f:
+                    data = json.load(f)
+                timestamp = data.get("timestamp", "N/A")
+                count = len(data.get("mismatches", []))
+                messagebox.showinfo("History Info", f"Timestamp: {timestamp}\nMissing items: {count}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open history file: {e}")
+
+# ----------------------------------------------------------------------------
+# ADVANCED DASHBOARD (displays 8 fixed-size charts)
+# ----------------------------------------------------------------------------
+class AdvancedDashboard(ctk.CTkFrame):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.df_current = pd.DataFrame()
+        self.df_history = pd.DataFrame()
+        self.selected_dims: Set[str] = set()
+        self.selected_attrs: Set[str] = set()
+        self.top_n = 10
+
+        self.topbar_scroll = ctk.CTkScrollableFrame(self, orientation="horizontal", height=60)
+        self.topbar_scroll.pack(fill="x", pady=5)
+        self.metric_label = ctk.CTkLabel(self.topbar_scroll, text="Metrics: 0 missing, 0 dimension", width=300)
+        self.metric_label.pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Filter Dimension", command=self.show_dimension_filter,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Filter Attribute", command=self.show_attribute_filter,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Last 7 Days", command=lambda: self.set_quick_range(7),
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Last 30 Days", command=lambda: self.set_quick_range(30),
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Last 90 Days", command=lambda: self.set_quick_range(90),
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="All Time", command=lambda: self.set_quick_range(9999),
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        self.start_date_var = tk.StringVar(value=(datetime.now()-timedelta(days=30)).strftime("%Y-%m-%d"))
+        self.end_date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+        ctk.CTkEntry(self.topbar_scroll, textvariable=self.start_date_var, width=100, text_color="black").pack(side="left", padx=5)
+        ctk.CTkEntry(self.topbar_scroll, textvariable=self.end_date_var, width=100, text_color="black").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Update Timeline", command=self.update_data_filters,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(self.topbar_scroll, text="Toggle Top 10 / All", command=self.toggle_top_n,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
+        self.frames = {}
+        chart_names = ["Heatmap", "Lollipop", "Circular", "Scatter", "Radar", "Normal Pie", "Normal Bar", "Band Chart"]
+        for lbl in chart_names:
+            fr = ctk.CTkFrame(self.notebook)
+            self.notebook.add(fr, text=lbl)
+            self.frames[lbl] = fr
+
+    def toggle_top_n(self):
+        if self.top_n == 10:
+            self.top_n = None
+        else:
+            self.top_n = 10
+        self.update_data_filters()
+
+    def set_quick_range(self, days: int):
+        if days > 9000:
+            self.start_date_var.set("1900-01-01")
+            self.end_date_var.set("2100-12-31")
+        else:
+            dt_end = datetime.now()
+            dt_start = dt_end - timedelta(days=days)
+            self.start_date_var.set(dt_start.strftime("%Y-%m-%d"))
+            self.end_date_var.set(dt_end.strftime("%Y-%m-%d"))
+        self.update_data_filters()
+
+    def show_dimension_filter(self):
+        self.show_filter_popup("Dimension")
+
+    def show_attribute_filter(self):
+        self.show_filter_popup("Attribute")
+
+    def show_filter_popup(self, col: str):
+        base_df = self.df_history if not self.df_history.empty else self.df_current
+        if base_df.empty or col not in base_df.columns:
+            return
+        popup = tk.Toplevel(self)
+        popup.title(f"Filter: {col}")
+        popup.geometry("300x400")
+        frame = ctk.CTkFrame(popup)
+        frame.pack(fill="both", expand=True, padx=5, pady=5)
+        unique_vals = self.df_current[col].dropna().unique().tolist()
+        if self.df_current[col].isna().any():
+            unique_vals.append("(NaN)")
+        display_map = {str(v): str(v) for v in unique_vals}
+        sorted_vals = sorted(display_map.keys(), key=lambda x: x.lower())
+        if col == "Dimension":
+            curr = self.selected_dims
+        else:
+            curr = self.selected_attrs
+        if not curr:
+            curr = set(sorted_vals)
+        selall_var = tk.BooleanVar(value=True)
+        def toggle_all():
+            check = selall_var.get()
+            for vb in var_dict.values():
+                vb.set(check)
+        ctk.CTkCheckBox(frame, text="Select All", variable=selall_var, command=toggle_all,
+                        fg_color="#800020", hover_color="#a52a2a", text_color="black").pack(anchor="w", pady=5)
+        scroll = ctk.CTkScrollableFrame(frame, width=250, height=250)
+        scroll.pack(fill="both", expand=True, padx=5, pady=5)
+        var_dict = {}
+        for key in sorted_vals:
+            in_filter = key in curr
+            bvar = tk.BooleanVar(value=in_filter)
+            var_dict[key] = bvar
+            ctk.CTkCheckBox(scroll, text=display_map[key], variable=bvar,
+                             fg_color="#800020", hover_color="#a52a2a", text_color="black").pack(anchor="w")
+        def apply_():
+            sel = {key for key, vb in var_dict.items() if vb.get()}
+            if col == "Dimension":
+                self.selected_dims = sel
+            else:
+                self.selected_attrs = sel
+            popup.destroy()
+            self.update_data_filters()
+        bf = ctk.CTkFrame(frame)
+        bf.pack(fill="x", pady=5)
+        ctk.CTkButton(bf, text="Apply", command=apply_,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+        ctk.CTkButton(bf, text="Cancel", command=popup.destroy,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
+
+    def update_data_filters(self):
+        dfc = self.df_current.copy()
+        if not dfc.empty:
+            if self.selected_dims:
+                dfc = dfc[dfc["Dimension"].isin(self.selected_dims)]
+            if self.selected_attrs:
+                dfc = dfc[dfc["Attribute"].isin(self.selected_attrs)]
+            if "RunDate" in dfc.columns:
+                try:
+                    start = datetime.strptime(self.start_date_var.get(), "%Y-%m-%d")
+                    end = datetime.strptime(self.end_date_var.get(), "%Y-%m-%d")
+                    dfc["RunDate_dt"] = pd.to_datetime(dfc["RunDate"], errors="coerce")
+                    dfc = dfc[(dfc["RunDate_dt"] >= start) & (dfc["RunDate_dt"] <= end)]
+                except Exception as e:
+                    logging.error(f"Date filter error => {e}")
+        mism = len(dfc)
+        dims = dfc["Dimension"].nunique() if not dfc.empty and "Dimension" in dfc.columns else 0
+        self.metric_label.configure(text=f"Mismatches: {mism}, Dims: {dims}")
+        charts = plot_dashboard_charts(dfc, self.df_history)
+        for key, fig in charts.items():
+            if fig is not None and key in self.frames:
+                self.plot_chart(self.frames[key], fig)
+
+    def plot_chart(self, frame, fig):
+        for w in frame.winfo_children():
+            w.destroy()
+        canvas = FigureCanvasTkAgg(fig, master=frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+# ----------------------------------------------------------------------------
+# HISTORY BROWSER (lists JSON files and shows info on double-click)
+# ----------------------------------------------------------------------------
+class HistoryBrowser(ctk.CTkFrame):
+    def __init__(self, parent, history_dir: str):
+        super().__init__(parent)
+        self.history_dir = history_dir
+        self.create_widgets()
+        self.refresh_file_list()
+
+    def create_widgets(self):
+        self.file_listbox = tk.Listbox(self, width=80)
+        self.file_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = tk.Scrollbar(self, command=self.file_listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.file_listbox.config(yscrollcommand=scrollbar.set)
+        self.file_listbox.bind("<Double-Button-1>", self.on_click)
+        refresh_btn = ctk.CTkButton(self, text="Refresh", command=self.refresh_file_list,
+                                    fg_color="#800020", hover_color="#a52a2a", text_color="white")
+        refresh_btn.pack(side="bottom", pady=5)
+
+    def refresh_file_list(self):
+        self.file_listbox.delete(0, tk.END)
+        if not os.path.exists(self.history_dir):
+            os.makedirs(self.history_dir)
+        for file in sorted(os.listdir(self.history_dir)):
+            if file.endswith(".json"):
+                file_path = os.path.join(self.history_dir, file)
+                try:
+                    with open(file_path, "r") as f:
+                        data = json.load(f)
+                        count = len(data.get("mismatches", []))
+                        display_text = f"{file} - {count} missing items"
+                except Exception:
+                    display_text = file
+                self.file_listbox.insert(tk.END, display_text)
+
+    def on_click(self, event):
+        selection = self.file_listbox.curselection()
+        if selection:
+            entry = self.file_listbox.get(selection[0])
+            file_name = entry.split(" - ")[0]
+            file_path = os.path.join(self.history_dir, file_name)
+            try:
+                with open(file_path, "r") as f:
+                    data = json.load(f)
+                timestamp = data.get("timestamp", "N/A")
+                count = len(data.get("mismatches", []))
+                messagebox.showinfo("History Info", f"Timestamp: {timestamp}\nMissing items: {count}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open history file: {e}")
+
+# ----------------------------------------------------------------------------
+# MAIN APP (with configurable paths for config/history)
+# ----------------------------------------------------------------------------
+class MainApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Ultra-Mega Reconciliation: Param-based, Full Dashboard")
+        self.geometry("1600x900")
+        ctk.set_appearance_mode("light")
+        self.config_dict = load_config(Path(DEFAULT_PATHS["CONFIG_PATH"]))
+        self.param_dict = read_param_file(Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"])))
+        self.history_df = pd.DataFrame()
+        date_filters = self.config_dict.get("date_filters", {})
+        self.start_date_var = tk.StringVar(value=date_filters.get("start_date", (datetime.now()-timedelta(days=30)).strftime("%Y-%m-%d")))
+        self.end_date_var = tk.StringVar(value=date_filters.get("end_date", datetime.now().strftime("%Y-%m-%d")))
+        self.hist_var = tk.StringVar(value=self.config_dict["paths"].get("HISTORY_FOLDER", "history"))
+        self.tabs = ttk.Notebook(self)
+        self.tabs.pack(fill="both", expand=True)
+        self.tab_paths = ctk.CTkFrame(self.tabs)
+        self.tabs.add(self.tab_paths, text="Paths")
+        self.build_paths_tab(self.tab_paths)
+        self.tab_erp = ctk.CTkFrame(self.tabs)
+        erp_filters = self.config_dict.get("erp_grid", {}).get("filters", {})
+        self.erp_preview = SimplePreview(self.tab_erp, "ERP", filters_dict=erp_filters)
+        self.erp_preview.pack(fill="both", expand=True)
+        self.tabs.add(self.tab_erp, text="ERP Preview")
+        self.tab_master = ctk.CTkFrame(self.tabs)
+        master_filters = self.config_dict.get("master_grid", {}).get("filters", {})
+        self.master_preview = SimplePreview(self.tab_master, "Master", filters_dict=master_filters)
+        self.master_preview.pack(fill="both", expand=True)
+        self.tabs.add(self.tab_master, text="Master Preview")
+        self.tab_compare = ctk.CTkFrame(self.tabs)
+        self.build_compare_tab(self.tab_compare)
+        self.tabs.add(self.tab_compare, text="Compare")
+        self.dashboard_tab = AdvancedDashboard(self.tabs)
+        self.tabs.add(self.dashboard_tab, text="Dashboard")
+        self.history_tab = HistoryBrowser(self.tabs, history_dir=self.hist_var.get())
+        self.tabs.add(self.history_tab, text="History")
+        self.log_box = ctk.CTkTextbox(self, height=120)
+        self.log_box.pack(fill="both")
+        self.log_box.configure(state="disabled")
+        handler = TextHandler(self.log_box)
+        handler.setLevel(logging.INFO)
+        logging.getLogger().addHandler(handler)
+        self.temp_csv_dir = Path(self.config_dict["paths"].get("MASTER_CSV_OUTPUT", "temp_master_csv"))
+        self.temp_csv_dir.mkdir(parents=True, exist_ok=True)
+        dash_state = self.config_dict.get('dashboard_state', {})
+        self.dashboard_tab.selected_dims = set(dash_state.get('selected_dims', []))
+        self.dashboard_tab.selected_attrs = set(dash_state.get('selected_attrs', []))
+        self.dashboard_tab.top_n = dash_state.get('top_n', 10)
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.refresh_erp()
+        self.refresh_master()
+        ctk.CTkButton(self, text="Close Script", command=self.quit,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(pady=5)
+
+    def build_paths_tab(self, parent):
+        frm = ctk.CTkFrame(parent)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+        self.erp_var = tk.StringVar(value=self.config_dict["paths"].get("ERP_EXCEL_PATH", DEFAULT_PATHS["ERP_EXCEL_PATH"]))
+        self.mast_var = tk.StringVar(value=self.config_dict["paths"].get("MASTER_ZIP_PATH", DEFAULT_PATHS["MASTER_ZIP_PATH"]))
+        self.exc_var = tk.StringVar(value=self.config_dict["paths"].get("EXCEPTION_PATH", DEFAULT_PATHS["EXCEPTION_PATH"]))
+        self.out_var = tk.StringVar(value=self.config_dict["paths"].get("OUTPUT_PATH", DEFAULT_PATHS["OUTPUT_PATH"]))
+        self.cfg_var = tk.StringVar(value=self.config_dict["paths"].get("CONFIG_PATH", DEFAULT_PATHS["CONFIG_PATH"]))
+        self.par_var = tk.StringVar(value=self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"]))
+        self.csv_var = tk.StringVar(value=self.config_dict["paths"].get("MASTER_CSV_OUTPUT", DEFAULT_PATHS["MASTER_CSV_OUTPUT"]))
+        self.pdf_var = tk.StringVar(value=self.config_dict["paths"].get("PDF_EXPORT_PATH", DEFAULT_PATHS["PDF_EXPORT_PATH"]))
+        self.hist_var = tk.StringVar(value=self.config_dict["paths"].get("HISTORY_FOLDER", DEFAULT_PATHS["HISTORY_FOLDER"]))
+        def mkrow(lbl, var, is_dir=False):
+            rowf = ctk.CTkFrame(frm)
+            rowf.pack(fill="x", pady=5)
+            ctk.CTkLabel(rowf, text=lbl, width=180).pack(side="left", padx=5)
+            e = ctk.CTkEntry(rowf, textvariable=var, width=600)
+            e.pack(side="left", padx=5)
+            def br():
+                if is_dir:
+                    p = filedialog.askdirectory()
+                else:
+                    p = filedialog.askopenfilename()
+                if p:
+                    var.set(p)
+            ctk.CTkButton(rowf, text="Browse", command=br,
+                          fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+        mkrow("ERP Excel:", self.erp_var)
+        mkrow("Master ZIP:", self.mast_var)
+        mkrow("Exception Path:", self.exc_var)
+        mkrow("Missing Items Output:", self.out_var)
+        mkrow("JSON Config Path:", self.cfg_var)
+        mkrow("Parameter File:", self.par_var)
+        mkrow("Master CSV Folder:", self.csv_var, is_dir=True)
+        mkrow("PDF Export Path:", self.pdf_var, is_dir=False)
+        mkrow("History Folder:", self.hist_var, is_dir=True)
+        bf = ctk.CTkFrame(frm)
+        bf.pack(fill="x", pady=10)
+        ctk.CTkButton(bf, text="Save Config", command=self.save_all_config,
+                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+        ctk.CTkButton(bf, text="Refresh ERP", command=self.refresh_erp,
+                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+        ctk.CTkButton(bf, text="Refresh Master", command=self.refresh_master,
+                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+
+    def build_compare_tab(self, parent):
+        frm = ctk.CTkFrame(parent)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+        ctk.CTkLabel(frm, text="Generate Missing Items", font=("Arial", 16)).pack(pady=5)
+        ctk.CTkButton(frm, text="Run Reconciliation", command=self.run_comparison,
+                      fg_color="#800020", hover_color="#a52a2a").pack(pady=10)
+        ctk.CTkButton(frm, text="Export PDF Report", command=self.export_pdf,
+                      fg_color="#800020", hover_color="#a52a2a").pack(pady=10)
+
+    def export_pdf(self):
+        if self.history_df.empty:
+            messagebox.showinfo("PDF Export", "No mismatch data to export (history is empty).")
+            return
+        run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        df_current = self.history_df[self.history_df["RunDate"] == run_timestamp].copy() if run_timestamp in self.history_df["RunDate"].values else self.history_df.copy()
+        df_history = self.history_df.copy()
+        rep = EnhancedPDFReport(df_current, df_history, self.config_dict)
+        try:
+            pdf_path = rep.generate()
+            messagebox.showinfo("PDF Export", f"PDF exported => {pdf_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"PDF generation failed: {e}")
+
+    def refresh_erp(self):
+        erp_path = Path(self.erp_var.get().strip())
+        raw_erp = read_erp_excel(erp_path)
+        if raw_erp.empty:
+            self.erp_preview.set_data(pd.DataFrame())
+            return
+        param = read_param_file(Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"])))
+        melted = meltdown_erp_for_preview(raw_erp, param)
+        pivoted = pivot_for_preview(melted)
+        self.erp_preview.set_data(pivoted)
+
+    def refresh_master(self):
+        zip_path = Path(self.mast_var.get().strip())
+        out_dir = Path(self.csv_var.get().strip())
+        csvs = convert_master_txt_to_csv(zip_path, out_dir)
+        raw_mast = unify_master_csvs(csvs)
+        if raw_mast.empty:
+            self.master_preview.set_data(pd.DataFrame())
+            return
+        param = read_param_file(Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"])))
+        melted = meltdown_master_for_preview(raw_mast, param)
+        pivoted = pivot_for_preview(melted)
+        self.master_preview.set_data(pivoted)
+
+    def run_comparison(self):
+        df_erp_wide = self.erp_preview.get_filtered_df()
+        df_mast_wide = self.master_preview.get_filtered_df()
+        erp_long = melt_back(df_erp_wide)
+        erp_long = build_keys(erp_long)
+        mast_long = melt_back(df_mast_wide)
+        mast_long = build_keys(mast_long)
+        df_diff = compare_mode2(erp_long, mast_long)
+        exc_path = Path(self.exc_var.get().strip())
+        df_exc = read_exception_table(exc_path)
+        final = merge_exceptions(df_diff, df_exc)
+        out_path = Path(self.out_var.get().strip())
+        write_missing_items(final, out_path)
+        run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        final["RunDate"] = run_timestamp
+        if self.history_df.empty:
+            self.history_df = final.copy()
+        else:
+            self.history_df = pd.concat([self.history_df, final], ignore_index=True)
+        run_data = {'timestamp': run_timestamp, 'mismatches': final.to_dict('records')}
+        history_folder = self.hist_var.get().strip()
+        self.config_dict["paths"]["HISTORY_FOLDER"] = history_folder
+        history_path = Path(history_folder)
+        history_path.mkdir(exist_ok=True)
+        run_file = history_path / f'run_{run_timestamp.replace(":", "-")}.json'
+        with open(run_file, 'w') as f:
+            json.dump(run_data, f)
+        self.dashboard_tab.update_data(final, self.history_df)
+        self.tabs.select(self.dashboard_tab)
+        messagebox.showinfo("Done", f"Missing items => {out_path}")
+
+    def save_all_config(self):
+        self.config_dict["paths"]["ERP_EXCEL_PATH"] = self.erp_var.get().strip()
+        self.config_dict["paths"]["MASTER_ZIP_PATH"] = self.mast_var.get().strip()
+        self.config_dict["paths"]["EXCEPTION_PATH"] = self.exc_var.get().strip()
+        self.config_dict["paths"]["OUTPUT_PATH"] = self.out_var.get().strip()
+        self.config_dict["paths"]["CONFIG_PATH"] = self.cfg_var.get().strip()
+        self.config_dict["paths"]["PARAMETER_PATH"] = self.par_var.get().strip()
+        self.config_dict["paths"]["MASTER_CSV_OUTPUT"] = self.csv_var.get().strip()
+        self.config_dict["paths"]["PDF_EXPORT_PATH"] = self.pdf_var.get().strip()
+        self.config_dict["paths"]["HISTORY_FOLDER"] = self.hist_var.get().strip()
+        self.config_dict.setdefault("erp_grid", {})
+        self.config_dict["erp_grid"]["filters"] = self.erp_preview.filters
+        self.config_dict.setdefault("master_grid", {})
+        self.config_dict["master_grid"]["filters"] = self.master_preview.filters
+        self.config_dict["date_filters"] = {
+            "start_date": self.start_date_var.get().strip(),
+            "end_date": self.end_date_var.get().strip()
+        }
+        save_config(self.config_dict, Path(self.config_dict["paths"]["CONFIG_PATH"]))
+        messagebox.showinfo("Saved", "Paths & Config saved successfully.")
+
+    def on_closing(self):
+        self.config_dict['dashboard_state'] = {
+            'selected_dims': list(self.dashboard_tab.selected_dims),
+            'selected_attrs': list(self.dashboard_tab.selected_attrs),
+            'top_n': self.dashboard_tab.top_n
+        }
+        self.config_dict['date_filters'] = {
+            'start_date': self.start_date_var.get().strip(),
+            'end_date': self.end_date_var.get().strip()
+        }
+        save_config(self.config_dict, Path(self.config_dict['paths']['CONFIG_PATH']))
+        self.quit()
+
+def main():
+    app = MainApp()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()

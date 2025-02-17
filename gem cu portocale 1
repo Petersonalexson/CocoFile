@@ -1,12 +1,10 @@
 """
 Ultra-Mega Reconciliation: Parameter-based with advanced Dashboard (8 charts).
-Watermark logo only on the cover page. If a chart has insufficient data, we catch IndexError
-to avoid "index out of bounds" errors. Radar chart also checks if len(...)>1 before plotting.
-Timestamped PDF filenames, date filters in previews, and a history browser.
+Watermark logo only on the cover page. Comparison results are saved in history JSON files.
+Date filters (for Start Date and End Date) allow you to include or exclude NaN values, and that setting is saved in the JSON config.
 """
 
 import os
-import sys
 import json
 import math
 import logging
@@ -29,8 +27,6 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.backends.backend_pdf import PdfPages
-
-import seaborn as sns  # For enhanced heatmaps
 
 try:
     import chardet
@@ -98,15 +94,16 @@ def load_config(path: Path) -> Dict:
 def save_config(cfg: Dict, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
+        # Save preview filters with our new structure: each column is a dict with keys "values" and "include_nan"
         if "erp_grid" in cfg and "filters" in cfg["erp_grid"]:
             nf = {}
-            for col, svals in cfg["erp_grid"]["filters"].items():
-                nf[col] = list(svals)
+            for col, filt in cfg["erp_grid"]["filters"].items():
+                nf[col] = {"values": list(filt.get("values", [])), "include_nan": filt.get("include_nan", True)}
             cfg["erp_grid"]["filters"] = nf
         if "master_grid" in cfg and "filters" in cfg["master_grid"]:
             nf = {}
-            for col, svals in cfg["master_grid"]["filters"].items():
-                nf[col] = list(svals)
+            for col, filt in cfg["master_grid"]["filters"].items():
+                nf[col] = {"values": list(filt.get("values", [])), "include_nan": filt.get("include_nan", True)}
             cfg["master_grid"]["filters"] = nf
 
         cfg = replace_nan(cfg)
@@ -523,7 +520,7 @@ def write_missing_items(df: pd.DataFrame, out_path: Path):
     logging.info(f"Missing items => {out_path}")
 
 # ----------------------------------------------------------------------------
-# SIMPLE PREVIEW (Date Filtering Implementation: Only "Start Date" and "End Date" are filterable)
+# SIMPLE PREVIEW (with Date Filtering for only "Start Date" and "End Date")
 # ----------------------------------------------------------------------------
 class SimplePreview(ctk.CTkFrame):
     FILTERABLE = {"Start Date", "End Date"}  # Only these columns can be filtered
@@ -532,13 +529,18 @@ class SimplePreview(ctk.CTkFrame):
         super().__init__(parent)
         self.name = name
         self.df = pd.DataFrame()
-        self.filters: Dict[str, Set] = {}
+        # Our filters dict will map a column name to a dict with keys "values" (a set) and "include_nan" (a bool)
+        self.filters: Dict[str, Dict] = {}
         if filters_dict:
-            for col, val_list in filters_dict.items():
-                if isinstance(val_list, list):
-                    self.filters[col] = set(val_list)
+            # Convert loaded list to a set, and assume include_nan True if not specified.
+            for col, filt in filters_dict.items():
+                if isinstance(filt, dict):
+                    self.filters[col] = {
+                        "values": set(filt.get("values", [])),
+                        "include_nan": filt.get("include_nan", True)
+                    }
                 else:
-                    self.filters[col] = val_list
+                    self.filters[col] = {"values": set(filt), "include_nan": True}
         self.create_toolbar()
         self.create_table()
         self.create_statusbar()
@@ -612,10 +614,12 @@ class SimplePreview(ctk.CTkFrame):
 
     def apply_filters(self) -> pd.DataFrame:
         df_f = self.df.copy()
-        for col, allowed in self.filters.items():
-            if col in df_f.columns and len(allowed) > 0:
-                # Only filter the dates (without handling NaN)
-                df_f = df_f[df_f[col].isin(allowed)]
+        for col, filt in self.filters.items():
+            if col in df_f.columns and len(filt.get("values", set())) > 0:
+                if filt.get("include_nan", True):
+                    df_f = df_f[df_f[col].isin(filt["values"]) | df_f[col].isna()]
+                else:
+                    df_f = df_f[df_f[col].isin(filt["values"])]
         return df_f
 
     def on_heading_click(self, col_name: str):
@@ -627,7 +631,7 @@ class SimplePreview(ctk.CTkFrame):
             return
         popup = tk.Toplevel(self)
         popup.title(f"Filter: {col_name}")
-        popup.geometry("300x400")
+        popup.geometry("300x450")
         frame = ctk.CTkFrame(popup)
         frame.pack(fill="both", expand=True, padx=5, pady=5)
         unique_vals = self.df[col_name].unique()
@@ -642,7 +646,7 @@ class SimplePreview(ctk.CTkFrame):
             display_map[v] = dsp
         sorted_vals = sorted(display_map.keys(), key=lambda x: display_map[x].lower())
         all_vals = set(sorted_vals)
-        curr_filter = self.filters.get(col_name, all_vals)
+        current = self.filters.get(col_name, {"values": all_vals, "include_nan": True})
         selall_var = tk.BooleanVar(value=True)
         def toggle_all():
             check = selall_var.get()
@@ -656,22 +660,22 @@ class SimplePreview(ctk.CTkFrame):
         scroll.pack(fill="both", expand=True, padx=5, pady=5)
         var_dict = {}
         for rv in sorted_vals:
-            in_filter = rv in curr_filter
+            in_filter = rv in current.get("values", all_vals)
             bvar = tk.BooleanVar(value=in_filter)
             var_dict[rv] = bvar
             ctk.CTkCheckBox(
-                scroll,
-                text=display_map[rv],
-                variable=bvar,
+                scroll, text=display_map[rv], variable=bvar,
                 fg_color="#800020", hover_color="#a52a2a", text_color="black"
             ).pack(anchor="w")
+        # Add a checkbox for "Include NaN"
+        include_nan_var = tk.BooleanVar(value=current.get("include_nan", True))
+        ctk.CTkCheckBox(
+            frame, text="Include NaN", variable=include_nan_var,
+            fg_color="#800020", hover_color="#a52a2a", text_color="black"
+        ).pack(anchor="w", pady=5)
         def apply_():
             sel = {rv for rv, vb in var_dict.items() if vb.get()}
-            if sel == all_vals or len(sel) == 0:
-                if col_name in self.filters:
-                    del self.filters[col_name]
-            else:
-                self.filters[col_name] = sel
+            self.filters[col_name] = {"values": sel, "include_nan": include_nan_var.get()}
             popup.destroy()
             self.refresh_table()
         bf = ctk.CTkFrame(frame)
@@ -718,7 +722,7 @@ class EnhancedPDFReport:
         self.PAGE_WIDTH = 8.5
         self.PAGE_HEIGHT = 11
         
-        plt.style.use('seaborn-whitegrid')
+        plt.style.use('default')
         self.chart_style = {
             'figure.facecolor': 'white',
             'axes.facecolor': 'white',
@@ -757,15 +761,15 @@ class EnhancedPDFReport:
             plt.close(fig)
 
     def _plot_heatmap(self, ax, pivot):
-        sns.heatmap(pivot, 
-                   ax=ax,
-                   cmap='RdPu',
-                   annot=True,
-                   fmt='d',
-                   cbar_kws={'label': 'Count'},
-                   square=True)
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
-        ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+        im = ax.imshow(pivot, aspect="auto", cmap='RdPu')
+        ax.set_xticks(np.arange(len(pivot.columns)))
+        ax.set_xticklabels(pivot.columns, rotation=45, ha='right')
+        ax.set_yticks(np.arange(len(pivot.index)))
+        ax.set_yticklabels(pivot.index)
+        for i in range(len(pivot.index)):
+            for j in range(len(pivot.columns)):
+                ax.text(j, i, str(pivot.iloc[i, j]), ha="center", va="center", fontsize=8)
+        plt.colorbar(im, ax=ax)
 
     def _plot_lollipop(self, ax, cdim):
         y_pos = np.arange(len(cdim))
@@ -903,6 +907,48 @@ class EnhancedPDFReport:
             if not date_ct.empty:
                 self._add_chart_page(pdf, "Trend Analysis with Confidence Band",
                                    self._plot_bandchart, date_ct=date_ct)
+
+# ----------------------------------------------------------------------------
+# HISTORY BROWSER (lists JSON files and shows count on click)
+# ----------------------------------------------------------------------------
+class HistoryBrowser(ctk.CTkFrame):
+    def __init__(self, parent, history_dir: str):
+        super().__init__(parent)
+        self.history_dir = history_dir
+        self.create_widgets()
+        self.refresh_file_list()
+
+    def create_widgets(self):
+        self.file_listbox = tk.Listbox(self, width=80)
+        self.file_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = tk.Scrollbar(self, command=self.file_listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.file_listbox.config(yscrollcommand=scrollbar.set)
+        self.file_listbox.bind("<Double-Button-1>", self.on_click)
+        refresh_btn = ctk.CTkButton(self, text="Refresh", command=self.refresh_file_list,
+                                    fg_color="#800020", hover_color="#a52a2a", text_color="white")
+        refresh_btn.pack(side="bottom", pady=5)
+
+    def refresh_file_list(self):
+        self.file_listbox.delete(0, tk.END)
+        if not os.path.exists(self.history_dir):
+            os.makedirs(self.history_dir)
+        for file in sorted(os.listdir(self.history_dir)):
+            if file.endswith(".json"):
+                # List file with its missing count if possible
+                file_path = os.path.join(self.history_dir, file)
+                try:
+                    with open(file_path, "r") as f:
+                        data = json.load(f)
+                        count = len(data.get("mismatches", []))
+                        display_text = f"{file} - {count} missing items"
+                except Exception:
+                    display_text = file
+                self.file_listbox.insert(tk.END, display_text)
+
+    def on_click(self, event):
+        # Do nothing on click, just list the file info.
+        pass
 
 # ----------------------------------------------------------------------------
 # ADVANCED DASHBOARD (8 Chart Tabs and Date Filtering)
@@ -1112,9 +1158,9 @@ class AdvancedDashboard(ctk.CTkFrame):
         fig, ax = plt.subplots(figsize=(6,5))
         try:
             cax = ax.imshow(pivot, aspect="auto", cmap="Reds")
-            ax.set_xticks(range(len(pivot.columns)))
+            ax.set_xticks(np.arange(len(pivot.columns)))
             ax.set_xticklabels(pivot.columns, rotation=90)
-            ax.set_yticks(range(len(pivot.index)))
+            ax.set_yticks(np.arange(len(pivot.index)))
             ax.set_yticklabels(pivot.index)
             fig.colorbar(cax, ax=ax)
             ax.set_title("Heatmap: Missing Items")
@@ -1287,7 +1333,7 @@ class AdvancedDashboard(ctk.CTkFrame):
         except IndexError as e:
             logging.error(f"Bar index error => {e}")
 
-    def plotBandChart(self, dfc: pd.DataFrame = None):
+    def plotBandChart(self):
         fr = self.frames["Band Chart"]
         for w in fr.winfo_children():
             w.destroy()
@@ -1315,8 +1361,47 @@ class AdvancedDashboard(ctk.CTkFrame):
         except IndexError as e:
             logging.error(f"Band chart error => {e}")
 
+    def update_data(self, df_current: pd.DataFrame, df_history: pd.DataFrame):
+        self.df_current = df_current.copy()
+        self.df_history = df_history.copy()
+        self.update_data_filters()
+
+    def update_data_filters(self):
+        dfc = self.df_current.copy()
+        if not dfc.empty:
+            if self.selected_dims:
+                dfc = dfc[dfc["Dimension"].isin(self.selected_dims)]
+            if self.selected_attrs:
+                dfc = dfc[dfc["Attribute"].isin(self.selected_attrs)]
+            if "RunDate" in dfc.columns:
+                try:
+                    start = datetime.strptime(self.start_date_var.get(), "%Y-%m-%d")
+                    end = datetime.strptime(self.end_date_var.get(), "%Y-%m-%d")
+                    dfc["RunDate_dt"] = pd.to_datetime(dfc["RunDate"], errors="coerce")
+                    dfc = dfc[(dfc["RunDate_dt"] >= start) & (dfc["RunDate_dt"] <= end)]
+                except Exception as e:
+                    logging.error(f"Date filter error => {e}")
+        mism = len(dfc)
+        dims = dfc["Dimension"].nunique() if not dfc.empty and "Dimension" in dfc.columns else 0
+        self.metric_label.configure(text=f"Mismatches: {mism}, Dims: {dims}")
+        self.plotHeatmap(dfc)
+        self.plotLollipop(dfc)
+        self.plotCircular(dfc)
+        self.plotScatter(dfc)
+        self.plotRadar(dfc)
+        self.plotNormalPie(dfc)
+        self.plotNormalBar(dfc)
+        self.plotBandChart()
+
+    def plot_chart(self, frame, fig):
+        for w in frame.winfo_children():
+            w.destroy()
+        canvas = FigureCanvasTkAgg(fig, master=frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
 # ----------------------------------------------------------------------------
-# HISTORY BROWSER (to browse JSON run history)
+# HISTORY BROWSER (lists JSON files and shows count on click)
 # ----------------------------------------------------------------------------
 class HistoryBrowser(ctk.CTkFrame):
     def __init__(self, parent, history_dir: str):
@@ -1331,7 +1416,7 @@ class HistoryBrowser(ctk.CTkFrame):
         scrollbar = tk.Scrollbar(self, command=self.file_listbox.yview)
         scrollbar.pack(side="right", fill="y")
         self.file_listbox.config(yscrollcommand=scrollbar.set)
-        self.file_listbox.bind("<Double-Button-1>", self.open_file)
+        self.file_listbox.bind("<Double-Button-1>", self.on_click)
         refresh_btn = ctk.CTkButton(self, text="Refresh", command=self.refresh_file_list,
                                     fg_color="#800020", hover_color="#a52a2a", text_color="white")
         refresh_btn.pack(side="bottom", pady=5)
@@ -1342,21 +1427,19 @@ class HistoryBrowser(ctk.CTkFrame):
             os.makedirs(self.history_dir)
         for file in sorted(os.listdir(self.history_dir)):
             if file.endswith(".json"):
-                self.file_listbox.insert(tk.END, file)
+                file_path = os.path.join(self.history_dir, file)
+                try:
+                    with open(file_path, "r") as f:
+                        data = json.load(f)
+                        count = len(data.get("mismatches", []))
+                        display_text = f"{file} - {count} missing items"
+                except Exception:
+                    display_text = file
+                self.file_listbox.insert(tk.END, display_text)
 
-    def open_file(self, event):
-        selection = self.file_listbox.curselection()
-        if selection:
-            file_name = self.file_listbox.get(selection[0])
-            file_path = os.path.join(self.history_dir, file_name)
-            with open(file_path, "r") as f:
-                content = f.read()
-            top = tk.Toplevel(self)
-            top.title(file_name)
-            text = tk.Text(top, wrap="word")
-            text.insert("1.0", content)
-            text.config(state="disabled")
-            text.pack(fill="both", expand=True)
+    def on_click(self, event):
+        # Do nothing on click; files are listed with missing count.
+        pass
 
 # ----------------------------------------------------------------------------
 # MAIN APP (Saves config including date filters and dashboard state)

@@ -1,6 +1,8 @@
 """
 Ultra-Mega Reconciliation: Parameter-based with advanced Dashboard (8 charts).
-Results are saved as JSON history files. Date filters for "Start Date" and "End Date" can include NaN.
+Results are saved as JSON history files. Date filters for "Start Date" and "End Date" 
+include (NaN) if you select the (NaN) option in the filter popup. The JSON config stores 
+this selection. The History folder is configurable.
 """
 
 import os
@@ -67,7 +69,8 @@ DEFAULT_PATHS = {
     "PARAMETER_PATH": "data/parameters.xlsx",
     "MASTER_CSV_OUTPUT": "temp_master_csv",
     "PDF_EXPORT_PATH": "output/dashboard_report.pdf",
-    "LOGO_PATH": "images/company_logo.png"
+    "LOGO_PATH": "images/company_logo.png",
+    "HISTORY_FOLDER": "history"
 }
 
 def default_config() -> Dict:
@@ -283,12 +286,7 @@ def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.D
     id_vars.insert(0, "DimRaw")
 
     meltdown_cols = [c for c in df2.columns if c not in skip_cols]
-    melted = df2.melt(
-        id_vars=id_vars,
-        value_vars=meltdown_cols,
-        var_name="OrigAttr",
-        value_name="ValX"
-    )
+    melted = df2.melt(id_vars=id_vars, value_vars=meltdown_cols, var_name="OrigAttr", value_name="ValX")
 
     def rename_dim(v):
         return dmap.get(v, v)
@@ -297,19 +295,14 @@ def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.D
         melted.rename(columns={"Value": "Name"}, inplace=True)
     else:
         melted["Name"] = ""
-
     melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
     melted["Attribute"] = melted["OrigAttr"].map(amap)
-
     def strip_t(val):
         if isinstance(val, str) and "T" in val:
             return val.split("T")[0]
         return val
-    melted["Value"] = np.where(
-        melted["Attribute"].isin(["Start Date", "End Date"]),
-        melted["ValX"].apply(strip_t),
-        melted["ValX"]
-    )
+    melted["Value"] = np.where(melted["Attribute"].isin(["Start Date", "End Date"]),
+                               melted["ValX"].apply(strip_t), melted["ValX"])
     return melted[["Dimension", "Name", "Attribute", "Value"]]
 
 def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.DataFrame:
@@ -331,45 +324,30 @@ def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> p
         skip_cols.add("Name")
 
     meltdown_cols = [c for c in df2.columns if c not in skip_cols]
-    melted = df2.melt(
-        id_vars=id_vars,
-        value_vars=meltdown_cols,
-        var_name="OrigAttr",
-        value_name="ValX"
-    )
+    melted = df2.melt(id_vars=id_vars, value_vars=meltdown_cols, var_name="OrigAttr", value_name="ValX")
 
     def rename_dim(fn):
         return keep_map.get(fn, fn)
     melted["Dimension"] = melted["DimRaw"].apply(rename_dim)
-
     if "Name" in id_vars:
         melted.rename(columns={"Name": "Name"}, inplace=True)
     else:
         melted["Name"] = ""
-
     melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
     melted["Attribute"] = melted["OrigAttr"].map(amap)
-
     def strip_t(val):
         if isinstance(val, str) and "T" in val:
             return val.split("T")[0]
         return val
-    melted["Value"] = np.where(
-        melted["Attribute"].isin(["Start Date", "End Date"]),
-        melted["ValX"].apply(strip_t),
-        melted["ValX"]
-    )
+    melted["Value"] = np.where(melted["Attribute"].isin(["Start Date", "End Date"]),
+                               melted["ValX"].apply(strip_t), melted["ValX"])
     return melted[["Dimension", "Name", "Attribute", "Value"]]
 
 def pivot_for_preview(df: pd.DataFrame) -> pd.DataFrame:
     if not df.empty and {"Dimension", "Name", "Attribute"}.issubset(df.columns):
         df = df.drop_duplicates(subset=["Dimension", "Name", "Attribute"])
         try:
-            df = df.pivot(
-                index=["Dimension", "Name"],
-                columns="Attribute",
-                values="Value"
-            ).reset_index()
+            df = df.pivot(index=["Dimension", "Name"], columns="Attribute", values="Value").reset_index()
         except Exception as e:
             logging.error(f"Pivot error => {e}")
     return df
@@ -382,12 +360,7 @@ def melt_back(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     skip_cols = {"Dimension", "Name"}
     meltdown_cols = [c for c in df.columns if c not in skip_cols]
-    melted = df.melt(
-        id_vars=["Dimension", "Name"],
-        value_vars=meltdown_cols,
-        var_name="Attribute",
-        value_name="Value"
-    )
+    melted = df.melt(id_vars=["Dimension", "Name"], value_vars=meltdown_cols, var_name="Attribute", value_name="Value")
     return melted[["Dimension", "Name", "Attribute", "Value"]]
 
 def build_keys(df: pd.DataFrame) -> pd.DataFrame:
@@ -533,10 +506,7 @@ class SimplePreview(ctk.CTkFrame):
         if filters_dict:
             for col, filt in filters_dict.items():
                 if isinstance(filt, dict):
-                    self.filters[col] = {
-                        "values": set(filt.get("values", [])),
-                        "include_nan": filt.get("include_nan", True)
-                    }
+                    self.filters[col] = {"values": set(filt.get("values", [])), "include_nan": filt.get("include_nan", True)}
                 else:
                     self.filters[col] = {"values": set(filt), "include_nan": True}
         self.create_toolbar()
@@ -604,8 +574,10 @@ class SimplePreview(ctk.CTkFrame):
         df_f = self.df.copy()
         for col, filt in self.filters.items():
             if col in df_f.columns and len(filt.get("values", set())) > 0:
-                if filt.get("include_nan", True):
-                    df_f = df_f[df_f[col].isin(filt["values"]) | df_f[col].isna()]
+                # If the special string "(NaN)" is selected, include NaN values.
+                if "(NaN)" in filt.get("values", set()):
+                    sel = filt["values"] - {"(NaN)"}
+                    df_f = df_f[df_f[col].isin(sel) | df_f[col].isna()]
                 else:
                     df_f = df_f[df_f[col].isin(filt["values"])]
         return df_f
@@ -626,15 +598,18 @@ class SimplePreview(ctk.CTkFrame):
         display_map = {}
         for v in unique_vals:
             if pd.isna(v):
+                key = "(NaN)"
                 dsp = "(NaN)"
             elif isinstance(v, str) and not v.strip():
+                key = "(blank)"
                 dsp = "(blank)"
             else:
+                key = str(v)
                 dsp = str(v)
-            display_map[v] = dsp
+            display_map[key] = dsp
         sorted_vals = sorted(display_map.keys(), key=lambda x: display_map[x].lower())
         all_vals = set(sorted_vals)
-        current = self.filters.get(col_name, {"values": all_vals, "include_nan": True})
+        current = self.filters.get(col_name, {"values": all_vals})
         selall_var = tk.BooleanVar(value=True)
         def toggle_all():
             check = selall_var.get()
@@ -645,18 +620,15 @@ class SimplePreview(ctk.CTkFrame):
         scroll = ctk.CTkScrollableFrame(frame, width=250, height=250)
         scroll.pack(fill="both", expand=True, padx=5, pady=5)
         var_dict = {}
-        for rv in sorted_vals:
-            in_filter = rv in current.get("values", all_vals)
+        for key in sorted_vals:
+            in_filter = key in current.get("values", all_vals)
             bvar = tk.BooleanVar(value=in_filter)
-            var_dict[rv] = bvar
-            ctk.CTkCheckBox(scroll, text=display_map[rv], variable=bvar,
+            var_dict[key] = bvar
+            ctk.CTkCheckBox(scroll, text=display_map[key], variable=bvar,
                              fg_color="#800020", hover_color="#a52a2a", text_color="black").pack(anchor="w")
-        include_nan_var = tk.BooleanVar(value=current.get("include_nan", True))
-        ctk.CTkCheckBox(frame, text="Include NaN", variable=include_nan_var,
-                        fg_color="#800020", hover_color="#a52a2a", text_color="black").pack(anchor="w", pady=5)
         def apply_():
-            sel = {rv for rv, vb in var_dict.items() if vb.get()}
-            self.filters[col_name] = {"values": sel, "include_nan": include_nan_var.get()}
+            sel = {key for key, vb in var_dict.items() if vb.get()}
+            self.filters[col_name] = {"values": sel}
             popup.destroy()
             self.refresh_table()
         bf = ctk.CTkFrame(frame)
@@ -676,7 +648,7 @@ class SimplePreview(ctk.CTkFrame):
         return self.apply_filters()
 
 # ----------------------------------------------------------------------------
-# ENHANCED PDF REPORT (with custom chart styling and generate() method)
+# ENHANCED PDF REPORT (with generate() method)
 # ----------------------------------------------------------------------------
 class EnhancedPDFReport:
     def __init__(self, df_current: pd.DataFrame, df_history: pd.DataFrame, config: Dict):
@@ -736,11 +708,12 @@ class EnhancedPDFReport:
                  ha='center', fontsize=9, color=self.colors['secondary'], transform=fig.transFigure)
         plt.text(0.5, 0.08, "Ultra-Mega Reconciliation System",
                  ha='center', fontsize=9, color=self.colors['secondary'], transform=fig.transFigure)
-        pdf.savefig(fig)
+        pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
     def _add_summary_page(self, pdf: PdfPages):
         fig = plt.figure(figsize=(self.PAGE_WIDTH, self.PAGE_HEIGHT))
+        plt.axis('off')
         plt.text(0.5, 0.92, "Reconciliation Summary", ha='center', fontsize=18, fontweight='bold',
                  color=self.colors['primary'], transform=fig.transFigure)
         y = 0.75
@@ -751,15 +724,14 @@ class EnhancedPDFReport:
             total = len(self.df_current)
             erp_missing = (self.df_current["Missing In"]=="ERP").sum()
             master_missing = (self.df_current["Missing In"]=="MASTER").sum()
-            txt = (f"Total Mismatches: {total}\n"
-                   f"Missing in ERP: {erp_missing}\n"
-                   f"Missing in Master: {master_missing}")
+            txt = (f"Total Mismatches: {total}\nMissing in ERP: {erp_missing}\nMissing in Master: {master_missing}")
             plt.text(0.5, y, txt, ha='center', fontsize=14, color=self.colors['secondary'], transform=fig.transFigure)
-        pdf.savefig(fig)
+        pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
     def _add_topdimsattrs_page(self, pdf: PdfPages):
         fig = plt.figure(figsize=(self.PAGE_WIDTH, self.PAGE_HEIGHT))
+        plt.axis('off')
         plt.text(0.5, 0.92, "Top Dimensions & Attributes", ha='center', fontsize=18, fontweight='bold',
                  color=self.colors['primary'], transform=fig.transFigure)
         if self.df_current.empty:
@@ -776,7 +748,7 @@ class EnhancedPDFReport:
                 lines = [f"- {k} ({v})" for k, v in attrs.items()]
                 plt.text(0.6, 0.7, "Top Attributes:\n" + "\n".join(lines),
                          fontsize=12, color=self.colors['secondary'], transform=fig.transFigure)
-        pdf.savefig(fig)
+        pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
     def _add_chart_page(self, pdf: PdfPages, title: str, plot_func, **kwargs):
@@ -799,7 +771,7 @@ class EnhancedPDFReport:
             plt.close(fig)
 
     def _plot_heatmap(self, ax, pivot):
-        im = ax.imshow(pivot, aspect="auto", cmap='Reds')
+        im = ax.imshow(pivot, aspect="auto", cmap="Reds")
         ax.set_xticks(np.arange(len(pivot.columns)))
         ax.set_xticklabels(pivot.columns, rotation=45, ha='right')
         ax.set_yticks(np.arange(len(pivot.index)))
@@ -1059,23 +1031,18 @@ class AdvancedDashboard(ctk.CTkFrame):
         popup.geometry("300x400")
         frame = ctk.CTkFrame(popup)
         frame.pack(fill="both", expand=True, padx=5, pady=5)
-        unique_vals = base_df[col].unique()
-        display_map = {}
-        for v in unique_vals:
-            if pd.isna(v):
-                dsp = "(NaN)"
-            elif isinstance(v, str) and not v.strip():
-                dsp = "(blank)"
-            else:
-                dsp = str(v)
-            display_map[v] = dsp
-        sorted_vals = sorted(display_map.keys(), key=lambda x: display_map[x].lower())
+        unique_vals = self.df_current[col].dropna().unique().tolist()
+        # Manually add a special key for NaN if there are NaNs in the column
+        if self.df_current[col].isna().any():
+            unique_vals.append("(NaN)")
+        display_map = {str(v): str(v) for v in unique_vals}
+        sorted_vals = sorted(display_map.keys(), key=lambda x: x.lower())
         if col == "Dimension":
             curr = self.selected_dims
         else:
             curr = self.selected_attrs
         if not curr:
-            curr = set(unique_vals)
+            curr = set(sorted_vals)
         selall_var = tk.BooleanVar(value=True)
         def toggle_all():
             check = selall_var.get()
@@ -1086,14 +1053,14 @@ class AdvancedDashboard(ctk.CTkFrame):
         scroll = ctk.CTkScrollableFrame(frame, width=250, height=250)
         scroll.pack(fill="both", expand=True, padx=5, pady=5)
         var_dict = {}
-        for rv in sorted_vals:
-            in_filter = rv in curr
+        for key in sorted_vals:
+            in_filter = key in curr
             bvar = tk.BooleanVar(value=in_filter)
-            var_dict[rv] = bvar
-            ctk.CTkCheckBox(scroll, text=display_map[rv], variable=bvar,
+            var_dict[key] = bvar
+            ctk.CTkCheckBox(scroll, text=display_map[key], variable=bvar,
                              fg_color="#800020", hover_color="#a52a2a", text_color="black").pack(anchor="w")
         def apply_():
-            sel = {rv for rv, vb in var_dict.items() if vb.get()}
+            sel = {key for key, vb in var_dict.items() if vb.get()}
             if col == "Dimension":
                 self.selected_dims = sel
             else:
@@ -1273,7 +1240,7 @@ class AdvancedDashboard(ctk.CTkFrame):
         N = len(cat)
         if N < 2:
             return
-        fig = plt.figure(figsize=(6,6))
+        fig, ax = plt.subplots(figsize=(6,6))
         try:
             angles = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
             angles += angles[:1]
@@ -1457,7 +1424,7 @@ class HistoryBrowser(ctk.CTkFrame):
                 messagebox.showerror("Error", f"Could not open history file: {e}")
 
 # ----------------------------------------------------------------------------
-# MAIN APP (Saves config including date filters and dashboard state)
+# MAIN APP (Saves config including date filters, dashboard state, and JSON/History folder)
 # ----------------------------------------------------------------------------
 class MainApp(ctk.CTk):
     def __init__(self):
@@ -1473,7 +1440,10 @@ class MainApp(ctk.CTk):
         date_filters = self.config_dict.get("date_filters", {})
         self.start_date_var = tk.StringVar(value=date_filters.get("start_date", (datetime.now()-timedelta(days=30)).strftime("%Y-%m-%d")))
         self.end_date_var = tk.StringVar(value=date_filters.get("end_date", datetime.now().strftime("%Y-%m-%d")))
-        
+
+        # New variable for History folder (configurable)
+        self.history_folder_var = tk.StringVar(value=self.config_dict["paths"].get("HISTORY_FOLDER", "history"))
+
         self.tabs = ttk.Notebook(self)
         self.tabs.pack(fill="both", expand=True)
 
@@ -1500,7 +1470,7 @@ class MainApp(ctk.CTk):
         self.dashboard_tab = AdvancedDashboard(self.tabs)
         self.tabs.add(self.dashboard_tab, text="Dashboard")
 
-        self.history_tab = HistoryBrowser(self.tabs, history_dir="history")
+        self.history_tab = HistoryBrowser(self.tabs, history_dir=self.history_folder_var.get())
         self.tabs.add(self.history_tab, text="History")
 
         self.log_box = ctk.CTkTextbox(self, height=120)
@@ -1538,6 +1508,7 @@ class MainApp(ctk.CTk):
         self.par_var = tk.StringVar(value=self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"]))
         self.csv_var = tk.StringVar(value=self.config_dict["paths"].get("MASTER_CSV_OUTPUT", DEFAULT_PATHS["MASTER_CSV_OUTPUT"]))
         self.pdf_var = tk.StringVar(value=self.config_dict["paths"].get("PDF_EXPORT_PATH", DEFAULT_PATHS["PDF_EXPORT_PATH"]))
+        self.hist_var = tk.StringVar(value=self.config_dict["paths"].get("HISTORY_FOLDER", DEFAULT_PATHS["HISTORY_FOLDER"]))
 
         def mkrow(lbl, var, is_dir=False):
             rowf = ctk.CTkFrame(frm)
@@ -1562,6 +1533,7 @@ class MainApp(ctk.CTk):
         mkrow("Parameter File:", self.par_var)
         mkrow("Master CSV Folder:", self.csv_var, is_dir=True)
         mkrow("PDF Export Path:", self.pdf_var, is_dir=False)
+        mkrow("History Folder:", self.hist_var, is_dir=True)
         bf = ctk.CTkFrame(frm)
         bf.pack(fill="x", pady=10)
         ctk.CTkButton(bf, text="Save Config", command=self.save_all_config,
@@ -1646,7 +1618,9 @@ class MainApp(ctk.CTk):
             'timestamp': run_timestamp,
             'mismatches': final.to_dict('records')
         }
-        history_path = Path('history')
+        history_folder = self.hist_var.get().strip()
+        self.config_dict["paths"]["HISTORY_FOLDER"] = history_folder
+        history_path = Path(history_folder)
         history_path.mkdir(exist_ok=True)
         run_file = history_path / f'run_{run_timestamp.replace(":", "-")}.json'
         with open(run_file, 'w') as f:
@@ -1665,6 +1639,7 @@ class MainApp(ctk.CTk):
         self.config_dict["paths"]["PARAMETER_PATH"] = self.par_var.get().strip()
         self.config_dict["paths"]["MASTER_CSV_OUTPUT"] = self.csv_var.get().strip()
         self.config_dict["paths"]["PDF_EXPORT_PATH"] = self.pdf_var.get().strip()
+        self.config_dict["paths"]["HISTORY_FOLDER"] = self.hist_var.get().strip()
 
         self.config_dict.setdefault("erp_grid", {})
         self.config_dict["erp_grid"]["filters"] = self.erp_preview.filters

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import os
 import io
 import zipfile
@@ -12,97 +11,87 @@ def read_txt_2encodings(raw: bytes) -> pd.DataFrame:
     1) utf-8-sig
     2) utf-16-le
 
-    The first one that yields a non-empty DataFrame is returned.
-    If both fail or produce (0,0), an empty DataFrame is returned.
+    Returns the first non-empty DataFrame encountered.
+    If both fail or produce (0,0) shape, returns empty DataFrame.
     """
     for enc in ["utf-8-sig", "utf-16-le"]:
         try:
-            # Use engine="python" and sep=None to let Pandas sniff delimiters automatically.
-            df = pd.read_csv(io.BytesIO(raw), encoding=enc, sep=None, engine="python", on_bad_lines="warn")
-            # If this DataFrame is non-empty (rows or columns), return it
+            # Use engine="python" and on_bad_lines="skip" to handle messy files
+            df = pd.read_csv(io.BytesIO(raw), encoding=enc, engine="python", on_bad_lines="skip")
+            # Drop columns or rows that are all-NaN, to reduce empty shapes
+            df.dropna(how="all", axis=0, inplace=True)
+            df.dropna(how="all", axis=1, inplace=True)
+            # If this DataFrame is non-empty, return
             if df.shape[0] > 0 and df.shape[1] > 0:
                 return df
         except Exception as e:
-            # We ignore the error and try the next encoding
             pass
-    # If both attempts fail or produce empty => return empty df
-    return pd.DataFrame()
+    return pd.DataFrame()  # If both fail or produce empty => return empty
 
-def extract_master_data(zip_path: str, output_excel: str):
+def extract_master_zip(zip_path: str, output_excel: str):
     """
-    1) For each *_Caster.txt in zip_path:
-       - dimension = the file name minus "_Caster.txt" + remove underscores
-       - read the file with read_txt_2encodings()
-       - rename the first column to "Name" if none is labeled "Name" (case-insensitive)
-       - add rows to final list: (Dimension, Name, Name)
-    2) Output an Excel with columns: Dimension, Name, Value
-       (where Value = the same content as Name).
+    1) Read each .txt inside 'zip_path' with two encodings (utf-8-sig, utf-16-le).
+    2) If no 'Name' column is found, rename the *first* column to 'Name' (if any).
+    3) Append all columns to a final DataFrame. Also add 'SourceFile' for tracking.
+    4) Write a single Excel with data from all text files.
     """
     zip_path = Path(zip_path)
     if not zip_path.is_file():
-        print(f"[ERROR] ZIP not found => {zip_path}")
+        print(f"[ERROR] Zip file not found => {zip_path}")
         return
 
-    rows = []
-    with zipfile.ZipFile(zip_path, "r") as z:
-        # Gather all .txt that have "_Caster.txt" (case-insensitive)
-        txt_files = [f for f in z.namelist() if f.lower().endswith(".txt") and "_caster.txt" in f.lower()]
+    all_frames = []
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        # Collect .txt files
+        txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+        if not txt_files:
+            print(f"[WARN] No .txt files found in {zip_path}")
+            return
 
         for txt_file in txt_files:
-            base_name = os.path.basename(txt_file)
-            # Derive dimension:
-            # remove "_Caster.txt" and all underscores
-            dim_raw = base_name.lower().replace("_caster.txt", "")
-            dimension = dim_raw.replace("_", "")
-
-            # Read raw bytes
+            file_name = os.path.basename(txt_file)
             try:
-                with z.open(txt_file) as fo:
-                    raw = fo.read()
+                with z.open(txt_file) as fh:
+                    raw = fh.read()
             except Exception as e:
                 print(f"[WARN] Could not read {txt_file}: {e}")
                 continue
 
-            # Parse with two encodings
             df = read_txt_2encodings(raw)
             if df.empty:
-                print(f"[INFO] {txt_file} => empty after both encodings.")
+                print(f"[INFO] {txt_file} => empty or failed parsing in both encodings.")
                 continue
 
-            # Lowercase the columns for easier checks
-            df.columns = [c.lower().strip() for c in df.columns]
-
-            # If "name" is not found, rename the first column to "name"
-            # so we can at least get *some* data.
-            if "name" not in df.columns:
-                # rename the first column if there is at least one column
+            # Make sure there's a 'Name' column.
+            # If there's no 'Name', rename the first column to 'Name' if possible.
+            lower_cols = [c.lower().strip() for c in df.columns]
+            if 'name' not in lower_cols:
                 if len(df.columns) > 0:
-                    first_col = df.columns[0]
-                    df.rename(columns={first_col: "name"}, inplace=True)
+                    old_first = df.columns[0]
+                    df.rename(columns={old_first: "Name"}, inplace=True)
+                else:
+                    # If there's not even a single column, skip
+                    print(f"[INFO] {txt_file} => No columns after cleaning.")
+                    continue
+            # Tag the source file
+            df["SourceFile"] = file_name
+            all_frames.append(df)
 
-            # If we *still* don't have a "name" column, skip
-            if "name" not in df.columns:
-                print(f"[WARN] No 'Name' column found in {txt_file}. Columns={list(df.columns)}")
-                continue
-
-            # Collect (Dimension, Name, Value=same as Name) for each row
-            for val in df["name"]:
-                name_str = str(val) if pd.notna(val) else ""
-                rows.append((dimension, name_str, name_str))
-
-    # Create a single DataFrame and write to Excel
-    out_df = pd.DataFrame(rows, columns=["Dimension", "Name", "Value"])
-    if out_df.empty:
-        print("[INFO] No data to write after processing all files.")
+    if not all_frames:
+        print("[INFO] No data to write after processing all .txt files.")
         return
 
-    out_df.to_excel(output_excel, index=False)
-    print(f"[OK] Extracted {len(out_df)} rows => {output_excel}")
+    # Combine everything
+    final_df = pd.concat(all_frames, ignore_index=True)
 
+    # Write to Excel
+    final_df.to_excel(output_excel, index=False)
+    print(f"[OK] Wrote {len(final_df)} rows to {output_excel}")
 
 if __name__ == "__main__":
     # Example usage:
-    master_zip = "Master_Config.zip"        # Your master ZIP path
-    output_xlsx = "extracted_master.xlsx"   # Desired output
+    # Adjust paths to your environment
+    master_zip_path = "data/Master_Config.zip"
+    output_file = "all_master_data.xlsx"
 
-    extract_master_data(master_zip, output_xlsx)
+    extract_master_zip(master_zip_path, output_file)

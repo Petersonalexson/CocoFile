@@ -1,4 +1,4 @@
-# mini mamaliga!
+#!/usr/bin/env python3
 
 import os
 import io
@@ -17,11 +17,13 @@ def read_txt_2encodings(raw: bytes) -> pd.DataFrame:
     """
     for enc in ["utf-8-sig", "utf-16-le"]:
         try:
-            df = pd.read_csv(io.BytesIO(raw), encoding=enc, on_bad_lines="skip", engine="python")
+            # Use engine="python" and sep=None to let Pandas sniff delimiters automatically.
+            df = pd.read_csv(io.BytesIO(raw), encoding=enc, sep=None, engine="python", on_bad_lines="warn")
             # If this DataFrame is non-empty (rows or columns), return it
             if df.shape[0] > 0 and df.shape[1] > 0:
                 return df
-        except Exception:
+        except Exception as e:
+            # We ignore the error and try the next encoding
             pass
     # If both attempts fail or produce empty => return empty df
     return pd.DataFrame()
@@ -29,11 +31,12 @@ def read_txt_2encodings(raw: bytes) -> pd.DataFrame:
 def extract_master_data(zip_path: str, output_excel: str):
     """
     1) For each *_Caster.txt in zip_path:
-       - dimension = the file name minus "_Caster.txt" and any '_'
+       - dimension = the file name minus "_Caster.txt" + remove underscores
        - read the file with read_txt_2encodings()
-       - keep only the column "Name"
+       - rename the first column to "Name" if none is labeled "Name" (case-insensitive)
+       - add rows to final list: (Dimension, Name, Name)
     2) Output an Excel with columns: Dimension, Name, Value
-       (where Value = the same content as Name, as requested).
+       (where Value = the same content as Name).
     """
     zip_path = Path(zip_path)
     if not zip_path.is_file():
@@ -42,18 +45,15 @@ def extract_master_data(zip_path: str, output_excel: str):
 
     rows = []
     with zipfile.ZipFile(zip_path, "r") as z:
-        txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+        # Gather all .txt that have "_Caster.txt" (case-insensitive)
+        txt_files = [f for f in z.namelist() if f.lower().endswith(".txt") and "_caster.txt" in f.lower()]
+
         for txt_file in txt_files:
             base_name = os.path.basename(txt_file)
-            # Only process files that match the pattern *_Caster.txt
-            # (case-insensitive check)
-            if "_caster.txt" not in base_name.lower():
-                continue
-
             # Derive dimension:
-            # remove "_Caster.txt" + remove remaining underscores
+            # remove "_Caster.txt" and all underscores
             dim_raw = base_name.lower().replace("_caster.txt", "")
-            dim = dim_raw.replace("_", "")
+            dimension = dim_raw.replace("_", "")
 
             # Read raw bytes
             try:
@@ -66,23 +66,34 @@ def extract_master_data(zip_path: str, output_excel: str):
             # Parse with two encodings
             df = read_txt_2encodings(raw)
             if df.empty:
-                print(f"[INFO] Skipping {txt_file} => empty after both encodings.")
+                print(f"[INFO] {txt_file} => empty after both encodings.")
                 continue
 
-            # We only keep the 'Name' column
-            if "Name" not in df.columns:
-                print(f"[WARN] 'Name' column not found in {txt_file}. Columns={list(df.columns)}")
+            # Lowercase the columns for easier checks
+            df.columns = [c.lower().strip() for c in df.columns]
+
+            # If "name" is not found, rename the first column to "name"
+            # so we can at least get *some* data.
+            if "name" not in df.columns:
+                # rename the first column if there is at least one column
+                if len(df.columns) > 0:
+                    first_col = df.columns[0]
+                    df.rename(columns={first_col: "name"}, inplace=True)
+
+            # If we *still* don't have a "name" column, skip
+            if "name" not in df.columns:
+                print(f"[WARN] No 'Name' column found in {txt_file}. Columns={list(df.columns)}")
                 continue
 
-            # For each row, produce Dimension, Name, Value (same as 'Name')
-            for _, row in df.iterrows():
-                name_val = str(row["Name"])  # or row["Name"] if you don't need str conversion
-                rows.append((dim, name_val, name_val))
+            # Collect (Dimension, Name, Value=same as Name) for each row
+            for val in df["name"]:
+                name_str = str(val) if pd.notna(val) else ""
+                rows.append((dimension, name_str, name_str))
 
     # Create a single DataFrame and write to Excel
     out_df = pd.DataFrame(rows, columns=["Dimension", "Name", "Value"])
     if out_df.empty:
-        print("[INFO] No data to write.")
+        print("[INFO] No data to write after processing all files.")
         return
 
     out_df.to_excel(output_excel, index=False)

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Ultra-Mega Reconciliation (Single File), with:
- - Automatic End Date filtering (blank or > today's date) after meltdown
- - Two-sheet missing_items.xlsx (Mismatch + Case_Differences)
- - Dimension short code in final output, but param-based full dimension internally
- - 8-chart Dashboard (incl. Bollinger)
- - History double-click => show JSON content
- - 'float' -> 'strip' error fixed by converting values to string
- - Hidden advanced paths from the user in "Paths" tab
+Ultra-Mega Reconciliation:
+ - Use param dictionary: short code => full dimension name internally
+ - Final missing_items.xlsx uses the short code in the "Dimension" column
+ - End Date auto-filter: keep only blank or strictly > today's date
+ - Two-sheet Excel: "Mismatch" & "Case_Differences"
+ - 8-chart dashboard (example code for 2 charts in PDF)
+ - History double-click => show JSON
+ - No user date filters, meltdown does it automatically
+ - Fix 'float' -> 'strip' by converting all date fields to string
 """
 
 import os
@@ -93,9 +94,8 @@ def save_config(cfg: Dict, path: Path):
     except Exception as e:
         logging.error(f"Error saving config => {e}")
 
-
 # ----------------------------------------------------------------------------
-# LOGGER HANDLER
+# TEXT LOGGER HANDLER
 # ----------------------------------------------------------------------------
 class TextHandler(logging.Handler):
     def __init__(self, widget: ctk.CTkTextbox):
@@ -109,7 +109,6 @@ class TextHandler(logging.Handler):
         self.widget.insert("end", msg)
         self.widget.see("end")
         self.widget.configure(state="disabled")
-
 
 # ----------------------------------------------------------------------------
 # PARAM READING
@@ -136,6 +135,7 @@ def read_param_file(path: Path)-> Dict[str, object]:
             vsc= s(row.get("V S C",""))
             dim= s(row.get("Dimension",""))
             ev=  s(row.get("ERP Values",""))
+            # if we see 'x' in ERP Values => we keep that short code
             if ev.lower()=="x" and vsc and dim:
                 param["dim_erp_keep"].add(vsc)
                 param["dim_erp_map"][vsc]= dim
@@ -159,48 +159,40 @@ def read_param_file(path: Path)-> Dict[str, object]:
         logging.error(f"Error reading param => {e}")
         return param
 
-
 # ----------------------------------------------------------------------------
-# END DATE HELPER
+# HELPER: Keep blank or future End Date
 # ----------------------------------------------------------------------------
 def keep_valid_end_date(attr: str, val) -> bool:
     """
-    If attribute == 'End Date', keep blank or strictly future.
-    We convert 'val' to string to avoid float->strip errors.
+    Keep only if attribute != 'End Date' OR
+    if attribute == 'End Date', keep blank or strictly future.
+    We'll parse 'val' as 'YYYY-MM-DD' if not blank.
     """
-    if attr != "End Date":
+    if attr!="End Date":
         return True
-    # convert to string:
-    val_str= ""
-    if pd.notna(val):
-        val_str= str(val).strip()
-
+    val_str= str(val).strip() if pd.notna(val) else ""
     if not val_str:
         # blank => keep
         return True
-    # parse as YYYY-MM-DD
     try:
         dt= datetime.strptime(val_str, "%Y-%m-%d").date()
         return dt> datetime.now().date()
     except:
         return False
 
-def strip_time_if_present(x):
+def strip_t(val) -> str:
     """
-    Convert 'x' to string, remove trailing spaces, and if 'T' present => keep only date part.
-    E.g. '2023-12-15T00:00:00' => '2023-12-15'
-    Floats => coerced to str first => no crash.
+    Convert 'val' to str, remove trailing spaces, if 'T' present => keep only date part.
     """
-    if pd.isna(x):
+    if pd.isna(val):
         return ""
-    s= str(x).strip()
+    s= str(val).strip()
     if "T" in s:
-        return s.split("T")[0]
+        s= s.split("T")[0]
     return s
 
-
 # ----------------------------------------------------------------------------
-# ERP EXCEL
+# ERP READING
 # ----------------------------------------------------------------------------
 def read_erp_excel(path: Path)-> pd.DataFrame:
     if not path.is_file():
@@ -213,11 +205,11 @@ def read_erp_excel(path: Path)-> pd.DataFrame:
             df= df[df["Enabled_Flag"]=="Enabled"]
         return df
     except Exception as e:
-        logging.error(f"ERP read => {e}")
+        logging.error(f"Error reading ERP => {e}")
         return pd.DataFrame()
 
 # ----------------------------------------------------------------------------
-# MASTER => read from zip
+# MASTER READING
 # ----------------------------------------------------------------------------
 def read_txt_2encodings(raw: bytes)-> pd.DataFrame:
     import io
@@ -285,6 +277,10 @@ def unify_master_csvs(csvs: List[Path])-> pd.DataFrame:
 # MELTDOWN
 # ----------------------------------------------------------------------------
 def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str,object]) -> pd.DataFrame:
+    """
+    Convert wide ERP data into [DimCode, Dimension, Name, Attribute, Value].
+    Filter out End Date if not blank/future. For End/Start Date => store as 'YYYY-MM-DD' if parseable.
+    """
     if "V_S_C" not in df.columns:
         return pd.DataFrame()
     keep= param["dim_erp_keep"]
@@ -295,16 +291,16 @@ def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str,object]) -> pd.Da
     if df2.empty:
         return pd.DataFrame()
 
-    df2["DimCode"]= df2["V_S_C"]
-    df2["Dimension"]= df2["V_S_C"].map(dmap).fillna(df2["V_S_C"])
+    df2["DimCode"]= df2["V_S_C"]  # short code
+    df2["Dimension"]= df2["V_S_C"].map(dmap).fillna(df2["V_S_C"])  # full dimension
 
-    skip= {"V_S_C","Enabled_Flag","DimCode","Dimension"}
+    skip_cols= {"V_S_C","Enabled_Flag","DimCode","Dimension"}
     id_vars= ["DimCode","Dimension"]
     if "Value" in df2.columns:
         id_vars.append("Value")
-        skip.add("Value")
+        skip_cols.add("Value")
 
-    meltdown_cols= [c for c in df2.columns if c not in skip]
+    meltdown_cols= [c for c in df2.columns if c not in skip_cols]
     melted= df2.melt(id_vars=id_vars, value_vars=meltdown_cols,
                      var_name="OrigAttr", value_name="ValX")
 
@@ -313,14 +309,28 @@ def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str,object]) -> pd.Da
     else:
         melted["Name"]= ""
 
-    # keep recognized
+    # keep recognized attributes
     melted= melted[melted["OrigAttr"].isin(amap.keys())].copy()
     melted["Attribute"]= melted["OrigAttr"].map(amap)
 
-    # strip T
-    melted["Value"]= melted["ValX"].apply(strip_time_if_present)
+    # convert to 'YYYY-MM-DD' if Start/End Date
+    def handle_date(attr, val):
+        s= strip_t(val)
+        if attr not in ["Start Date","End Date"]:
+            return s
+        # parse if possible => store 'YYYY-MM-DD'
+        if not s:
+            return s  # blank => keep
+        # parse
+        try:
+            dt= datetime.strptime(s, "%Y-%m-%d").date()
+            return dt.strftime("%Y-%m-%d")
+        except:
+            return ""
 
-    # keep only blank/future if End Date
+    melted["Value"]= melted.apply(lambda r: handle_date(r["Attribute"], r["ValX"]), axis=1)
+
+    # now filter out End Date not blank/future
     keep_rows=[]
     for _, row in melted.iterrows():
         if keep_valid_end_date(row["Attribute"], row["Value"]):
@@ -329,6 +339,10 @@ def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str,object]) -> pd.Da
     return out[["DimCode","Dimension","Name","Attribute","Value"]]
 
 def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str,object]) -> pd.DataFrame:
+    """
+    Similar meltdown for Master. We store short code in DimCode, full dimension in Dimension.
+    Filter out End Date if not blank/future. Convert Start/End to 'YYYY-MM-DD' if parseable.
+    """
     if df.empty or "RawFileName" not in df.columns:
         return pd.DataFrame()
     dmap= param["dim_master_map"]
@@ -341,20 +355,32 @@ def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str,object]) -> pd
     df2["DimCode"]= df2["RawFileName"]
     df2["Dimension"]= df2["RawFileName"].map(dmap).fillna(df2["RawFileName"])
 
-    skip= {"RawFileName","DimCode","Dimension"}
+    skip_cols= {"RawFileName","DimCode","Dimension"}
     id_vars= ["DimCode","Dimension"]
     if "Name" in df2.columns:
         id_vars.append("Name")
-        skip.add("Name")
+        skip_cols.add("Name")
 
-    meltdown_cols= [c for c in df2.columns if c not in skip]
+    meltdown_cols= [c for c in df2.columns if c not in skip_cols]
     melted= df2.melt(id_vars=id_vars, value_vars=meltdown_cols,
                      var_name="OrigAttr", value_name="ValX")
 
     melted= melted[melted["OrigAttr"].isin(amap.keys())].copy()
     melted["Attribute"]= melted["OrigAttr"].map(amap)
 
-    melted["Value"]= melted["ValX"].apply(strip_time_if_present)
+    def handle_date(attr, val):
+        s= strip_t(val)
+        if attr not in ["Start Date","End Date"]:
+            return s
+        if not s:
+            return s
+        try:
+            dt= datetime.strptime(s, "%Y-%m-%d").date()
+            return dt.strftime("%Y-%m-%d")
+        except:
+            return ""
+
+    melted["Value"]= melted.apply(lambda r: handle_date(r["Attribute"], r["ValX"]), axis=1)
 
     keep_rows=[]
     for _, row in melted.iterrows():
@@ -375,9 +401,13 @@ def pivot_for_preview(df: pd.DataFrame)-> pd.DataFrame:
     return df
 
 # ----------------------------------------------------------------------------
-# COMPARE
+# COMPARE => short code vs. dimension
 # ----------------------------------------------------------------------------
 def compare_erp_master(erp_df: pd.DataFrame, mast_df: pd.DataFrame)-> pd.DataFrame:
+    """
+    Input meltdown => [DimCode, Dimension, Name, Attribute, Value]
+    We'll rename Value->ERP or Master, ignoring-case compare => produce "Gap In" => MASTER, ERP, or MISMATCH
+    """
     e2= erp_df.copy()
     e2.rename(columns={"Value":"ERP"}, inplace=True)
     m2= mast_df.copy()
@@ -405,16 +435,22 @@ def compare_erp_master(erp_df: pd.DataFrame, mast_df: pd.DataFrame)-> pd.DataFra
     out["Comments_1"]= ""
     out["Comments_2"]= ""
 
+    # Build uppercase Key from the *full dimension*
     out["Key"]= (
         out["Dimension"].str.upper().str.strip()+" | "+
         out["Name"].str.upper().str.strip()+" | "+
         out["Attribute"].str.upper().str.strip()
     )
 
+    # final => keep columns
     final_cols= ["DimCode","Dimension","Name","Attribute","Master","ERP","Comments_1","Comments_2","Gap In","Key"]
     return out[final_cols]
 
 def separate_case_diffs(df: pd.DataFrame)-> Tuple[pd.DataFrame,pd.DataFrame]:
+    """
+    Return (mismatch, case_only).
+    case_only => same lower, different actual => only differ by case
+    """
     same_lower= df["Master"].str.lower()== df["ERP"].str.lower()
     diff= df["Master"]!= df["ERP"]
     mask= same_lower & diff
@@ -423,7 +459,7 @@ def separate_case_diffs(df: pd.DataFrame)-> Tuple[pd.DataFrame,pd.DataFrame]:
     return mismatch_df, case_df
 
 # ----------------------------------------------------------------------------
-# EXCEPTIONS
+# EXCEPTION & MERGE
 # ----------------------------------------------------------------------------
 def read_exception_table(path: Path)-> pd.DataFrame:
     if not path.is_file():
@@ -459,19 +495,20 @@ def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame)-> pd.DataFrame:
     return final
 
 # ----------------------------------------------------------------------------
-# WRITE 2 sheets
+# WRITE => 2 sheets
 # ----------------------------------------------------------------------------
 def write_two_sheet_excel(mismatch: pd.DataFrame, case_only: pd.DataFrame, out_path: Path):
     """
     2 sheets => 'Mismatch' + 'Case_Differences'
     Columns => Key, Dimension, Name, Attribute, Master, ERP, Comments_1, Comments_2, Gap In
-    We'll rename 'Dimension' => 'DimFull' + 'DimCode' => 'Dimension' so final 'Dimension' is short code.
+    We'll rename 'Dimension' => 'DimFull', 'DimCode' => 'Dimension' so final 'Dimension' is short code (V_S_C).
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     main_cols= ["Key","Dimension","Name","Attribute","Master","ERP","Comments_1","Comments_2","Gap In"]
 
     def finalize(df: pd.DataFrame)-> pd.DataFrame:
         dfc= df.copy()
+        # rename dimension => short code
         if "Dimension" in dfc.columns and "DimCode" in dfc.columns:
             dfc.rename(columns={"Dimension":"DimFull","DimCode":"Dimension"}, inplace=True)
         for c in main_cols:
@@ -530,11 +567,12 @@ def write_two_sheet_excel(mismatch: pd.DataFrame, case_only: pd.DataFrame, out_p
 
 
 # ----------------------------------------------------------------------------
-# SIMPLE PREVIEW => no user date filters
+# SIMPLE PREVIEW => no date filter in GUI
 # ----------------------------------------------------------------------------
 class SimplePreview(ctk.CTkFrame):
     """
-    Show meltdown data for ERP or Master, no date filters in the GUI.
+    Show meltdown data for ERP or Master. No user date filters.
+    End Date => auto-filter in meltdown.
     """
     def __init__(self, parent, name: str):
         super().__init__(parent)
@@ -556,7 +594,7 @@ class SimplePreview(ctk.CTkFrame):
                       fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(side="left", padx=5)
 
     def show_info(self):
-        messagebox.showinfo("Info", f"{self.name} meltdown data.\nAuto-filter End Date => blank/future.\nNo user date filters here.")
+        messagebox.showinfo("Info", f"{self.name} meltdown data.\nNo user date filters.\nEnd Date automatically kept if blank/future.")
 
     def create_table(self):
         container= ctk.CTkFrame(self)
@@ -599,9 +637,8 @@ class SimplePreview(ctk.CTkFrame):
     def get_filtered_df(self)-> pd.DataFrame:
         return self.df.copy()
 
-
 # ----------------------------------------------------------------------------
-# PDF REPORT => 8 charts
+# ENHANCED PDF REPORT => 8 charts (example code for 2)
 # ----------------------------------------------------------------------------
 def enable_hover_chart(ax, polar=False):
     if not MPLCURSORS_AVAILABLE:
@@ -634,41 +671,41 @@ class EnhancedPDFReport:
         out_dir.mkdir(parents=True, exist_ok=True)
         pdf_path= out_dir / f"Reconciliation_{stamp}.pdf"
         with PdfPages(pdf_path) as pdf:
-            # cover
-            fig= self._new_fig()
+            # 1) cover
+            fig= plt.figure(figsize=(self.PAGE_WIDTH, self.PAGE_HEIGHT))
+            plt.axis("off")
             plt.text(0.5, 0.6, "Reconciliation Report", ha="center", fontsize=24, weight="bold", transform=fig.transFigure)
             plt.text(0.5, 0.5, f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ha="center", fontsize=12, transform=fig.transFigure)
             pdf.savefig(fig)
             plt.close(fig)
 
-            # summary
-            fig= self._new_fig()
+            # 2) summary
+            fig= plt.figure(figsize=(self.PAGE_WIDTH, self.PAGE_HEIGHT))
+            plt.axis("off")
             total= len(self.df_current)
             plt.text(0.5, 0.8, "Summary", ha="center", fontsize=18, weight="bold", transform=fig.transFigure)
             plt.text(0.5, 0.6, f"Mismatches => {total}", ha="center", fontsize=12, transform=fig.transFigure)
             pdf.savefig(fig)
             plt.close(fig)
 
-            # example => we do 2 charts: Heatmap, Bollinger
-            # In your real code you'd do all 8.
-            # Heatmap
+            # 3) example => heatmap
             df_m= self.df_current[self.df_current["Gap In"]!=""]
             if not df_m.empty and {"Dimension","Attribute"}.issubset(df_m.columns):
-                piv= df_m.groupby(["Dimension","Attribute"]).size().unstack(fill_value=0)
-                if not piv.empty:
+                pivot= df_m.groupby(["Dimension","Attribute"]).size().unstack(fill_value=0)
+                if not pivot.empty:
                     fig, ax= plt.subplots(figsize=(8,5))
-                    im= ax.imshow(piv, aspect="auto", cmap="Reds")
-                    ax.set_xticks(np.arange(len(piv.columns)))
-                    ax.set_xticklabels(piv.columns, rotation=45, ha="right")
-                    ax.set_yticks(np.arange(len(piv.index)))
-                    ax.set_yticklabels(piv.index)
+                    im= ax.imshow(pivot, aspect="auto", cmap="Reds")
+                    ax.set_xticks(np.arange(len(pivot.columns)))
+                    ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
+                    ax.set_yticks(np.arange(len(pivot.index)))
+                    ax.set_yticklabels(pivot.index)
                     plt.colorbar(im, ax=ax)
-                    ax.set_title("Heatmap: Dim x Attr")
                     enable_hover_chart(ax)
+                    ax.set_title("Heatmap => Dimension x Attribute")
                     pdf.savefig(fig)
                     plt.close(fig)
 
-            # Bollinger
+            # 4) Bollinger => entire history
             if not self.df_history.empty and "RunDate" in self.df_history.columns and "Key" in self.df_history.columns:
                 date_ct= self.df_history.groupby("RunDate")["Key"].count().reset_index(name="Count")
                 if not date_ct.empty:
@@ -687,7 +724,7 @@ class EnhancedPDFReport:
                     ax.set_xticks(xvals)
                     xlbl= [d.strftime("%Y-%m-%d") if not pd.isna(d) else "" for d in date_ct["dt"]]
                     ax.set_xticklabels(xlbl, rotation=45, ha="right")
-                    ax.set_title("Bollinger: entire history")
+                    ax.set_title("Bollinger => entire history")
                     ax.legend()
                     enable_hover_chart(ax)
                     pdf.savefig(fig)
@@ -695,13 +732,6 @@ class EnhancedPDFReport:
 
         logging.info(f"PDF => {pdf_path}")
         return pdf_path
-
-    def _new_fig(self)-> plt.Figure:
-        fig= plt.figure(figsize=(self.PAGE_WIDTH,self.PAGE_HEIGHT))
-        plt.axis("off")
-        self.page_count+=1
-        return fig
-
 
 # ----------------------------------------------------------------------------
 # HISTORY TAB => double click => show JSON
@@ -756,7 +786,6 @@ class HistoryTab(ctk.CTkFrame):
             txt.configure(state="disabled")
         except Exception as e:
             logging.error(f"History => {e}")
-
 
 # ----------------------------------------------------------------------------
 # ADVANCED DASHBOARD => stubs
@@ -1029,6 +1058,7 @@ class MainApp(ctk.CTk):
         meltdown_cols= [c for c in df_wide.columns if c not in id_vars]
         melted= df_wide.melt(id_vars=id_vars, value_vars=meltdown_cols,
                              var_name="Attribute", value_name="Value")
+        # fill nans
         for c in ["DimCode","Dimension","Name","Attribute","Value"]:
             if c not in melted.columns:
                 melted[c]= ""

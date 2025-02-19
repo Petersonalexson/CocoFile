@@ -1,0 +1,97 @@
+# mini mamaliga!
+
+import os
+import io
+import zipfile
+import pandas as pd
+from pathlib import Path
+
+def read_txt_2encodings(raw: bytes) -> pd.DataFrame:
+    """
+    Attempt to parse 'raw' bytes as CSV using two encodings:
+    1) utf-8-sig
+    2) utf-16-le
+
+    The first one that yields a non-empty DataFrame is returned.
+    If both fail or produce (0,0), an empty DataFrame is returned.
+    """
+    for enc in ["utf-8-sig", "utf-16-le"]:
+        try:
+            df = pd.read_csv(io.BytesIO(raw), encoding=enc, on_bad_lines="skip", engine="python")
+            # If this DataFrame is non-empty (rows or columns), return it
+            if df.shape[0] > 0 and df.shape[1] > 0:
+                return df
+        except Exception:
+            pass
+    # If both attempts fail or produce empty => return empty df
+    return pd.DataFrame()
+
+def extract_master_data(zip_path: str, output_excel: str):
+    """
+    1) For each *_Caster.txt in zip_path:
+       - dimension = the file name minus "_Caster.txt" and any '_'
+       - read the file with read_txt_2encodings()
+       - keep only the column "Name"
+    2) Output an Excel with columns: Dimension, Name, Value
+       (where Value = the same content as Name, as requested).
+    """
+    zip_path = Path(zip_path)
+    if not zip_path.is_file():
+        print(f"[ERROR] ZIP not found => {zip_path}")
+        return
+
+    rows = []
+    with zipfile.ZipFile(zip_path, "r") as z:
+        txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+        for txt_file in txt_files:
+            base_name = os.path.basename(txt_file)
+            # Only process files that match the pattern *_Caster.txt
+            # (case-insensitive check)
+            if "_caster.txt" not in base_name.lower():
+                continue
+
+            # Derive dimension:
+            # remove "_Caster.txt" + remove remaining underscores
+            dim_raw = base_name.lower().replace("_caster.txt", "")
+            dim = dim_raw.replace("_", "")
+
+            # Read raw bytes
+            try:
+                with z.open(txt_file) as fo:
+                    raw = fo.read()
+            except Exception as e:
+                print(f"[WARN] Could not read {txt_file}: {e}")
+                continue
+
+            # Parse with two encodings
+            df = read_txt_2encodings(raw)
+            if df.empty:
+                print(f"[INFO] Skipping {txt_file} => empty after both encodings.")
+                continue
+
+            # We only keep the 'Name' column
+            if "Name" not in df.columns:
+                print(f"[WARN] 'Name' column not found in {txt_file}. Columns={list(df.columns)}")
+                continue
+
+            # For each row, produce Dimension, Name, Value (same as 'Name')
+            for _, row in df.iterrows():
+                name_val = str(row["Name"])  # or row["Name"] if you don't need str conversion
+                rows.append((dim, name_val, name_val))
+
+    # Create a single DataFrame and write to Excel
+    out_df = pd.DataFrame(rows, columns=["Dimension", "Name", "Value"])
+    if out_df.empty:
+        print("[INFO] No data to write.")
+        return
+
+    out_df.to_excel(output_excel, index=False)
+    print(f"[OK] Extracted {len(out_df)} rows => {output_excel}")
+
+
+if __name__ == "__main__":
+    # Example usage:
+    master_zip = "Master_Config.zip"        # Your master ZIP path
+    output_xlsx = "extracted_master.xlsx"   # Desired output
+
+    extract_master_data(master_zip, output_xlsx)

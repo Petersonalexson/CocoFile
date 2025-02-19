@@ -5,34 +5,53 @@ import zipfile
 import pandas as pd
 from pathlib import Path
 
-def read_txt_2encodings(raw: bytes) -> pd.DataFrame:
-    """
-    Attempt to parse 'raw' bytes as CSV using two encodings:
-    1) utf-8-sig
-    2) utf-16-le
+ENCODING_CANDIDATES = [
+    "utf-8",
+    "utf-8-sig",
+    "utf-16",
+    "utf-16-le",
+    "utf-16-be",
+    "latin-1",
+    "cp1252",
+]
 
-    Returns the first non-empty DataFrame encountered.
-    If both fail or produce (0,0) shape, returns empty DataFrame.
+def read_txt_all_encodings(raw: bytes) -> pd.DataFrame:
     """
-    for enc in ["utf-8-sig", "utf-16-le"]:
+    Attempt to parse 'raw' bytes as CSV using multiple encodings:
+    - utf-8, utf-8-sig, utf-16, utf-16-le, utf-16-be, latin-1, cp1252
+
+    Returns the first *non-empty* DataFrame encountered.
+    If all fail or yield an empty (0,0) shape, returns an empty DataFrame.
+    """
+    for enc in ENCODING_CANDIDATES:
         try:
-            # Use engine="python" and on_bad_lines="skip" to handle messy files
-            df = pd.read_csv(io.BytesIO(raw), encoding=enc, engine="python", on_bad_lines="skip")
+            # Use engine="python" and on_bad_lines="skip" for messy files
+            # Using sep=None helps pandas sniff delimiters automatically.
+            df = pd.read_csv(io.BytesIO(raw), 
+                             encoding=enc, 
+                             engine="python", 
+                             on_bad_lines="skip", 
+                             sep=None)
             # Drop columns or rows that are all-NaN, to reduce empty shapes
             df.dropna(how="all", axis=0, inplace=True)
             df.dropna(how="all", axis=1, inplace=True)
-            # If this DataFrame is non-empty, return
+
             if df.shape[0] > 0 and df.shape[1] > 0:
+                print(f"[INFO] Successfully parsed with encoding={enc}, shape={df.shape}")
                 return df
         except Exception as e:
+            # We ignore parse errors and keep trying
+            # uncomment next line for debug:
+            # print(f"[DEBUG] encoding={enc} error => {e}")
             pass
-    return pd.DataFrame()  # If both fail or produce empty => return empty
+    # If we get here, everything failed or produced (0,0) shape
+    return pd.DataFrame()
 
 def extract_master_zip(zip_path: str, output_excel: str):
     """
-    1) Read each .txt inside 'zip_path' with two encodings (utf-8-sig, utf-16-le).
+    1) Read each .txt inside 'zip_path' by trying multiple encodings.
     2) If no 'Name' column is found, rename the *first* column to 'Name' (if any).
-    3) Append all columns to a final DataFrame. Also add 'SourceFile' for tracking.
+    3) Append all columns to a final DataFrame, also adding 'SourceFile' for reference.
     4) Write a single Excel with data from all text files.
     """
     zip_path = Path(zip_path)
@@ -57,9 +76,9 @@ def extract_master_zip(zip_path: str, output_excel: str):
                 print(f"[WARN] Could not read {txt_file}: {e}")
                 continue
 
-            df = read_txt_2encodings(raw)
+            df = read_txt_all_encodings(raw)
             if df.empty:
-                print(f"[INFO] {txt_file} => empty or failed parsing in both encodings.")
+                print(f"[INFO] {txt_file} => empty or failed parsing in all encodings.")
                 continue
 
             # Make sure there's a 'Name' column.
@@ -73,6 +92,11 @@ def extract_master_zip(zip_path: str, output_excel: str):
                     # If there's not even a single column, skip
                     print(f"[INFO] {txt_file} => No columns after cleaning.")
                     continue
+
+            # Optionally, keep all columns (including 'Name'). 
+            # If you want to exclude columns, do so here. E.g.:
+            # df = df[["Name", "SomeOtherColumn"]] # etc.
+
             # Tag the source file
             df["SourceFile"] = file_name
             all_frames.append(df)
@@ -90,7 +114,6 @@ def extract_master_zip(zip_path: str, output_excel: str):
 
 if __name__ == "__main__":
     # Example usage:
-    # Adjust paths to your environment
     master_zip_path = "data/Master_Config.zip"
     output_file = "all_master_data.xlsx"
 

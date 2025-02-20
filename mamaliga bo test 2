@@ -1,20 +1,17 @@
-#!/usr/bin/env python3
+# mamaliga bo test 2
 """
 Ultra-Mega Reconciliation with:
  - Automatic loading of all history JSON runs on startup
- - ERP & Master Previews (auto End Date filter => blank/future)
+ - ERP & Master Previews (Start/End Date filterable)
  - Compare => missing_items.xlsx (two sheets: Mismatch & Case_Differences)
  - "Gap In" column instead of "Missing In"
  - 8-chart Dashboard with Bollinger band
  - Bollinger data saved on close (for entire history) to a user-chosen JSON
  - KEY = (Dimension|Name|Attribute|Master|ERP).upper() in Mismatch
  - Only check case differences for rows where Attribute=="Name"
- - **Paths tab is hidden** (we still load them, but no UI for it).
- - **No Start/End Date filter popups** in the Previews.
- - **When double-clicking a JSON run in History, show a summary plus a button for full content**.
- - **We store both Key (uppercase) and Key_Original to handle case differences**.
- - **CSV reading tries 'utf-8-sig' and 'utf-16-le' encodings**.
- - **Now replaces any NaN with "<<NaN>>"** in meltdown steps.
+ - We **show** the Paths tab again, so the user can set file paths.
+ - We do NOT forcibly replace missing data with "<<NaN>>" anymore (we keep original data or blank if truly NaN).
+ - CSV reading tries many encodings (utf-8-sig, utf-16-le, utf-16-be, cp1252, latin-1, ascii) for robust reading.
 """
 
 import os
@@ -55,13 +52,13 @@ DEFAULT_PATHS = {
     "MASTER_ZIP_PATH": "data/Master_Config.zip",
     "EXCEPTION_PATH": "data/Exception_Table.xlsx",
     "OUTPUT_PATH": "output/missing_items.xlsx",
-    "CONFIG_PATH": "config/ui_config.json",  # hidden in GUI
+    "CONFIG_PATH": "config/ui_config.json",
     "PARAMETER_PATH": "data/parameters.xlsx",
-    "MASTER_CSV_OUTPUT": "temp_master_csv",  # hidden in GUI
+    "MASTER_CSV_OUTPUT": "temp_master_csv",
     "PDF_EXPORT_PATH": "output/dashboard_report.pdf",
-    "LOGO_PATH": "images/company_logo.png",  # hidden in GUI
-    "HISTORY_PATH": "history_runs",          # hidden in GUI
-    "BAND_CHART_JSON_PATH": "data/bollinger_data.json"  # hidden in GUI
+    "LOGO_PATH": "images/company_logo.png",
+    "HISTORY_PATH": "history_runs",
+    "BAND_CHART_JSON_PATH": "data/bollinger_data.json"
 }
 
 def default_config() -> Dict:
@@ -255,11 +252,12 @@ def read_erp_excel(path: Path) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 def read_txt_2encodings(raw: bytes) -> pd.DataFrame:
     """
-    Tries reading the bytes with 'utf-8-sig' and 'utf-16-le'.
-    Returns the first successful parse or empty DataFrame if none works.
+    Tries reading the bytes with many encodings: 'utf-8-sig', 'utf-16-le', 'utf-16-be',
+    'cp1252', 'latin-1', 'ascii'. Returns the first successful parse or empty DataFrame.
     """
     import io
-    for enc in ["utf-8-sig","utf-16-le"]:
+    encodings_to_try = ["utf-8-sig","utf-16-le","utf-16-be","cp1252","latin-1","ascii"]
+    for enc in encodings_to_try:
         try:
             buf = io.BytesIO(raw)
             df = pd.read_csv(buf, encoding=enc, on_bad_lines="skip", engine="python")
@@ -314,9 +312,10 @@ def convert_master_txt_to_csv(zip_path: Path, out_dir: Path):
 
 def read_csv_2encodings(path: Path) -> pd.DataFrame:
     """
-    Similar approach for final CSVs: tries 'utf-8-sig' then 'utf-16-le'.
+    Similar approach for final CSVs: tries many encodings.
     """
-    for enc in ["utf-8-sig","utf-16-le"]:
+    encodings_to_try = ["utf-8-sig","utf-16-le","utf-16-be","cp1252","latin-1","ascii"]
+    for enc in encodings_to_try:
         try:
             df = pd.read_csv(path, encoding=enc, on_bad_lines="skip")
             df.columns = df.columns.astype(str).str.strip()
@@ -345,7 +344,7 @@ def unify_master_csvs(csvs: List[Path]) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------
-# MELTDOWN => fill NaN => "<<NaN>>", plus keep end date blank/future
+# MELTDOWN => keep end date blank/future (no forced "<<NaN>>"), keep data as is
 # ----------------------------------------------------------------------------
 def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.DataFrame:
     """
@@ -353,8 +352,7 @@ def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.D
     2) Map V_S_C => param["dim_erp_map"] => "Dimension"
     3) Melt wide columns => (Dimension, Name, Attribute, Value)
     4) Use param["attr_erp_map"] to rename columns => standard attributes
-    5) Convert any NaN => "<<NaN>>"
-    6) Keep End Date blank/future
+    5) keep valid end date if not empty/future.
     """
     if "V_S_C" not in df.columns:
         return pd.DataFrame()
@@ -397,25 +395,23 @@ def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.D
     melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
     melted["Attribute"] = melted["OrigAttr"].map(amap)
 
-    # strip T, then convert NaN => "<<NaN>>"
-    def handle_value(a, val):
-        # strip potential trailing time
-        raw = strip_t(val)
-        if pd.isna(raw) or raw == "":
-            # fill with explicit placeholder
-            raw = "<<NaN>>"
+    def handle_date(a, val):
+        # strip if T found
+        s = strip_t(val)
+        # if end/start => ensure YYYY-MM-DD if possible
+        if a in ["Start Date","End Date"] and s:
+            try:
+                dt = datetime.strptime(s, "%Y-%m-%d").date()
+                s = dt.strftime("%Y-%m-%d")
+            except:
+                s = ""
+        return s
 
-        return str(raw)
+    melted["Value"] = melted.apply(lambda r: handle_date(r["Attribute"], r["ValX"]), axis=1)
 
-    melted["Value"] = melted.apply(lambda r: handle_value(r["Attribute"], r["ValX"]), axis=1)
-
-    # keep valid end date (if Value is not "<<NaN>>")
     keep_rows = []
     for _, row in melted.iterrows():
-        if row["Value"] == "<<NaN>>" and row["Attribute"] == "End Date":
-            # This means it was missing data, but we treat missing as blank => OK
-            keep_rows.append(row)
-        elif keep_valid_end_date(row["Attribute"], row["Value"]):
+        if keep_valid_end_date(row["Attribute"], row["Value"]):
             keep_rows.append(row)
 
     out = pd.DataFrame(keep_rows)
@@ -427,8 +423,7 @@ def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> p
     2) Map => dimension
     3) Melt => (Dimension, Name, Attribute, Value)
     4) Map attribute
-    5) fill NaN => "<<NaN>>"
-    6) keep valid end date
+    5) keep valid end date if not empty/future
     """
     if df.empty or "RawFileName" not in df.columns:
         return pd.DataFrame()
@@ -458,22 +453,22 @@ def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> p
     melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
     melted["Attribute"] = melted["OrigAttr"].map(amap)
 
-    def handle_value(a, val):
-        raw = strip_t(val)
-        if pd.isna(raw) or raw == "":
-            raw = "<<NaN>>"
-        return str(raw)
+    def handle_date(a, val):
+        s = strip_t(val)
+        if a in ["Start Date","End Date"] and s:
+            try:
+                dt = datetime.strptime(s, "%Y-%m-%d").date()
+                s = dt.strftime("%Y-%m-%d")
+            except:
+                s = ""
+        return s
 
-    melted["Value"] = melted.apply(lambda r: handle_value(r["Attribute"], r["ValX"]), axis=1)
+    melted["Value"] = melted.apply(lambda r: handle_date(r["Attribute"], r["ValX"]), axis=1)
 
     keep_rows = []
     for _, row in melted.iterrows():
-        if row["Value"] == "<<NaN>>" and row["Attribute"] == "End Date":
-            # missing End Date => treat as blank => keep
+        if keep_valid_end_date(row["Attribute"], row["Value"]):
             keep_rows.append(row)
-        elif keep_valid_end_date(row["Attribute"], row["Value"]):
-            keep_rows.append(row)
-
     out = pd.DataFrame(keep_rows)
     if "Name" not in out.columns:
         out["Name"] = ""
@@ -493,7 +488,7 @@ def pivot_for_preview(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------
-# COMPARE => produce "Gap In" (instead of "Missing In")
+# COMPARE => produce "Gap In"
 # ----------------------------------------------------------------------------
 def melt_back(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -509,8 +504,7 @@ def melt_back(df: pd.DataFrame) -> pd.DataFrame:
 def build_keys(df: pd.DataFrame)-> pd.DataFrame:
     """
     Prepare for compare => fill blanks, add GroupKey placeholders, etc.
-    Also note that we can have blank strings or actual NaN in DataFrame.
-    We'll do fillna("") here.
+    We'll do fillna("") here, so missing becomes blank.
     """
     df = df.copy()
     for c in ["Dimension","Name","Attribute","Value"]:
@@ -732,12 +726,12 @@ def write_two_sheet_excel(mismatch: pd.DataFrame, case_only: pd.DataFrame, out_p
 
 
 # ----------------------------------------------------------------------------
-# SIMPLE PREVIEW (No date filter popups)
+# SIMPLE PREVIEW (with no explicit date filter popups)
 # ----------------------------------------------------------------------------
 class SimplePreview(ctk.CTkFrame):
     """
-    We show meltdown data pivoted in a read-only table (no date filter).
-    If the config had filters, we store them but ignore them.
+    We show meltdown data pivoted in a read-only table (no date filter popups).
+    If the config had filters, we store them but do nothing.
     """
     def __init__(self, parent, name: str, filters_dict=None):
         super().__init__(parent)
@@ -1031,12 +1025,10 @@ class EnhancedPDFReport:
 
     def _plot_scatter(self, ax, cdim):
         xvals= np.arange(len(cdim))
-        yvals= cdim["Key"].values
+        yvals= cdim.values
         ax.scatter(xvals, yvals, color="green")
-        for i, (ix, val) in enumerate(zip(xvals, yvals)):
-            # dimension name
-            name= cdim.index[i]
-            ax.text(ix, val, name, ha="center", va="bottom", rotation=60, fontsize=8)
+        for i, v in enumerate(yvals):
+            ax.text(xvals[i], v, cdim.index[i], ha="center", va="bottom", rotation=60, fontsize=8)
         ax.set_xticks([])
         ax.set_ylabel("Count")
 
@@ -1468,49 +1460,40 @@ class MainApp(ctk.CTk):
         # 3) prepare empty history
         self.history_df= pd.DataFrame()
 
-        # We do NOT show a "Paths" tab. We read paths from config behind the scenes.
-        self.erp_path = Path(self.config_dict["paths"].get("ERP_EXCEL_PATH", DEFAULT_PATHS["ERP_EXCEL_PATH"]))
-        self.mast_zip = Path(self.config_dict["paths"].get("MASTER_ZIP_PATH", DEFAULT_PATHS["MASTER_ZIP_PATH"]))
-        self.exc_path = Path(self.config_dict["paths"].get("EXCEPTION_PATH", DEFAULT_PATHS["EXCEPTION_PATH"]))
-        self.out_path = Path(self.config_dict["paths"].get("OUTPUT_PATH", DEFAULT_PATHS["OUTPUT_PATH"]))
-
-        self.cfg_path = Path(self.config_dict["paths"].get("CONFIG_PATH", DEFAULT_PATHS["CONFIG_PATH"]))
-        self.par_path = Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"]))
-        self.csv_dir = Path(self.config_dict["paths"].get("MASTER_CSV_OUTPUT", DEFAULT_PATHS["MASTER_CSV_OUTPUT"]))
-        self.pdf_path= Path(self.config_dict["paths"].get("PDF_EXPORT_PATH", DEFAULT_PATHS["PDF_EXPORT_PATH"]))
-        self.logo_path= Path(self.config_dict["paths"].get("LOGO_PATH", DEFAULT_PATHS["LOGO_PATH"]))
-        self.hist_path= Path(self.config_dict["paths"].get("HISTORY_PATH", DEFAULT_PATHS["HISTORY_PATH"]))
-        self.band_json_path= Path(self.config_dict["paths"].get("BAND_CHART_JSON_PATH", DEFAULT_PATHS["BAND_CHART_JSON_PATH"]))
-
-        # Tab control
+        # We'll show the PATHS tab again, so user can change paths.
         self.tabs= ttk.Notebook(main_frame)
         self.tabs.pack(fill="both", expand=True)
 
-        # 1) ERP Preview
+        # 1) Paths tab
+        self.tab_paths= ctk.CTkFrame(self.tabs)
+        self.build_paths_tab(self.tab_paths)
+        self.tabs.add(self.tab_paths, text="Paths")
+
+        # 2) ERP Preview
         self.tab_erp= ctk.CTkFrame(self.tabs)
         erp_filters= self.config_dict.get("erp_grid",{}).get("filters",{})
         self.erp_preview= SimplePreview(self.tab_erp,"ERP",filters_dict=erp_filters)
         self.erp_preview.pack(fill="both", expand=True)
         self.tabs.add(self.tab_erp, text="ERP Preview")
 
-        # 2) Master Preview
+        # 3) Master Preview
         self.tab_master= ctk.CTkFrame(self.tabs)
         mast_filters= self.config_dict.get("master_grid",{}).get("filters",{})
         self.master_preview= SimplePreview(self.tab_master,"Master",filters_dict=mast_filters)
         self.master_preview.pack(fill="both", expand=True)
         self.tabs.add(self.tab_master, text="Master Preview")
 
-        # 3) Compare
+        # 4) Compare
         self.tab_compare= ctk.CTkFrame(self.tabs)
         self.build_compare_tab(self.tab_compare)
         self.tabs.add(self.tab_compare, text="Compare")
 
-        # 4) Dashboard
+        # 5) Dashboard
         self.dashboard_tab= AdvancedDashboard(self.tabs, self.config_dict)
         self.tabs.add(self.dashboard_tab, text="Dashboard")
 
-        # 5) History
-        self.history_tab= HistoryTab(self.tabs, self.hist_path)
+        # 6) History
+        self.history_tab= HistoryTab(self.tabs, Path(self.config_dict["paths"].get("HISTORY_PATH","history_runs")))
         self.tabs.add(self.history_tab, text="History")
 
         # bottom log box
@@ -1521,14 +1504,13 @@ class MainApp(ctk.CTk):
         handler.setLevel(logging.INFO)
         logging.getLogger().addHandler(handler)
 
-        # temp CSV dir for Master
-        self.temp_csv_dir= self.csv_dir
+        self.temp_csv_dir= Path(self.config_dict["paths"].get("MASTER_CSV_OUTPUT","temp_master_csv"))
         self.temp_csv_dir.mkdir(parents=True, exist_ok=True)
 
-        # load older runs from JSON => self.history_df
+        # load older runs
         self.load_all_runs()
 
-        # meltdown => show preview
+        # meltdown => preview
         self.refresh_erp()
         self.refresh_master()
 
@@ -1543,22 +1525,67 @@ class MainApp(ctk.CTk):
         # push entire history => dash
         self.dashboard_tab.set_data(pd.DataFrame(), self.history_df)
 
+    def build_paths_tab(self, parent):
+        frm= ctk.CTkFrame(parent)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.erp_var= tk.StringVar(value=self.config_dict["paths"].get("ERP_EXCEL_PATH", DEFAULT_PATHS["ERP_EXCEL_PATH"]))
+        self.mast_var= tk.StringVar(value=self.config_dict["paths"].get("MASTER_ZIP_PATH", DEFAULT_PATHS["MASTER_ZIP_PATH"]))
+        self.exc_var= tk.StringVar(value=self.config_dict["paths"].get("EXCEPTION_PATH", DEFAULT_PATHS["EXCEPTION_PATH"]))
+        self.out_var= tk.StringVar(value=self.config_dict["paths"].get("OUTPUT_PATH", DEFAULT_PATHS["OUTPUT_PATH"]))
+        self.cfg_var= tk.StringVar(value=self.config_dict["paths"].get("CONFIG_PATH", DEFAULT_PATHS["CONFIG_PATH"]))
+        self.par_var= tk.StringVar(value=self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"]))
+        self.csv_var= tk.StringVar(value=self.config_dict["paths"].get("MASTER_CSV_OUTPUT", DEFAULT_PATHS["MASTER_CSV_OUTPUT"]))
+        self.pdf_var= tk.StringVar(value=self.config_dict["paths"].get("PDF_EXPORT_PATH", DEFAULT_PATHS["PDF_EXPORT_PATH"]))
+        self.logo_var= tk.StringVar(value=self.config_dict["paths"].get("LOGO_PATH", DEFAULT_PATHS["LOGO_PATH"]))
+        self.hist_var= tk.StringVar(value=self.config_dict["paths"].get("HISTORY_PATH", DEFAULT_PATHS["HISTORY_PATH"]))
+        self.band_json_var= tk.StringVar(value=self.config_dict["paths"].get("BAND_CHART_JSON_PATH", DEFAULT_PATHS["BAND_CHART_JSON_PATH"]))
+
+        def mkrow(lbl, var, is_dir=False):
+            rowf= ctk.CTkFrame(frm)
+            rowf.pack(fill="x", pady=5)
+            ctk.CTkLabel(rowf, text=lbl, width=180).pack(side="left", padx=5)
+            e= ctk.CTkEntry(rowf, textvariable=var, width=600)
+            e.pack(side="left", padx=5)
+            def br():
+                if is_dir:
+                    p= filedialog.askdirectory()
+                else:
+                    p= filedialog.askopenfilename()
+                if p:
+                    var.set(p)
+            ctk.CTkButton(rowf, text="Browse", command=br,
+                          fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+
+        mkrow("ERP Excel:", self.erp_var)
+        mkrow("Master ZIP:", self.mast_var)
+        mkrow("Exception Path:", self.exc_var)
+        mkrow("Missing Items Output:", self.out_var)
+        mkrow("JSON Config Path:", self.cfg_var)
+        mkrow("Parameter File:", self.par_var)
+        mkrow("Master CSV Folder:", self.csv_var, is_dir=True)
+        mkrow("PDF Export Path:", self.pdf_var, is_dir=False)
+        mkrow("Logo Path:", self.logo_var, is_dir=False)
+        mkrow("History Path:", self.hist_var, is_dir=True)
+        mkrow("Bollinger JSON Path:", self.band_json_var, is_dir=False)
+
+        bf= ctk.CTkFrame(frm)
+        bf.pack(fill="x", pady=10)
+        ctk.CTkButton(bf, text="Save Config", command=self.save_all_config,
+                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+        ctk.CTkButton(bf, text="Refresh ERP", command=self.refresh_erp,
+                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+        ctk.CTkButton(bf, text="Refresh Master", command=self.refresh_master,
+                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+
     def build_compare_tab(self, parent):
         frm= ctk.CTkFrame(parent)
         frm.pack(fill="both", expand=True, padx=10, pady=10)
         ctk.CTkLabel(frm, text="Generate Missing Items", font=("Arial",16)).pack(pady=5)
-
-        ctk.CTkButton(
-            frm, text="Run Reconciliation",
-            command=self.run_comparison,
-            fg_color="#800020", hover_color="#a52a2a", text_color="white"
-        ).pack(pady=10)
-
-        ctk.CTkButton(
-            frm, text="Export PDF Report",
-            command=self.export_pdf,
-            fg_color="#800020", hover_color="#a52a2a", text_color="white"
-        ).pack(pady=10)
+        ctk.CTkButton(frm, text="Run Reconciliation", command=self.run_comparison,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(pady=10)
+        ctk.CTkButton(frm, text="Export PDF Report", command=self.export_pdf,
+                      fg_color="#800020", hover_color="#a52a2a", text_color="white").pack(pady=10)
 
     def load_all_runs(self):
         if not self.hist_path.is_dir():
@@ -1580,7 +1607,8 @@ class MainApp(ctk.CTk):
             logging.info(f"Loaded all runs => total {len(self.history_df)} records from {self.hist_path}")
 
     def refresh_erp(self):
-        raw_erp= read_erp_excel(self.erp_path)
+        erp_path= Path(self.erp_var.get().strip())
+        raw_erp= read_erp_excel(erp_path)
         if raw_erp.empty:
             self.erp_preview.set_data(pd.DataFrame())
             return
@@ -1589,7 +1617,9 @@ class MainApp(ctk.CTk):
         self.erp_preview.set_data(pivoted)
 
     def refresh_master(self):
-        csvs= convert_master_txt_to_csv(self.mast_zip, self.temp_csv_dir)
+        zip_path= Path(self.mast_var.get().strip())
+        out_dir= Path(self.csv_var.get().strip())
+        csvs= convert_master_txt_to_csv(zip_path, out_dir)
         raw_mast= unify_master_csvs(csvs)
         if raw_mast.empty:
             self.master_preview.set_data(pd.DataFrame())
@@ -1664,17 +1694,17 @@ class MainApp(ctk.CTk):
 
     def save_all_config(self):
         cfg = self.config_dict
-        cfg["paths"]["ERP_EXCEL_PATH"] = str(self.erp_path)
-        cfg["paths"]["MASTER_ZIP_PATH"] = str(self.mast_zip)
-        cfg["paths"]["EXCEPTION_PATH"] = str(self.exc_path)
-        cfg["paths"]["OUTPUT_PATH"] = str(self.out_path)
-        cfg["paths"]["CONFIG_PATH"] = str(self.cfg_path)
-        cfg["paths"]["PARAMETER_PATH"] = str(self.par_path)
-        cfg["paths"]["MASTER_CSV_OUTPUT"] = str(self.csv_dir)
-        cfg["paths"]["PDF_EXPORT_PATH"] = str(self.pdf_path)
-        cfg["paths"]["LOGO_PATH"] = str(self.logo_path)
-        cfg["paths"]["HISTORY_PATH"] = str(self.hist_path)
-        cfg["paths"]["BAND_CHART_JSON_PATH"] = str(self.band_json_path)
+        cfg["paths"]["ERP_EXCEL_PATH"] = str(self.erp_var.get().strip())
+        cfg["paths"]["MASTER_ZIP_PATH"] = str(self.mast_var.get().strip())
+        cfg["paths"]["EXCEPTION_PATH"] = str(self.exc_var.get().strip())
+        cfg["paths"]["OUTPUT_PATH"] = str(self.out_var.get().strip())
+        cfg["paths"]["CONFIG_PATH"] = str(self.cfg_var.get().strip())
+        cfg["paths"]["PARAMETER_PATH"] = str(self.par_var.get().strip())
+        cfg["paths"]["MASTER_CSV_OUTPUT"] = str(self.csv_var.get().strip())
+        cfg["paths"]["PDF_EXPORT_PATH"] = str(self.pdf_var.get().strip())
+        cfg["paths"]["LOGO_PATH"] = str(self.logo_var.get().strip())
+        cfg["paths"]["HISTORY_PATH"] = str(self.hist_var.get().strip())
+        cfg["paths"]["BAND_CHART_JSON_PATH"] = str(self.band_json_var.get().strip())
 
         cfg.setdefault("erp_grid", {})
         cfg["erp_grid"]["filters"] = self.erp_preview.filters

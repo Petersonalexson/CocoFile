@@ -106,12 +106,12 @@ Sub ProcessExpensesData()
     logRow = logRow + 1
     
     ' Process SUM sheet
-    Dim sumContulCol As Long, sumCentruCol As Long, sumExpensesCol As Long
+    Dim sumContulCol As Long, sumCentruCol As Long, sumAmountCol As Long
     sumContulCol = FindColumnByHeader(sumSheet, "Contul Nat")
     sumCentruCol = FindColumnByHeader(sumSheet, "Centru")
-    sumExpensesCol = FindColumnByHeader(sumSheet, "EXPENSES")
+    sumAmountCol = FindColumnByHeader(sumSheet, "Amount")
     
-    Call WriteLog(logSheet, logRow, "SUM Columns", "Contul Nat col: " & sumContulCol & ", Centru col: " & sumCentruCol & ", EXPENSES col: " & sumExpensesCol)
+    Call WriteLog(logSheet, logRow, "SUM Columns", "Contul Nat col: " & sumContulCol & ", Centru col: " & sumCentruCol & ", Amount col: " & sumAmountCol)
     logRow = logRow + 1
     
     lastRow = sumSheet.Cells(sumSheet.Rows.Count, sumContulCol).End(xlUp).Row
@@ -145,7 +145,7 @@ Sub ProcessExpensesData()
         
         If isAllowed Then
             Dim expenseValue As Double
-            expenseValue = sumSheet.Cells(i, sumExpensesCol).Value
+            expenseValue = sumSheet.Cells(i, sumAmountCol).Value
             
             If expensesDict.Exists(centru) Then
                 expensesDict(centru) = expensesDict(centru) + expenseValue

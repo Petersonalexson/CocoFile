@@ -69,34 +69,53 @@ Sub ProcessExpensesData()
     
     ' Open MAP workbook
     Set mapWB = Workbooks.Open(mapPath)
-    Set mapSheet = mapWB.Sheets("MAP")
+    
+    ' Get sheet name from user
+    Dim sheetName As String
+    sheetName = InputBox("Enter the sheet name from MAP.xlsx to process:", "Select Sheet", "MAP")
+    
+    If sheetName = "" Then
+        MsgBox "Operation cancelled by user.", vbInformation
+        GoTo CleanUp
+    End If
+    
+    ' Try to set the specified sheet
+    On Error Resume Next
+    Set mapSheet = mapWB.Sheets(sheetName)
+    On Error GoTo 0
+    
+    If mapSheet Is Nothing Then
+        MsgBox "Sheet '" & sheetName & "' not found in MAP.xlsx", vbCritical
+        GoTo CleanUp
+    End If
+    
     Call WriteLog(logSheet, logRow, "Open MAP", "Successfully opened MAP.xlsx, Sheet: " & mapSheet.Name)
     logRow = logRow + 1
     
-    Set sumSheet = financeWB.Sheets("SUM")
+    Set sumSheet = financeWB.Sheets("XRP")
     Set expectedSheet = financeWB.Sheets("EXPECTED")
-    Call WriteLog(logSheet, logRow, "Sheets", "Located SUM and EXPECTED sheets in FINANCE")
+    Call WriteLog(logSheet, logRow, "Sheets", "Located XRP and EXPECTED sheets in FINANCE")
     logRow = logRow + 1
     
     ' Get column indices for MAP
-    Dim mapDescrCol As Long, mapContulCol As Long
+    Dim mapDescrCol As Long, mapAccountCol As Long
     mapDescrCol = FindColumnByHeader(mapSheet, "Descriere 2")
-    mapContulCol = FindColumnByHeader(mapSheet, "Contul")
-    Call WriteLog(logSheet, logRow, "MAP Columns", "Descriere 2 col: " & mapDescrCol & ", Contul col: " & mapContulCol)
+    mapAccountCol = FindColumnByHeader(mapSheet, "Account")
+    Call WriteLog(logSheet, logRow, "MAP Columns", "Descriere 2 col: " & mapDescrCol & ", Account col: " & mapAccountCol)
     logRow = logRow + 1
     
     ' Get allowed accounts from MAP worksheet
     Dim allowedAccounts As New Collection
     Dim lastRow As Long
-    lastRow = mapSheet.Cells(mapSheet.Rows.Count, mapContulCol).End(xlUp).Row
+    lastRow = mapSheet.Cells(mapSheet.Rows.Count, mapAccountCol).End(xlUp).Row
     Call WriteLog(logSheet, logRow, "MAP Rows", "Last row in MAP: " & lastRow)
     logRow = logRow + 1
     
     For i = 1 To lastRow
         If LCase(Trim(mapSheet.Cells(i, mapDescrCol).Value)) = "expenses" Then
             On Error Resume Next
-            allowedAccounts.Add Trim(mapSheet.Cells(i, mapContulCol).Value)
-            Call WriteLog(logSheet, logRow, "Allowed Account", "Found account: " & Trim(mapSheet.Cells(i, mapContulCol).Value))
+            allowedAccounts.Add Trim(mapSheet.Cells(i, mapAccountCol).Value)
+            Call WriteLog(logSheet, logRow, "Allowed Account", "Found account: " & Trim(mapSheet.Cells(i, mapAccountCol).Value))
             logRow = logRow + 1
             On Error GoTo ErrorHandler
         End If
@@ -105,17 +124,17 @@ Sub ProcessExpensesData()
     Call WriteLog(logSheet, logRow, "Accounts Summary", "Found " & allowedAccounts.Count & " allowed accounts")
     logRow = logRow + 1
     
-    ' Process SUM sheet
-    Dim sumContulCol As Long, sumCCenterCol As Long, sumAmountCol As Long
-    sumContulCol = FindColumnByHeader(sumSheet, "Contul Nat")
-    sumCCenterCol = FindColumnByHeader(sumSheet, "CCenter")
-    sumAmountCol = FindColumnByHeader(sumSheet, "Amount")
+    ' Process XRP sheet
+    Dim xrpAccountCol As Long, xrpCCenterCol As Long, xrpAmountCol As Long
+    xrpAccountCol = FindColumnByHeader(sumSheet, "Account Nat")
+    xrpCCenterCol = FindColumnByHeader(sumSheet, "CCenter")
+    xrpAmountCol = FindColumnByHeader(sumSheet, "Amount")
     
-    Call WriteLog(logSheet, logRow, "SUM Columns", "Contul Nat col: " & sumContulCol & ", CCenter col: " & sumCCenterCol & ", Amount col: " & sumAmountCol)
+    Call WriteLog(logSheet, logRow, "XRP Columns", "Account Nat col: " & xrpAccountCol & ", CCenter col: " & xrpCCenterCol & ", Amount col: " & xrpAmountCol)
     logRow = logRow + 1
     
-    lastRow = sumSheet.Cells(sumSheet.Rows.Count, sumContulCol).End(xlUp).Row
-    Call WriteLog(logSheet, logRow, "SUM Rows", "Last row in SUM: " & lastRow)
+    lastRow = sumSheet.Cells(sumSheet.Rows.Count, xrpAccountCol).End(xlUp).Row
+    Call WriteLog(logSheet, logRow, "XRP Rows", "Last row in XRP: " & lastRow)
     logRow = logRow + 1
     
     ' Clear dictionary before populating
@@ -127,8 +146,8 @@ Sub ProcessExpensesData()
     
     For i = 2 To lastRow
         Dim contulNat As String, ccenter As String
-        contulNat = Trim(CStr(sumSheet.Cells(i, sumContulCol).Value))
-        ccenter = Trim(CStr(sumSheet.Cells(i, sumCCenterCol).Value))
+        contulNat = Trim(CStr(sumSheet.Cells(i, xrpAccountCol).Value))
+        ccenter = Trim(CStr(sumSheet.Cells(i, xrpCCenterCol).Value))
         
         ' Check if account is in allowed accounts
         Dim isAllowed As Boolean
@@ -145,7 +164,7 @@ Sub ProcessExpensesData()
         
         If isAllowed Then
             Dim expenseValue As Double
-            expenseValue = sumSheet.Cells(i, sumAmountCol).Value
+            expenseValue = sumSheet.Cells(i, xrpAmountCol).Value
             
             If expensesDict.Exists(ccenter) Then
                 expensesDict(ccenter) = expensesDict(ccenter) + expenseValue

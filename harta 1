@@ -1,0 +1,267 @@
+Sub UpdateFinanciarWorkbook()
+    Dim hartaWB As Workbook, financiarWB As Workbook
+    Dim hartaPath As String, financiarPath As String
+    Dim hartaWS As Worksheet, sumWS As Worksheet, expectedWS As Worksheet
+    Dim lastRow As Long, i As Long
+    Dim headerRow As Long, colDescriere As Long, colContul As Long
+    Dim headerNames As Variant
+    Dim allowedConturi As New Scripting.Dictionary
+    Dim key As Variant
+    
+    ' ===============================
+    ' Step 1: Process HARTA.xlsx
+    ' ===============================
+    hartaPath = "C:\Users\alexp\OneDrive\Desktop\HARTA.xlsx"  ' Update path if needed
+    Set hartaWB = Workbooks.Open(hartaPath)
+    ' Assume data is in the first sheet – adjust if necessary
+    Set hartaWS = hartaWB.Sheets(1)
+    
+    ' Assume headers are in row 1.
+    headerRow = 1
+    headerNames = Application.Transpose(Application.Transpose(hartaWS.Rows(headerRow).Value))
+    
+    colDescriere = GetColumnIndex(headerNames, "Descriere 2")
+    colContul = GetColumnIndex(headerNames, "Contul")
+    
+    If colDescriere = 0 Or colContul = 0 Then
+        MsgBox "Required columns not found in HARTA.xlsx", vbCritical
+        hartaWB.Close SaveChanges:=False
+        Exit Sub
+    End If
+    
+    lastRow = hartaWS.Cells(hartaWS.Rows.Count, colDescriere).End(xlUp).Row
+    
+    ' Loop through HARTA rows (starting from row 2 assuming header in row 1)
+    For i = headerRow + 1 To lastRow
+        Dim descriereVal As String, contulVal As String
+        descriereVal = Trim(CStr(hartaWS.Cells(i, colDescriere).Value))
+        If LCase(descriereVal) = "expenses" Then
+            contulVal = Trim(CStr(hartaWS.Cells(i, colContul).Value))
+            If contulVal <> "" Then
+                If Not allowedConturi.Exists(contulVal) Then
+                    allowedConturi.Add contulVal, True
+                End If
+            End If
+        End If
+    Next i
+    hartaWB.Close SaveChanges:=False
+    ' Debug: list allowed conturi
+    Dim tmpKey As Variant, msg As String
+    msg = "Allowed Conturi:" & vbCrLf
+    For Each tmpKey In allowedConturi.Keys
+        msg = msg & tmpKey & vbCrLf
+    Next tmpKey
+    Debug.Print msg
+    
+    ' ===============================================
+    ' Step 2: Process FINANCIAR.xlsx "SUM" sheet
+    ' ===============================================
+    financiarPath = "C:\Users\alexp\OneDrive\Desktop\FINANCIAR.xlsx"  ' Update path if needed
+    Set financiarWB = Workbooks.Open(financiarPath)
+    
+    ' Get the "SUM" sheet
+    On Error Resume Next
+    Set sumWS = financiarWB.Sheets("SUM")
+    On Error GoTo 0
+    If sumWS Is Nothing Then
+        MsgBox "Sheet 'SUM' not found in FINANCIAR.xlsx", vbCritical
+        financiarWB.Close SaveChanges:=False
+        Exit Sub
+    End If
+    
+    ' Assume headers are in row 1. Find columns:
+    Dim colContulNat As Long, colCentru As Long, colExpenses As Long
+    headerRow = 1
+    headerNames = Application.Transpose(Application.Transpose(sumWS.Rows(headerRow).Value))
+    
+    colContulNat = GetColumnIndex(headerNames, "Contul Nat")
+    colCentru = GetColumnIndex(headerNames, "Centru")
+    colExpenses = GetColumnIndex(headerNames, "EXPENSES")
+    
+    If colContulNat = 0 Or colCentru = 0 Or colExpenses = 0 Then
+        MsgBox "Required columns not found in SUM sheet", vbCritical
+        financiarWB.Close SaveChanges:=False
+        Exit Sub
+    End If
+    
+    lastRow = sumWS.Cells(sumWS.Rows.Count, colContulNat).End(xlUp).Row
+    
+    ' Create a dictionary for aggregated expenses: key=printer code, value=sum of EXPENSES
+    Dim expensesDict As New Scripting.Dictionary
+    Dim currContulNat As String, currCentru As String
+    Dim currExpense As Double
+    For i = headerRow + 1 To lastRow
+        currContulNat = Trim(CStr(sumWS.Cells(i, colContulNat).Value))
+        If allowedConturi.Exists(currContulNat) Then
+            currCentru = Trim(CStr(sumWS.Cells(i, colCentru).Value))
+            currExpense = 0
+            If IsNumeric(sumWS.Cells(i, colExpenses).Value) Then
+                currExpense = CDbl(sumWS.Cells(i, colExpenses).Value)
+            End If
+            If expensesDict.Exists(currCentru) Then
+                expensesDict(currCentru) = expensesDict(currCentru) + currExpense
+            Else
+                expensesDict.Add currCentru, currExpense
+            End If
+        End If
+    Next i
+    
+    ' Debug: print aggregated data
+    msg = "Aggregated Expenses:" & vbCrLf
+    For Each key In expensesDict.Keys
+        msg = msg & key & ": " & expensesDict(key) & vbCrLf
+    Next key
+    Debug.Print msg
+    
+    ' ===============================
+    ' Step 3: Update the "EXPECTED" sheet
+    ' ===============================
+    Dim wsExpected As Worksheet
+    On Error Resume Next
+    Set wsExpected = financiarWB.Sheets("EXPECTED")
+    On Error GoTo 0
+    If wsExpected Is Nothing Then
+        MsgBox "Sheet 'EXPECTED' not found in FINANCIAR.xlsx", vbCritical
+        financiarWB.Close SaveChanges:=False
+        Exit Sub
+    End If
+    
+    Dim maxRowExp As Long, maxColExp As Long, rowPtr As Long
+    maxRowExp = wsExpected.Cells(wsExpected.Rows.Count, 1).End(xlUp).Row
+    maxColExp = wsExpected.Cells(1, wsExpected.Columns.Count).End(xlToLeft).Column
+    rowPtr = 1
+    
+    Do While rowPtr <= maxRowExp
+        Dim headerFound As Boolean, headerRowFound As Long, plannedOctCol As Long
+        headerFound = False
+        plannedOctCol = 0
+        
+        ' Search for header row containing "Planned October"
+        Dim r As Long, c As Long
+        For r = rowPtr To maxRowExp
+            For c = 1 To maxColExp
+                Dim cellVal As String
+                cellVal = ""
+                If Not IsError(wsExpected.Cells(r, c).Value) Then
+                    cellVal = Trim(CStr(wsExpected.Cells(r, c).Value))
+                End If
+                If cellVal <> "" Then
+                    If InStr(1, LCase(cellVal), "planned october") > 0 Then
+                        headerFound = True
+                        headerRowFound = r
+                        plannedOctCol = c
+                        Debug.Print "Found header row at row " & r & " with 'Planned October' in column " & c
+                        Exit For
+                    End If
+                End If
+            Next c
+            If headerFound Then Exit For
+        Next r
+        
+        If Not headerFound Then
+            Debug.Print "No more header rows found. Exiting."
+            Exit Do
+        End If
+        
+        ' Attempt to identify the printer code by checking cells in header row
+        Dim printerCode As String
+        printerCode = ""
+        For c = 1 To maxColExp
+            cellVal = ""
+            If Not IsError(wsExpected.Cells(headerRowFound, c).Value) Then
+                cellVal = Trim(CStr(wsExpected.Cells(headerRowFound, c).Value))
+            End If
+            If cellVal <> "" Then
+                If expensesDict.Exists(cellVal) Then
+                    printerCode = cellVal
+                    Debug.Print "Found printer code '" & printerCode & "' in header row " & headerRowFound & " at column " & c
+                    Exit For
+                End If
+            End If
+        Next c
+        
+        ' If not found in header, look in the next few rows (up to 3 rows below header)
+        If printerCode = "" Then
+            For r = headerRowFound + 1 To Application.WorksheetFunction.Min(headerRowFound + 3, maxRowExp)
+                For c = 1 To maxColExp
+                    cellVal = ""
+                    If Not IsError(wsExpected.Cells(r, c).Value) Then
+                        cellVal = Trim(CStr(wsExpected.Cells(r, c).Value))
+                    End If
+                    If cellVal <> "" Then
+                        If expensesDict.Exists(cellVal) Then
+                            printerCode = cellVal
+                            Debug.Print "Found printer code '" & printerCode & "' in row " & r & " at column " & c
+                            Exit For
+                        End If
+                    End If
+                Next c
+                If printerCode <> "" Then Exit For
+            Next r
+        End If
+        
+        If printerCode = "" Then
+            Debug.Print "Could not identify a valid printer code for header row " & headerRowFound & ". Skipping this block."
+            rowPtr = headerRowFound + 1
+            GoTo ContinueLoop
+        End If
+        
+        ' Search downward from the header row for a row that has "Expenses" (case-insensitive)
+        Dim expensesRow As Long
+        expensesRow = 0
+        For r = headerRowFound + 1 To Application.WorksheetFunction.Min(headerRowFound + 5, maxRowExp)
+            For c = 1 To maxColExp
+                cellVal = ""
+                If Not IsError(wsExpected.Cells(r, c).Value) Then
+                    cellVal = Trim(CStr(wsExpected.Cells(r, c).Value))
+                End If
+                If cellVal <> "" Then
+                    If InStr(1, LCase(cellVal), "expenses") > 0 Then
+                        expensesRow = r
+                        Debug.Print "Found 'Expenses' row at row " & r
+                        Exit For
+                    End If
+                End If
+            Next c
+            If expensesRow <> 0 Then Exit For
+        Next r
+        
+        If expensesRow = 0 Then
+            Debug.Print "Could not find an 'Expenses' row for printer " & printerCode & " starting at header row " & headerRowFound & "."
+            rowPtr = headerRowFound + 1
+            GoTo ContinueLoop
+        End If
+        
+        ' Update the cell in the Expenses row in the Planned October column with the aggregated expense
+        Dim expenseValue As Double
+        expenseValue = 0
+        If expensesDict.Exists(printerCode) Then
+            expenseValue = expensesDict(printerCode)
+        End If
+        
+        wsExpected.Cells(expensesRow, plannedOctCol).Value = expenseValue
+        Debug.Print "Updated printer " & printerCode & ": Set cell at row " & expensesRow & ", column " & plannedOctCol & " to " & expenseValue
+        
+        ' Move row pointer past this block
+        rowPtr = expensesRow + 1
+ContinueLoop:
+    Loop
+    
+    ' ===============================
+    ' Save the updated workbook (update within the same file)
+    ' ===============================
+    financiarWB.Save
+    MsgBox "Workbook updated successfully.", vbInformation
+End Sub
+
+' Helper function to find column index by header name
+Function GetColumnIndex(headerNames As Variant, headerName As String) As Long
+    Dim i As Long
+    For i = LBound(headerNames) To UBound(headerNames)
+        If LCase(Trim(CStr(headerNames(i)))) = LCase(headerName) Then
+            GetColumnIndex = i
+            Exit Function
+        End If
+    Next i
+    GetColumnIndex = 0
+End Function

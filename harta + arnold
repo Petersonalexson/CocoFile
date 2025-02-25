@@ -1,0 +1,705 @@
+harta
+
+Option Explicit
+
+' =================================================================================
+' A) LOGGING HELPERS FOR EXPENSES
+' =================================================================================
+
+Private Function SheetExists_Expenses(sheetName As String, wb As Workbook) As Boolean
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Sheets(sheetName)
+    SheetExists_Expenses = Not (ws Is Nothing)
+    On Error GoTo 0
+End Function
+
+Private Function CreateNewLogSheet_Expenses(wb As Workbook, baseName As String) As Worksheet
+    Dim newSheet As Worksheet
+    Dim suffix As Long
+    
+    suffix = 2
+    ' Keep incrementing suffix until we find a name that doesn't exist
+    Do While SheetExists_Expenses(baseName & "_" & suffix, wb)
+        suffix = suffix + 1
+    Loop
+    
+    Set newSheet = wb.Sheets.Add(After:=wb.Sheets(wb.Sheets.Count))
+    newSheet.Name = baseName & "_" & suffix
+    
+    Set CreateNewLogSheet_Expenses = newSheet
+End Function
+
+Private Sub WriteLogExpenses(ByRef logSheet As Worksheet, ByRef logRow As Long, _
+                             stepName As String, details As String)
+    ' If we exceed Excel's max rows, create a new log sheet named "LOG_EXPENSES_2", etc.
+    If logRow > 1048576 Then
+        Set logSheet = CreateNewLogSheet_Expenses(logSheet.Parent, "LOG_EXPENSES")
+        With logSheet
+            .Cells(1, 1).Value = "Timestamp"
+            .Cells(1, 2).Value = "Step"
+            .Cells(1, 3).Value = "Details"
+        End With
+        logRow = 2
+    End If
+    
+    logSheet.Cells(logRow, 1).Value = Now
+    logSheet.Cells(logRow, 2).Value = stepName
+    logSheet.Cells(logRow, 3).Value = details
+End Sub
+
+' =================================================================================
+' B) COLUMN-FINDING HELPER FOR EXPENSES
+' =================================================================================
+
+Private Function FindColumnByHeader_Expenses(ws As Worksheet, headerText As String) As Long
+    Dim lastCol As Long, i As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    
+    For i = 1 To lastCol
+        If InStr(1, LCase(Trim(ws.Cells(1, i).Value)), LCase(headerText)) > 0 Then
+            FindColumnByHeader_Expenses = i
+            Exit Function
+        End If
+    Next i
+    
+    FindColumnByHeader_Expenses = 0
+End Function
+
+' =================================================================================
+' C) MAIN PROCEDURE - EXPENSES
+' =================================================================================
+Sub ProcessExpensesData()
+    Dim budgetWB As Workbook
+    Dim mapWB As Workbook
+    Dim mapSheet As Worksheet
+    Dim xrpSheet As Worksheet
+    Dim forecastSheet As Worksheet
+    Dim logSheet As Worksheet
+    Dim expensesDict As Object
+    Dim mapPath As String
+    Dim logRow As Long
+    
+    Application.ScreenUpdating = False
+    On Error GoTo ErrorHandler
+    
+    ' 1) Dictionary for [Center => total amount]
+    Set expensesDict = CreateObject("Scripting.Dictionary")
+    
+    ' 2) Current workbook = BUDGET
+    Set budgetWB = ThisWorkbook
+    
+    ' 3) Create or clear a dedicated "LOG_EXPENSES" sheet
+    On Error Resume Next
+    Set logSheet = budgetWB.Sheets("LOG_EXPENSES")
+    On Error GoTo 0
+    
+    If logSheet Is Nothing Then
+        Set logSheet = budgetWB.Sheets.Add(After:=budgetWB.Sheets(budgetWB.Sheets.Count))
+        logSheet.Name = "LOG_EXPENSES"
+    Else
+        logSheet.Cells.Clear
+    End If
+    
+    ' Initialize log headers
+    With logSheet
+        .Cells(1, 1).Value = "Timestamp"
+        .Cells(1, 2).Value = "Step"
+        .Cells(1, 3).Value = "Details"
+    End With
+    logRow = 2
+    
+    ' Log start
+    WriteLogExpenses logSheet, logRow, "Start", "Beginning EXPENSES process"
+    logRow = logRow + 1
+    
+    ' 4) Open MAP workbook
+    mapPath = "C:\Path\To\MAP.xlsx" ' <-- Adjust path
+    WriteLogExpenses logSheet, logRow, "Path", "MAP path: " & mapPath
+    logRow = logRow + 1
+    
+    Set mapWB = Workbooks.Open(mapPath)
+    Set mapSheet = mapWB.Sheets("MY_MAP_SHEET_NAME") ' <-- Adjust name
+    WriteLogExpenses logSheet, logRow, "Open MAP", "Opened sheet: " & mapSheet.Name
+    logRow = logRow + 1
+    
+    ' 5) Set references to XRP & FORECAST
+    Set xrpSheet = budgetWB.Sheets("XRP")
+    Set forecastSheet = budgetWB.Sheets("FORECAST")
+    WriteLogExpenses logSheet, logRow, "Sheets", "Got XRP & FORECAST"
+    logRow = logRow + 1
+    
+    ' 6) Gather "expenses" accounts from MAP
+    Dim mapDescCol As Long, mapAccountCol As Long
+    mapDescCol = FindColumnByHeader_Expenses(mapSheet, "desc")
+    mapAccountCol = FindColumnByHeader_Expenses(mapSheet, "account")
+    
+    WriteLogExpenses logSheet, logRow, "MAP Columns", _
+                     "desc col: " & mapDescCol & ", account col: " & mapAccountCol
+    logRow = logRow + 1
+    
+    Dim allowedAccounts As New Collection
+    Dim lastRow As Long, i As Long
+    lastRow = mapSheet.Cells(mapSheet.Rows.Count, mapAccountCol).End(xlUp).Row
+    
+    WriteLogExpenses logSheet, logRow, "MAP Rows", "Last row in MAP: " & lastRow
+    logRow = logRow + 1
+    
+    For i = 1 To lastRow
+        Dim descVal As String
+        descVal = LCase(Trim(mapSheet.Cells(i, mapDescCol).Value))
+        
+        If descVal = "expenses" Then
+            On Error Resume Next
+            allowedAccounts.Add LCase(Trim(mapSheet.Cells(i, mapAccountCol).Value))
+            WriteLogExpenses logSheet, logRow, "Allowed Account", _
+                             "Found account: " & LCase(Trim(mapSheet.Cells(i, mapAccountCol).Value))
+            logRow = logRow + 1
+            On Error GoTo ErrorHandler
+        End If
+    Next i
+    
+    WriteLogExpenses logSheet, logRow, "Accounts Summary", _
+                     "Found " & allowedAccounts.Count & " allowed 'expenses' accounts"
+    logRow = logRow + 1
+    
+    ' 7) Build dictionary from XRP
+    Dim xrpAccountCol As Long, xrpCenterCol As Long, xrpAmountCol As Long
+    xrpAccountCol = FindColumnByHeader_Expenses(xrpSheet, "account")
+    xrpCenterCol = FindColumnByHeader_Expenses(xrpSheet, "center")
+    xrpAmountCol = FindColumnByHeader_Expenses(xrpSheet, "amount")
+    
+    WriteLogExpenses logSheet, logRow, "XRP Columns", _
+                     "account: " & xrpAccountCol & _
+                     ", center: " & xrpCenterCol & _
+                     ", amount: " & xrpAmountCol
+    logRow = logRow + 1
+    
+    lastRow = xrpSheet.Cells(xrpSheet.Rows.Count, xrpAccountCol).End(xlUp).Row
+    WriteLogExpenses logSheet, logRow, "XRP Rows", "Last row in XRP: " & lastRow
+    logRow = logRow + 1
+    
+    Dim matchCount As Long
+    matchCount = 0
+    
+    For i = 2 To lastRow
+        Dim accVal As String, centerVal As String
+        accVal = LCase(Trim(xrpSheet.Cells(i, xrpAccountCol).Value))
+        centerVal = LCase(Trim(xrpSheet.Cells(i, xrpCenterCol).Value))
+        
+        Dim isAllowed As Boolean
+        isAllowed = False
+        
+        Dim a As Variant
+        For Each a In allowedAccounts
+            If a = accVal Then
+                isAllowed = True
+                matchCount = matchCount + 1
+                WriteLogExpenses logSheet, logRow, "Match Found", _
+                                 "Row " & i & ": " & accVal & " => allowed"
+                logRow = logRow + 1
+                Exit For
+            End If
+        Next a
+        
+        If isAllowed Then
+            Dim amtVal As Double
+            amtVal = xrpSheet.Cells(i, xrpAmountCol).Value
+            
+            If expensesDict.Exists(centerVal) Then
+                expensesDict(centerVal) = expensesDict(centerVal) + amtVal
+            Else
+                expensesDict.Add centerVal, amtVal
+            End If
+        End If
+    Next i
+    
+    WriteLogExpenses logSheet, logRow, "Dictionary Summary", _
+                     matchCount & " XRP rows matched. " & expensesDict.Count & " centers total."
+    logRow = logRow + 1
+    
+    ' 8) Update FORECAST
+    lastRow = forecastSheet.UsedRange.Rows.Count
+    Dim lastCol As Long
+    lastCol = forecastSheet.UsedRange.Columns.Count
+    
+    WriteLogExpenses logSheet, logRow, "FORECAST Dimensions", _
+                     "Last row: " & lastRow & ", Last col: " & lastCol
+    logRow = logRow + 1
+    
+    Dim updatedCount As Long
+    updatedCount = 0
+    
+    Dim rowPtr As Long
+    rowPtr = 1
+    
+    Do While rowPtr <= lastRow
+        Dim foundMonth As Boolean
+        foundMonth = False
+        Dim monthRow As Long, monthCol As Long
+        
+        ' Search for "october" (change if needed)
+        Dim r As Long, c As Long
+        For r = rowPtr To Application.Min(rowPtr + 100, lastRow)
+            For c = 1 To lastCol
+                Dim cellText As String
+                cellText = LCase(Trim(forecastSheet.Cells(r, c).Value))
+                
+                WriteLogExpenses logSheet, logRow, "Scanning Month", _
+                                 "R" & r & "C" & c & ": " & cellText
+                logRow = logRow + 1
+                
+                If InStr(1, cellText, "october") > 0 Then
+                    foundMonth = True
+                    monthRow = r
+                    monthCol = c
+                    WriteLogExpenses logSheet, logRow, "Month Found", _
+                                     "'October' at R" & r & "C" & c
+                    logRow = logRow + 1
+                    Exit For
+                End If
+            Next c
+            If foundMonth Then Exit For
+        Next r
+        
+        If Not foundMonth Then
+            WriteLogExpenses logSheet, logRow, "No More Months", _
+                             "No 'October' found after row " & rowPtr
+            logRow = logRow + 1
+            Exit Do
+        End If
+        
+        ' Look left for center (50 col range)
+        Dim colStart As Long, colEnd As Long
+        colEnd = monthCol - 1
+        colStart = Application.Max(1, monthCol - 50)
+        
+        For c = colEnd To colStart Step -1
+            Dim possibleCenter As String
+            possibleCenter = LCase(Trim(forecastSheet.Cells(monthRow, c).Value))
+            
+            If expensesDict.Exists(possibleCenter) Then
+                WriteLogExpenses logSheet, logRow, "Center Found", _
+                                 "R" & monthRow & "C" & c & ": '" & possibleCenter & "'"
+                logRow = logRow + 1
+                
+                ' Look down for "expenses"
+                Dim rr As Long
+                Dim foundExp As Boolean
+                foundExp = False
+                
+                For rr = monthRow + 1 To Application.Min(monthRow + 100, lastRow)
+                    cellText = LCase(Trim(forecastSheet.Cells(rr, c).Value))
+                    
+                    If InStr(1, cellText, "expenses") > 0 Then
+                        foundExp = True
+                        Dim newVal As Double
+                        newVal = expensesDict(possibleCenter)
+                        
+                        ' Overwrite the cell under "October"
+                        forecastSheet.Cells(rr, monthCol).Value = newVal
+                        updatedCount = updatedCount + 1
+                        
+                        WriteLogExpenses logSheet, logRow, "Expenses Updated", _
+                                         "Center='" & possibleCenter & "', R" & rr & _
+                                         "C" & monthCol & " = " & newVal
+                        logRow = logRow + 1
+                        
+                        Exit For
+                    End If
+                Next rr
+                
+                If Not foundExp Then
+                    WriteLogExpenses logSheet, logRow, "Not Found", _
+                                     "No 'expenses' under center '" & possibleCenter & "'"
+                    logRow = logRow + 1
+                End If
+            End If
+        Next c
+        
+        rowPtr = monthRow + 1
+    Loop
+    
+    WriteLogExpenses logSheet, logRow, "Complete", _
+                     "Updated " & updatedCount & " 'expenses' cells."
+    logRow = logRow + 1
+    
+    ' Format log
+    With logSheet.Range("A1:C1")
+        .Font.Bold = True
+        .Interior.Color = RGB(200, 200, 200)
+    End With
+    logSheet.Columns("A:C").AutoFit
+    
+    mapWB.Close False
+    Application.ScreenUpdating = True
+    
+    MsgBox "EXPENSES script complete! Updated " & updatedCount & " rows." & vbNewLine & _
+           "Check 'LOG_EXPENSES' for details.", vbInformation
+    Exit Sub
+
+ErrorHandler:
+    If Not logSheet Is Nothing Then
+        WriteLogExpenses logSheet, logRow, "ERROR", _
+                         "Error " & Err.Number & ": " & Err.Description
+        logRow = logRow + 1
+    End If
+    
+    MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical
+    On Error Resume Next
+    If Not mapWB Is Nothing Then mapWB.Close False
+    Application.ScreenUpdating = True
+End Sub
+
+
+arnold
+Option Explicit
+
+' =================================================================================
+' A) LOGGING HELPERS FOR TERMINATORS
+' =================================================================================
+
+Private Function SheetExists_Terminators(sheetName As String, wb As Workbook) As Boolean
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Sheets(sheetName)
+    SheetExists_Terminators = Not (ws Is Nothing)
+    On Error GoTo 0
+End Function
+
+Private Function CreateNewLogSheet_Terminators(wb As Workbook, baseName As String) As Worksheet
+    Dim newSheet As Worksheet
+    Dim suffix As Long
+    
+    suffix = 2
+    ' Keep incrementing suffix until we find a name that doesn't exist
+    Do While SheetExists_Terminators(baseName & "_" & suffix, wb)
+        suffix = suffix + 1
+    Loop
+    
+    Set newSheet = wb.Sheets.Add(After:=wb.Sheets(wb.Sheets.Count))
+    newSheet.Name = baseName & "_" & suffix
+    
+    Set CreateNewLogSheet_Terminators = newSheet
+End Function
+
+Private Sub WriteLogTerminators(ByRef logSheet As Worksheet, ByRef logRow As Long, _
+                                stepName As String, details As String)
+    If logRow > 1048576 Then
+        Set logSheet = CreateNewLogSheet_Terminators(logSheet.Parent, "LOG_TERMINATORS")
+        With logSheet
+            .Cells(1, 1).Value = "Timestamp"
+            .Cells(1, 2).Value = "Step"
+            .Cells(1, 3).Value = "Details"
+        End With
+        logRow = 2
+    End If
+    
+    logSheet.Cells(logRow, 1).Value = Now
+    logSheet.Cells(logRow, 2).Value = stepName
+    logSheet.Cells(logRow, 3).Value = details
+End Sub
+
+' =================================================================================
+' B) COLUMN-FINDING HELPER FOR TERMINATORS
+' =================================================================================
+
+Private Function FindColumnByHeader_Terminators(ws As Worksheet, headerText As String) As Long
+    Dim lastCol As Long, i As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    
+    For i = 1 To lastCol
+        If InStr(1, LCase(Trim(ws.Cells(1, i).Value)), LCase(headerText)) > 0 Then
+            FindColumnByHeader_Terminators = i
+            Exit Function
+        End If
+    Next i
+    
+    FindColumnByHeader_Terminators = 0
+End Function
+
+' =================================================================================
+' C) MAIN PROCEDURE - TERMINATORS
+' =================================================================================
+Sub ProcessTerminatorData()
+    Dim budgetWB As Workbook
+    Dim mapWB As Workbook
+    Dim mapSheet As Worksheet
+    Dim xrpSheet As Worksheet
+    Dim forecastSheet As Worksheet
+    Dim logSheet As Worksheet
+    Dim termDict As Object
+    Dim mapPath As String
+    Dim logRow As Long
+    
+    Application.ScreenUpdating = False
+    On Error GoTo ErrorHandler
+    
+    ' 1) Dictionary for [Center => total amount]
+    Set termDict = CreateObject("Scripting.Dictionary")
+    
+    ' 2) Current workbook
+    Set budgetWB = ThisWorkbook
+    
+    ' 3) Create or clear "LOG_TERMINATORS"
+    On Error Resume Next
+    Set logSheet = budgetWB.Sheets("LOG_TERMINATORS")
+    On Error GoTo 0
+    
+    If logSheet Is Nothing Then
+        Set logSheet = budgetWB.Sheets.Add(After:=budgetWB.Sheets(budgetWB.Sheets.Count))
+        logSheet.Name = "LOG_TERMINATORS"
+    Else
+        logSheet.Cells.Clear
+    End If
+    
+    ' Initialize log
+    With logSheet
+        .Cells(1, 1).Value = "Timestamp"
+        .Cells(1, 2).Value = "Step"
+        .Cells(1, 3).Value = "Details"
+    End With
+    logRow = 2
+    
+    WriteLogTerminators logSheet, logRow, "Start", "Beginning TERMINATOR process"
+    logRow = logRow + 1
+    
+    ' 4) Open MAP
+    mapPath = "C:\Path\To\MAP.xlsx"
+    WriteLogTerminators logSheet, logRow, "Path", "MAP path: " & mapPath
+    logRow = logRow + 1
+    
+    Set mapWB = Workbooks.Open(mapPath)
+    Set mapSheet = mapWB.Sheets("MY_MAP_SHEET_NAME")
+    WriteLogTerminators logSheet, logRow, "Open MAP", _
+                        "Opened sheet: " & mapSheet.Name
+    logRow = logRow + 1
+    
+    ' 5) Set references
+    Set xrpSheet = budgetWB.Sheets("XRP")
+    Set forecastSheet = budgetWB.Sheets("FORECAST")
+    WriteLogTerminators logSheet, logRow, "Sheets", "Got XRP & FORECAST"
+    logRow = logRow + 1
+    
+    ' 6) Gather "terminators" from MAP
+    Dim mapDescCol As Long, mapAccountCol As Long
+    mapDescCol = FindColumnByHeader_Terminators(mapSheet, "desc")
+    mapAccountCol = FindColumnByHeader_Terminators(mapSheet, "account")
+    
+    WriteLogTerminators logSheet, logRow, "MAP Columns", _
+                        "desc col: " & mapDescCol & ", account col: " & mapAccountCol
+    logRow = logRow + 1
+    
+    Dim allowedAccounts As New Collection
+    Dim lastRow As Long, i As Long
+    lastRow = mapSheet.Cells(mapSheet.Rows.Count, mapAccountCol).End(xlUp).Row
+    
+    WriteLogTerminators logSheet, logRow, "MAP Rows", "Last row in MAP: " & lastRow
+    logRow = logRow + 1
+    
+    For i = 1 To lastRow
+        Dim descVal As String
+        descVal = LCase(Trim(mapSheet.Cells(i, mapDescCol).Value))
+        
+        If descVal = "terminators" Then
+            On Error Resume Next
+            allowedAccounts.Add LCase(Trim(mapSheet.Cells(i, mapAccountCol).Value))
+            WriteLogTerminators logSheet, logRow, "Allowed Account", _
+                                "Found terminator acc: " & LCase(Trim(mapSheet.Cells(i, mapAccountCol).Value))
+            logRow = logRow + 1
+            On Error GoTo ErrorHandler
+        End If
+    Next i
+    
+    WriteLogTerminators logSheet, logRow, "Terminator Accounts", _
+                        "Found " & allowedAccounts.Count & " terminator accounts"
+    logRow = logRow + 1
+    
+    ' 7) Build dictionary from XRP
+    Dim xrpAccountCol As Long, xrpCenterCol As Long, xrpAmountCol As Long
+    xrpAccountCol = FindColumnByHeader_Terminators(xrpSheet, "account")
+    xrpCenterCol = FindColumnByHeader_Terminators(xrpSheet, "center")
+    xrpAmountCol = FindColumnByHeader_Terminators(xrpSheet, "amount")
+    
+    WriteLogTerminators logSheet, logRow, "XRP Columns", _
+                        "account: " & xrpAccountCol & _
+                        ", center: " & xrpCenterCol & _
+                        ", amount: " & xrpAmountCol
+    logRow = logRow + 1
+    
+    lastRow = xrpSheet.Cells(xrpSheet.Rows.Count, xrpAccountCol).End(xlUp).Row
+    WriteLogTerminators logSheet, logRow, "XRP Rows", "Last row in XRP: " & lastRow
+    logRow = logRow + 1
+    
+    Dim matchCount As Long
+    matchCount = 0
+    
+    For i = 2 To lastRow
+        Dim accVal As String, centerVal As String
+        accVal = LCase(Trim(xrpSheet.Cells(i, xrpAccountCol).Value))
+        centerVal = LCase(Trim(xrpSheet.Cells(i, xrpCenterCol).Value))
+        
+        Dim isTermAcct As Boolean
+        isTermAcct = False
+        
+        Dim a As Variant
+        For Each a In allowedAccounts
+            If a = accVal Then
+                isTermAcct = True
+                Exit For
+            End If
+        Next a
+        
+        If isTermAcct Then
+            matchCount = matchCount + 1
+            
+            Dim amtVal As Double
+            amtVal = xrpSheet.Cells(i, xrpAmountCol).Value
+            
+            If termDict.Exists(centerVal) Then
+                termDict(centerVal) = termDict(centerVal) + amtVal
+            Else
+                termDict.Add centerVal, amtVal
+            End If
+            
+            WriteLogTerminators logSheet, logRow, "Match Found", _
+                                "Row " & i & ": account=" & accVal & ", + " & amtVal
+            logRow = logRow + 1
+        End If
+    Next i
+    
+    WriteLogTerminators logSheet, logRow, "Terminator Dict Summary", _
+                        matchCount & " matched rows, " & termDict.Count & " centers total."
+    logRow = logRow + 1
+    
+    ' 8) Update FORECAST
+    lastRow = forecastSheet.UsedRange.Rows.Count
+    Dim lastCol As Long
+    lastCol = forecastSheet.UsedRange.Columns.Count
+    
+    WriteLogTerminators logSheet, logRow, "FORECAST Dimensions", _
+                        "Last row: " & lastRow & ", Last col: " & lastCol
+    logRow = logRow + 1
+    
+    Dim updatedCount As Long
+    updatedCount = 0
+    
+    Dim rowPtr As Long
+    rowPtr = 1
+    
+    Do While rowPtr <= lastRow
+        Dim foundMonth As Boolean
+        foundMonth = False
+        Dim monthRow As Long, monthCol As Long
+        
+        Dim r As Long, c As Long
+        For r = rowPtr To Application.Min(rowPtr + 100, lastRow)
+            For c = 1 To lastCol
+                Dim cellText As String
+                cellText = LCase(Trim(forecastSheet.Cells(r, c).Value))
+                
+                WriteLogTerminators logSheet, logRow, "Scanning Month", _
+                                    "R" & r & "C" & c & ": " & cellText
+                logRow = logRow + 1
+                
+                If InStr(1, cellText, "october") > 0 Then
+                    foundMonth = True
+                    monthRow = r
+                    monthCol = c
+                    WriteLogTerminators logSheet, logRow, "Month Found", _
+                                        "'October' at R" & r & "C" & c
+                    logRow = logRow + 1
+                    Exit For
+                End If
+            Next c
+            If foundMonth Then Exit For
+        Next r
+        
+        If Not foundMonth Then
+            WriteLogTerminators logSheet, logRow, "No More Months", _
+                                "No 'October' found after row " & rowPtr
+            logRow = logRow + 1
+            Exit Do
+        End If
+        
+        ' Look left for center
+        Dim colStart As Long, colEnd As Long
+        colEnd = monthCol - 1
+        colStart = Application.Max(1, monthCol - 50)
+        
+        For c = colEnd To colStart Step -1
+            Dim possibleCenter As String
+            possibleCenter = LCase(Trim(forecastSheet.Cells(monthRow, c).Value))
+            
+            If termDict.Exists(possibleCenter) Then
+                WriteLogTerminators logSheet, logRow, "Center Found", _
+                                    "R" & monthRow & "C" & c & ": '" & possibleCenter & "'"
+                logRow = logRow + 1
+                
+                ' Then look down for "terminator & arnold"
+                Dim rr As Long
+                Dim foundT As Boolean
+                foundT = False
+                
+                For rr = monthRow + 1 To Application.Min(monthRow + 100, lastRow)
+                    cellText = LCase(Trim(forecastSheet.Cells(rr, c).Value))
+                    
+                    If InStr(1, cellText, "terminator & arnold") > 0 Then
+                        foundT = True
+                        Dim newVal As Double
+                        newVal = termDict(possibleCenter)
+                        
+                        ' Overwrite the cell under "October"
+                        forecastSheet.Cells(rr, monthCol).Value = newVal
+                        updatedCount = updatedCount + 1
+                        
+                        WriteLogTerminators logSheet, logRow, "T&A Updated", _
+                                            "Center='" & possibleCenter & "', R" & rr & _
+                                            "C" & monthCol & " = " & newVal
+                        logRow = logRow + 1
+                        
+                        Exit For
+                    End If
+                Next rr
+                
+                If Not foundT Then
+                    WriteLogTerminators logSheet, logRow, "Not Found", _
+                                        "No 'Terminator & Arnold' under center '" & possibleCenter & "'"
+                    logRow = logRow + 1
+                End If
+            End If
+        Next c
+        
+        rowPtr = monthRow + 1
+    Loop
+    
+    WriteLogTerminators logSheet, logRow, "Complete", _
+                        "Updated " & updatedCount & " 'Terminator & Arnold' cells."
+    logRow = logRow + 1
+    
+    ' Format
+    With logSheet.Range("A1:C1")
+        .Font.Bold = True
+        .Interior.Color = RGB(200, 200, 200)
+    End With
+    logSheet.Columns("A:C").AutoFit
+    
+    mapWB.Close False
+    Application.ScreenUpdating = True
+    
+    MsgBox "TERMINATORS script complete! Updated " & updatedCount & " rows." & vbNewLine & _
+           "Check 'LOG_TERMINATORS' for details.", vbInformation
+    Exit Sub
+
+ErrorHandler:
+    If Not logSheet Is Nothing Then
+        WriteLogTerminators logSheet, logRow, "ERROR", _
+                            "Error " & Err.Number & ": " & Err.Description
+        logRow = logRow + 1
+    End If
+    
+    MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical
+    On Error Resume Next
+    If Not mapWB Is Nothing Then mapWB.Close False
+    Application.ScreenUpdating = True
+End Sub

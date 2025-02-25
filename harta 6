@@ -1,0 +1,383 @@
+Option Explicit
+
+' ==================================================================================
+' A) LOGGING HELPERS
+' ==================================================================================
+
+' 1) Checks if a sheet named sheetName exists in workbook wb.
+Private Function SheetExists(sheetName As String, wb As Workbook) As Boolean
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Sheets(sheetName)
+    SheetExists = Not (ws Is Nothing)
+    On Error GoTo 0
+End Function
+
+' 2) Creates and returns a new log sheet with a unique name, e.g. TEST_LOG_2, etc.
+Private Function CreateNewLogSheet(wb As Workbook) As Worksheet
+    Dim newSheet As Worksheet
+    Dim baseName As String
+    Dim suffix As Long
+    
+    baseName = "TEST_LOG"
+    suffix = 2
+    
+    ' Keep incrementing suffix until we find a name that doesn't exist
+    Do While SheetExists(baseName & "_" & suffix, wb)
+        suffix = suffix + 1
+    Loop
+    
+    Set newSheet = wb.Sheets.Add(After:=wb.Sheets(wb.Sheets.Count))
+    newSheet.Name = baseName & "_" & suffix
+    
+    Set CreateNewLogSheet = newSheet
+End Function
+
+' 3) Writes a line to the log. If logRow > 1,048,576, creates a new log sheet.
+Private Sub WriteLog(ByRef logSheet As Worksheet, ByRef logRow As Long, _
+                     stepName As String, details As String)
+    
+    If logRow > 1048576 Then
+        ' Create a new log sheet
+        Set logSheet = CreateNewLogSheet(logSheet.Parent)
+        ' Initialize headers
+        With logSheet
+            .Cells(1, 1).Value = "Timestamp"
+            .Cells(1, 2).Value = "Step"
+            .Cells(1, 3).Value = "Details"
+        End With
+        logRow = 2
+    End If
+    
+    logSheet.Cells(logRow, 1).Value = Now
+    logSheet.Cells(logRow, 2).Value = stepName
+    logSheet.Cells(logRow, 3).Value = details
+End Sub
+
+
+' ==================================================================================
+' B) MAP & COLUMN-FINDING HELPERS
+' ==================================================================================
+
+' Finds the column number whose header (row 1) contains headerText.
+' If not found, returns 0.
+Private Function FindColumnByHeader(ws As Worksheet, headerText As String) As Long
+    Dim lastCol As Long, i As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    
+    For i = 1 To lastCol
+        If InStr(1, ws.Cells(1, i).Text, headerText, vbTextCompare) > 0 Then
+            FindColumnByHeader = i
+            Exit Function
+        End If
+    Next i
+    
+    FindColumnByHeader = 0
+End Function
+
+
+' ==================================================================================
+' C) MAIN PROCEDURE
+' ==================================================================================
+Sub ProcessExpensesData()
+    ' 1) Main variables
+    Dim budgetWB As Workbook          ' BUDGET (this workbook)
+    Dim mapWB As Workbook             ' MAP workbook
+    Dim mapSheet As Worksheet
+    Dim xrpSheet As Worksheet
+    Dim forecastSheet As Worksheet
+    Dim logSheet As Worksheet
+    Dim amountDict As Object          ' dictionary: Center => total amount
+    Dim mapPath As String
+    Dim logRow As Long
+    
+    Application.ScreenUpdating = False
+    On Error GoTo ErrorHandler
+    
+    ' 2) Dictionary object
+    Set amountDict = CreateObject("Scripting.Dictionary")
+    
+    ' 3) This workbook = BUDGET
+    Set budgetWB = ThisWorkbook
+    
+    ' 4) Create or clear TEST_LOG
+    On Error Resume Next
+    Set logSheet = budgetWB.Sheets("TEST_LOG")
+    On Error GoTo 0
+    
+    If logSheet Is Nothing Then
+        Set logSheet = budgetWB.Sheets.Add(After:=budgetWB.Sheets(budgetWB.Sheets.Count))
+        logSheet.Name = "TEST_LOG"
+    Else
+        logSheet.Cells.Clear
+    End If
+    
+    ' Initialize log headers
+    With logSheet
+        .Cells(1, 1).Value = "Timestamp"
+        .Cells(1, 2).Value = "Step"
+        .Cells(1, 3).Value = "Details"
+    End With
+    logRow = 2
+    
+    ' Log start
+    WriteLog logSheet, logRow, "Start", "Beginning process"
+    logRow = logRow + 1
+    
+    ' 5) Open MAP workbook
+    mapPath = "C:\Users\alexp\OneDrive\Desktop\MAP.xlsx" ' <--- Adjust path as needed
+    WriteLog logSheet, logRow, "Path", "MAP path: " & mapPath
+    logRow = logRow + 1
+    
+    Set mapWB = Workbooks.Open(mapPath)
+    Set mapSheet = mapWB.Sheets("MY_MAP_SHEET_NAME")      ' <--- Hardcode your MAP sheet
+    WriteLog logSheet, logRow, "Open MAP", _
+             "Opened MAP: " & mapWB.Name & ", sheet: " & mapSheet.Name
+    logRow = logRow + 1
+    
+    ' 6) In BUDGET, reference XRP & FORECAST
+    Set xrpSheet = budgetWB.Sheets("XRP")
+    Set forecastSheet = budgetWB.Sheets("FORECAST")
+    WriteLog logSheet, logRow, "Sheets", "Got XRP & FORECAST from BUDGET"
+    logRow = logRow + 1
+    
+    ' 7) Gather allowed accounts from MAP (desc="expenses")
+    Dim mapDescCol As Long, mapAccountCol As Long
+    mapDescCol = FindColumnByHeader(mapSheet, "desc")
+    mapAccountCol = FindColumnByHeader(mapSheet, "account")
+    
+    WriteLog logSheet, logRow, "MAP Columns", _
+             "desc col: " & mapDescCol & ", account col: " & mapAccountCol
+    logRow = logRow + 1
+    
+    Dim allowedAccounts As New Collection
+    Dim lastRow As Long, i As Long
+    lastRow = mapSheet.Cells(mapSheet.Rows.Count, mapAccountCol).End(xlUp).Row
+    
+    WriteLog logSheet, logRow, "MAP Rows", "Last row in MAP: " & lastRow
+    logRow = logRow + 1
+    
+    For i = 1 To lastRow
+        If LCase(Trim(mapSheet.Cells(i, mapDescCol).Value)) = "expenses" Then
+            On Error Resume Next
+            allowedAccounts.Add Trim(mapSheet.Cells(i, mapAccountCol).Value)
+            WriteLog logSheet, logRow, "Allowed Account", _
+                     "Found account: " & Trim(mapSheet.Cells(i, mapAccountCol).Value)
+            logRow = logRow + 1
+            On Error GoTo ErrorHandler
+        End If
+    Next i
+    
+    WriteLog logSheet, logRow, "Accounts Summary", _
+             "Found " & allowedAccounts.Count & " allowed accounts"
+    logRow = logRow + 1
+    
+    ' 8) Build dictionary from XRP: (Center => sum of AMOUNT) for those accounts
+    Dim xrpAccountCol As Long, xrpCenterCol As Long, xrpAmountCol As Long
+    xrpAccountCol = FindColumnByHeader(xrpSheet, "account")
+    xrpCenterCol = FindColumnByHeader(xrpSheet, "CENTER")
+    xrpAmountCol = FindColumnByHeader(xrpSheet, "AMOUNT")
+    
+    WriteLog logSheet, logRow, "XRP Columns", _
+             "account col: " & xrpAccountCol & ", CENTER col: " & xrpCenterCol & _
+             ", AMOUNT col: " & xrpAmountCol
+    logRow = logRow + 1
+    
+    lastRow = xrpSheet.Cells(xrpSheet.Rows.Count, xrpAccountCol).End(xlUp).Row
+    WriteLog logSheet, logRow, "XRP Rows", "Last row in XRP: " & lastRow
+    logRow = logRow + 1
+    
+    ' Clear dictionary
+    Set amountDict = CreateObject("Scripting.Dictionary")
+    
+    Dim matchCount As Long
+    matchCount = 0
+    
+    Dim accountVal As String, centerVal As String
+    Dim amtValue As Double
+    Dim acc As Variant
+    
+    For i = 2 To lastRow
+        accountVal = Trim(CStr(xrpSheet.Cells(i, xrpAccountCol).Value))
+        centerVal = Trim(CStr(xrpSheet.Cells(i, xrpCenterCol).Value))
+        
+        ' Check if account is allowed
+        Dim isAllowed As Boolean
+        isAllowed = False
+        
+        For Each acc In allowedAccounts
+            If acc = accountVal Then
+                isAllowed = True
+                matchCount = matchCount + 1
+                WriteLog logSheet, logRow, "Match Found", _
+                         "Row " & i & ": " & accountVal & " => allowed"
+                logRow = logRow + 1
+                Exit For
+            End If
+        Next acc
+        
+        If isAllowed Then
+            amtValue = xrpSheet.Cells(i, xrpAmountCol).Value
+            
+            If amountDict.Exists(centerVal) Then
+                amountDict(centerVal) = amountDict(centerVal) + amtValue
+            Else
+                amountDict.Add centerVal, amtValue
+            End If
+            
+            WriteLog logSheet, logRow, "Amount Added", _
+                     "Center " & centerVal & ": + " & amtValue & _
+                     " => Total: " & amountDict(centerVal)
+            logRow = logRow + 1
+        End If
+    Next i
+    
+    WriteLog logSheet, logRow, "Dictionary Summary", _
+             matchCount & " XRP rows matched; " & amountDict.Count & " centers total"
+    logRow = logRow + 1
+    
+    ' 9) Process FORECAST to find "October", then look left for center, down for "salary"
+    Dim lastCol As Long
+    lastRow = forecastSheet.UsedRange.Rows.Count
+    lastCol = forecastSheet.UsedRange.Columns.Count
+    
+    WriteLog logSheet, logRow, "FORECAST Dimensions", _
+             "Last row: " & lastRow & ", Last col: " & lastCol
+    logRow = logRow + 1
+    
+    Dim updatedCount As Long
+    updatedCount = 0
+    
+    Dim rowPtr As Long
+    rowPtr = 1
+    
+    ' We'll keep scanning for "October" until we run out of rows
+    Do While rowPtr <= lastRow
+        Dim foundOctober As Boolean
+        foundOctober = False
+        
+        Dim octRow As Long, octCol As Long
+        Dim cellText As String
+        
+        ' A) Search up to 100 rows from rowPtr for "October"
+        For octRow = rowPtr To Application.Min(rowPtr + 100, lastRow)
+            For octCol = 1 To lastCol
+                cellText = CStr(forecastSheet.Cells(octRow, octCol).Value)
+                
+                WriteLog logSheet, logRow, "Scanning for October", _
+                         "R" & octRow & "C" & octCol & ": " & cellText
+                logRow = logRow + 1
+                
+                If InStr(1, cellText, "October", vbTextCompare) > 0 Then
+                    foundOctober = True
+                    WriteLog logSheet, logRow, "October Found", _
+                             "Found 'October' at R" & octRow & "C" & octCol
+                    logRow = logRow + 1
+                    Exit For
+                End If
+            Next octCol
+            If foundOctober Then Exit For
+        Next octRow
+        
+        If Not foundOctober Then
+            WriteLog logSheet, logRow, "No More October", _
+                     "None found after row " & rowPtr
+            logRow = logRow + 1
+            Exit Do
+        End If
+        
+        ' B) Look to the LEFT for center (up to 50 columns)
+        Dim colStart As Long, colEnd As Long
+        colEnd = octCol - 1
+        colStart = Application.Max(1, octCol - 50)
+        
+        WriteLog logSheet, logRow, "Check Left Columns", _
+                 "From col " & colEnd & " down to " & colStart & " in row " & octRow
+        logRow = logRow + 1
+        
+        Dim colCheck As Long
+        For colCheck = colEnd To colStart Step -1
+            Dim possibleCenter As String
+            possibleCenter = Trim(CStr(forecastSheet.Cells(octRow, colCheck).Value))
+            
+            If amountDict.Exists(possibleCenter) Then
+                ' We found a recognized Center in the same row as "October"
+                WriteLog logSheet, logRow, "Center Found", _
+                         "R" & octRow & "C" & colCheck & ": '" & possibleCenter & "'"
+                logRow = logRow + 1
+                
+                ' C) Look DOWN in that same column for "salary" (up to 100 rows)
+                Dim rowSalary As Long
+                Dim foundSalary As Boolean
+                foundSalary = False
+                
+                For rowSalary = octRow + 1 To Application.Min(octRow + 100, lastRow)
+                    cellText = Trim(CStr(forecastSheet.Cells(rowSalary, colCheck).Value))
+                    
+                    If InStr(1, cellText, "salary", vbTextCompare) > 0 Then
+                        foundSalary = True
+                        ' Update the cell to the right of "salary"
+                        Dim newValue As Double
+                        newValue = amountDict(possibleCenter)
+                        
+                        forecastSheet.Cells(rowSalary, colCheck + 1).Value = newValue
+                        updatedCount = updatedCount + 1
+                        
+                        WriteLog logSheet, logRow, "Salary Updated", _
+                                 "Center '" & possibleCenter & "' => R" & rowSalary & _
+                                 "C" & (colCheck + 1) & " = " & newValue
+                        logRow = logRow + 1
+                        
+                        Exit For  ' Found and updated the first "salary"
+                    End If
+                Next rowSalary
+                
+                If Not foundSalary Then
+                    WriteLog logSheet, logRow, "Salary Missing", _
+                             "No 'salary' found under Center '" & possibleCenter & "' at R" & octRow
+                    logRow = logRow + 1
+                End If
+            End If
+        Next colCheck
+        
+        ' D) Move rowPtr BELOW this "October" so we find the next one
+        rowPtr = octRow + 1
+    Loop
+    
+    ' Log final
+    WriteLog logSheet, logRow, "Complete", _
+             "Updated " & updatedCount & " 'salary' cells in FORECAST"
+    logRow = logRow + 1
+    
+    ' Format log sheet
+    With logSheet.Range("A1:C1")
+        .Font.Bold = True
+        .Interior.Color = RGB(200, 200, 200)
+    End With
+    logSheet.Columns("A:C").AutoFit
+    
+    ' Close MAP
+    mapWB.Close False
+    Application.ScreenUpdating = True
+    
+    MsgBox "Processing complete! Updated " & updatedCount & " 'salary' cells." & vbNewLine & _
+           "Check TEST_LOG sheet(s) for details.", vbInformation
+    Exit Sub
+
+' ---------------------------------------------------------------------------------
+' ERROR HANDLER
+' ---------------------------------------------------------------------------------
+ErrorHandler:
+    If Not logSheet Is Nothing Then
+        WriteLog logSheet, logRow, "ERROR", _
+                 "Error " & Err.Number & ": " & Err.Description
+        logRow = logRow + 1
+    End If
+    
+    MsgBox "Error " & Err.Number & ": " & Err.Description & vbNewLine & _
+           "Check TEST_LOG sheet(s) for details.", vbCritical
+    
+    On Error Resume Next
+    If Not mapWB Is Nothing Then mapWB.Close False
+    Application.ScreenUpdating = True
+End Sub

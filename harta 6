@@ -236,7 +236,7 @@ Sub ProcessExpensesData()
              matchCount & " XRP rows matched; " & amountDict.Count & " centers total"
     logRow = logRow + 1
     
-    ' 9) Process FORECAST to find "October", then look left for center, down for "salary"
+    ' 9) Process FORECAST to find "October", then look left for center, down for "Expenses"
     Dim lastCol As Long
     lastRow = forecastSheet.UsedRange.Rows.Count
     lastCol = forecastSheet.UsedRange.Columns.Count
@@ -261,21 +261,24 @@ Sub ProcessExpensesData()
         
         ' A) Search up to 100 rows from rowPtr for "October"
         For octRow = rowPtr To Application.Min(rowPtr + 100, lastRow)
-            For octCol = 1 To lastCol
-                cellText = CStr(forecastSheet.Cells(octRow, octCol).Value)
+            Dim jCol As Long
+            For jCol = 1 To lastCol
+                cellText = CStr(forecastSheet.Cells(octRow, jCol).Value)
                 
                 WriteLog logSheet, logRow, "Scanning for October", _
-                         "R" & octRow & "C" & octCol & ": " & cellText
+                         "R" & octRow & "C" & jCol & ": " & cellText
                 logRow = logRow + 1
                 
                 If InStr(1, cellText, "October", vbTextCompare) > 0 Then
                     foundOctober = True
+                    octCol = jCol
                     WriteLog logSheet, logRow, "October Found", _
                              "Found 'October' at R" & octRow & "C" & octCol
                     logRow = logRow + 1
                     Exit For
                 End If
-            Next octCol
+            Next jCol
+            
             If foundOctober Then Exit For
         Next octRow
         
@@ -306,35 +309,35 @@ Sub ProcessExpensesData()
                          "R" & octRow & "C" & colCheck & ": '" & possibleCenter & "'"
                 logRow = logRow + 1
                 
-                ' C) Look DOWN in that same column for "salary" (up to 100 rows)
-                Dim rowSalary As Long
-                Dim foundSalary As Boolean
-                foundSalary = False
+                ' C) Look DOWN in that same column for "Expenses" (up to 100 rows)
+                Dim rowExp As Long
+                Dim foundExpenses As Boolean
+                foundExpenses = False
                 
-                For rowSalary = octRow + 1 To Application.Min(octRow + 100, lastRow)
-                    cellText = Trim(CStr(forecastSheet.Cells(rowSalary, colCheck).Value))
+                For rowExp = octRow + 1 To Application.Min(octRow + 100, lastRow)
+                    cellText = Trim(CStr(forecastSheet.Cells(rowExp, colCheck).Value))
                     
-                    If InStr(1, cellText, "salary", vbTextCompare) > 0 Then
-                        foundSalary = True
-                        ' Update the cell to the right of "salary"
+                    If InStr(1, cellText, "expenses", vbTextCompare) > 0 Then
+                        foundExpenses = True
+                        ' Update the cell to the right of "Expenses"
                         Dim newValue As Double
                         newValue = amountDict(possibleCenter)
                         
-                        forecastSheet.Cells(rowSalary, colCheck + 1).Value = newValue
+                        forecastSheet.Cells(rowExp, colCheck + 1).Value = newValue
                         updatedCount = updatedCount + 1
                         
-                        WriteLog logSheet, logRow, "Salary Updated", _
-                                 "Center '" & possibleCenter & "' => R" & rowSalary & _
+                        WriteLog logSheet, logRow, "Expenses Updated", _
+                                 "Center '" & possibleCenter & "' => R" & rowExp & _
                                  "C" & (colCheck + 1) & " = " & newValue
                         logRow = logRow + 1
                         
-                        Exit For  ' Found and updated the first "salary"
+                        Exit For  ' Found and updated the first "expenses"
                     End If
-                Next rowSalary
+                Next rowExp
                 
-                If Not foundSalary Then
-                    WriteLog logSheet, logRow, "Salary Missing", _
-                             "No 'salary' found under Center '" & possibleCenter & "' at R" & octRow
+                If Not foundExpenses Then
+                    WriteLog logSheet, logRow, "Expenses Missing", _
+                             "No 'Expenses' found under Center '" & possibleCenter & "' at R" & octRow
                     logRow = logRow + 1
                 End If
             End If
@@ -346,7 +349,7 @@ Sub ProcessExpensesData()
     
     ' Log final
     WriteLog logSheet, logRow, "Complete", _
-             "Updated " & updatedCount & " 'salary' cells in FORECAST"
+             "Updated " & updatedCount & " 'Expenses' cells in FORECAST"
     logRow = logRow + 1
     
     ' Format log sheet
@@ -360,7 +363,7 @@ Sub ProcessExpensesData()
     mapWB.Close False
     Application.ScreenUpdating = True
     
-    MsgBox "Processing complete! Updated " & updatedCount & " 'salary' cells." & vbNewLine & _
+    MsgBox "Processing complete! Updated " & updatedCount & " 'Expenses' cells." & vbNewLine & _
            "Check TEST_LOG sheet(s) for details.", vbInformation
     Exit Sub
 

@@ -1,9 +1,15 @@
 import openpyxl
 from openpyxl.utils import get_column_letter
+import warnings
+
+# Suppress openpyxl user warnings (for example about data validation).
+warnings.simplefilter("ignore", UserWarning)
 
 def main():
     """
     Main driver function.
+    Scans 'MAP.xlsx' for allowed accounts and 'BANI.xlsx' to aggregate
+    values, then writes to the 'Forcast' sheet under the user-chosen column.
     """
 
     # ----------------------------------------------------------------
@@ -28,37 +34,31 @@ def main():
     xrp_col_quantitate_header = "Quantitate"
 
     # The forecast column title in the Forcast sheet where we need to put aggregated data
-    # e.g. "Oct Actual" or something else. Make it easily configurable.
     forecast_column_header = "Oct Actual"
 
-    # Optionally, if you have certain "Descriere 2" that map differently in the forecast:
+    # If your "Descriere 2" from MAP must map differently in Forcast, define here:
+    # e.g. "Mercenari" -> "Mercenari & Arnold"
     descriere_map_to_forecast = {
-        # "Mercenari" : "Mercenari & Arnold",
+        # "Mercenari": "Mercenari & Arnold",
         # "Antrnament": "Antrenament",
-        # etc.
-        #
-        # If your descriptors match exactly in the forecast, you can leave it empty or minimal.
+        # etc. If they match exactly, you can leave this empty.
     }
 
     # ----------------------------------------------------------------
     # 2) READ the MAP workbook to build dictionary {account -> descriere}
-    #    or {descriere -> [accounts]}, depending on your needs.
-    #    For simplicity, let's store: allowed_accounts[acc] = descriere
     # ----------------------------------------------------------------
     map_wb = openpyxl.load_workbook(path_map_xlsx, data_only=True)
     map_ws = map_wb[map_sheet_name]
 
-    # First, find which columns contain "accounts" and "Descriere 2"
+    # Identify columns "accounts" and "Descriere 2" from the first row (header).
+    header_row = next(map_ws.iter_rows(min_row=1, max_row=1, values_only=True))
     map_col_account_index = None
     map_col_descriere_index = None
 
-    # Find the header row (assume the first row has headers)
-    # If your file has multiple possible header rows, you can adapt.
-    header_row = next(map_ws.iter_rows(min_row=1, max_row=1, values_only=True))
     for idx, col_value in enumerate(header_row, start=1):
-        if col_value and col_value.strip().lower() == map_col_account_header.lower():
+        if col_value and str(col_value).strip().lower() == map_col_account_header.lower():
             map_col_account_index = idx
-        elif col_value and col_value.strip().lower() == map_col_descriere_header.lower():
+        elif col_value and str(col_value).strip().lower() == map_col_descriere_header.lower():
             map_col_descriere_index = idx
 
     if not map_col_account_index or not map_col_descriere_index:
@@ -67,13 +67,13 @@ def main():
             f"'{map_col_descriere_header}' in the MAP sheet's header."
         )
 
-    # Build dictionary of allowed accounts -> descriere
+    # Build dictionary of allowed accounts => descriere
     allowed_accounts = {}
     for row in map_ws.iter_rows(min_row=2, values_only=True):
-        acc = row[map_col_account_index - 1]       # minus 1 because enumerate started at 1
+        acc = row[map_col_account_index - 1]
         desc = row[map_col_descriere_index - 1]
         if acc and desc:
-            allowed_accounts[acc] = str(desc).strip()
+            allowed_accounts[str(acc).strip()] = str(desc).strip()
 
     map_wb.close()
 
@@ -84,18 +84,18 @@ def main():
     bani_wb = openpyxl.load_workbook(path_bani_xlsx)
     xrp_ws = bani_wb[xrp_sheet_name]
 
-    # Identify column indexes for nat cont, center, quantitate
+    # Identify column indexes for nat cont, center, quantitate from the first row
     xrp_header_row = next(xrp_ws.iter_rows(min_row=1, max_row=1, values_only=True))
     col_nat_cont_idx = None
     col_center_idx   = None
     col_quantitate_idx = None
 
     for idx, val in enumerate(xrp_header_row, start=1):
-        if val and val.strip().lower() == xrp_col_nat_cont_header.lower():
+        if val and str(val).strip().lower() == xrp_col_nat_cont_header.lower():
             col_nat_cont_idx = idx
-        elif val and val.strip().lower() == xrp_col_center_header.lower():
+        elif val and str(val).strip().lower() == xrp_col_center_header.lower():
             col_center_idx = idx
-        elif val and val.strip().lower() == xrp_col_quantitate_header.lower():
+        elif val and str(val).strip().lower() == xrp_col_quantitate_header.lower():
             col_quantitate_idx = idx
 
     if not col_nat_cont_idx or not col_center_idx or not col_quantitate_idx:
@@ -104,8 +104,8 @@ def main():
             f"or '{xrp_col_quantitate_header}' in the XRP sheet's header."
         )
 
-    # aggregator[center][descriere] = total_sum
-    aggregator = {}
+    # Build aggregator
+    aggregator = {}  # aggregator[center][descriere] = float sum
 
     # Iterate over rows in XRP, ignoring the first (header)
     for row in xrp_ws.iter_rows(min_row=2, values_only=True):
@@ -113,10 +113,14 @@ def main():
         center    = row[col_center_idx - 1]
         quantitate= row[col_quantitate_idx - 1]
 
-        # Filter only if nat_cont is in allowed_accounts
-        if nat_cont in allowed_accounts and center is not None and quantitate is not None:
+        if not (nat_cont and center and quantitate):
+            continue
+
+        nat_cont = str(nat_cont).strip()
+        center = str(center).strip()
+
+        if nat_cont in allowed_accounts:
             descriere = allowed_accounts[nat_cont]
-            # aggregator by center => by descriere
             if center not in aggregator:
                 aggregator[center] = {}
             if descriere not in aggregator[center]:
@@ -124,82 +128,88 @@ def main():
             aggregator[center][descriere] += quantitate
 
     # ----------------------------------------------------------------
-    # 4) WRITE to the Forcast sheet.
-    #    We need to find each center, find forecast_column_header column,
-    #    then for each row under that center (e.g., "Plata", "Mercenari & Arnold", etc.),
-    #    we put the aggregated value.
+    # 4) WRITE to the Forcast sheet
+    #    We'll do a big net search:
+    #       - find forecast_column by scanning all cells for 'Oct Actual'
+    #       - find center row by scanning all cells in entire sheet
+    #       - find descriere row by scanning all cells below that center row
     # ----------------------------------------------------------------
+
     forecast_ws = bani_wb[forecast_sheet_name]
 
-    # To find the column with the text "Oct Actual" (or user chosen)
-    # we will scan each row (often row 1 or so), or search *all rows*
-    # because the layout might be scattered. We'll store the column index
-    # if we find a cell with exactly forecast_column_header.
-
-    # For complicated layouts, you might want a more robust approach,
-    # but here's a straightforward search:
+    # 4.1) Find the column index containing forecast_column_header anywhere in the sheet
+    # We just take the first match we find
     forecast_column_idx = None
-    for row in forecast_ws.iter_rows(values_only=False):
+    found_forecast_header_cell = None
+    for row in forecast_ws.iter_rows():
         for cell in row:
-            if cell.value and str(cell.value).strip().lower() == forecast_column_header.lower():
-                forecast_column_idx = cell.column  # 1-based integer index
+            val = cell.value
+            if val and str(val).strip().lower() == forecast_column_header.lower():
+                forecast_column_idx = cell.column  # integer index
+                found_forecast_header_cell = cell
                 break
-        if forecast_column_idx:
+        if forecast_column_idx is not None:
             break
 
     if not forecast_column_idx:
         raise ValueError(
-            f"Could not find a cell with value '{forecast_column_header}' in Forcast sheet."
+            f"Could not find a cell with value '{forecast_column_header}' in the Forcast sheet."
         )
 
-    # Helper function: find a cell containing `value` in entire sheet. Return row index or None.
-    def find_row_with_value(sheet, value, start_row=1):
+    # 4.2) Helper: find row containing certain value scanning the entire sheet
+    # We pick the first occurrence
+    def find_row_for_value(sheet, search_value, start_row=1):
         """
-        Search from start_row downward for a cell whose value matches `value` exactly.
-        Returns the 1-based row index if found, else None.
+        Scan from start_row to the bottom, all columns, for a cell
+        whose string equals `search_value` (case-insensitive).
+        Return that row index if found, else None.
         """
+        search_value = str(search_value).strip().lower()
         for r in range(start_row, sheet.max_row + 1):
-            cell_val = sheet.cell(row=r, column=1).value  # searching in first column, if that's how "Center" is stored
-            # If your layout is more complex, you can check multiple columns or the entire row
-            # but let's assume the 'Center' label is in column A.
-            if cell_val is not None and str(cell_val).strip() == str(value):
-                return r
+            row_cells = sheet[r]
+            for cell in row_cells:
+                cell_val = cell.value
+                if cell_val and str(cell_val).strip().lower() == search_value:
+                    return r
         return None
 
-    # Another helper: find the row that has the text for "Descriere" in the first column (or wherever).
-    # We'll do a simple version that checks column A as well, just below the center row.
-    # But you might want a more flexible approach if the row can appear anywhere below center.
-    def find_row_for_descriere_after_center(sheet, start_row, descriere_text, max_search=50):
+    # 4.3) Another helper: after finding the row for center, we then search for the descriere
+    # starting from (center_row + 1), scanning all columns down. 
+    # If your layout always has the descriere *some* lines below the center, this is typical.
+    def find_row_for_descriere_after(sheet, start_row, descriere_value, max_search=100):
         """
-        Starting from the row after `start_row`, look up to `max_search` rows below,
-        for a cell in column A matching `descriere_text`. Return row index or None.
+        From row (start_row+1) to (start_row+max_search),
+        scan all columns for a cell matching `descriere_value`.
+        Return the row index if found, else None.
         """
-        for r in range(start_row+1, min(start_row+1+max_search, sheet.max_row+1)):
-            cell_val = sheet.cell(row=r, column=1).value
-            if cell_val is not None and str(cell_val).strip().lower() == descriere_text.lower():
-                return r
+        descriere_value = str(descriere_value).strip().lower()
+        end_row = min(sheet.max_row, start_row + max_search)
+        for r in range(start_row + 1, end_row + 1):
+            row_cells = sheet[r]
+            for cell in row_cells:
+                cell_val = cell.value
+                if cell_val and str(cell_val).strip().lower() == descriere_value:
+                    return r
         return None
 
-    # Now we iterate over each center in aggregator, search for it in forecast sheet, then update each descriere
+    # 4.4) Update the forecast sheet
     for center, descriere_dict in aggregator.items():
-        # 1) find center row
-        center_row = find_row_with_value(forecast_ws, center)
+        # 1) find row of center
+        center_row = find_row_for_value(forecast_ws, center, start_row=1)
         if center_row is None:
-            # If no row was found for that center, skip
+            # skip if center not found
             continue
 
-        # 2) for each descriere in this center
+        # 2) for each descriere => total, put in the row below center
         for descriere, total_val in descriere_dict.items():
-            # If there's a special mapping needed (e.g. "Mercenari" => "Mercenari & Arnold"), do it:
+            # if there's a special override
             final_descriere = descriere_map_to_forecast.get(descriere, descriere)
-
-            # 3) find the row for that descriere (some lines below center_row)
-            descriere_row = find_row_for_descriere_after_center(forecast_ws, center_row, final_descriere)
+            # find row
+            descriere_row = find_row_for_descriere_after(forecast_ws, center_row, final_descriere)
             if descriere_row is None:
-                # skip if not found in layout
                 continue
 
-            # 4) Write the aggregated total into the forecast_column_idx for that row
+            # 3) place value in forecast_column_idx
             forecast_ws.cell(row=descriere_row, column=forecast_column_idx, value=total_val)
 
     # ----------------------------------------------------------------
@@ -208,7 +218,7 @@ def main():
     bani_wb.save(path_bani_xlsx)
     bani_wb.close()
 
-    print("Done! The data has been aggregated and updated in the Forcast sheet.")
+    print("Done! Data was aggregated and the Forcast sheet updated.")
 
 
 if __name__ == "__main__":

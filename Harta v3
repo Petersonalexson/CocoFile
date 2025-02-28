@@ -1,0 +1,355 @@
+import openpyxl
+import warnings
+import os
+import logging
+from dataclasses import dataclass
+from typing import Dict, Optional, List, Tuple
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("data_processor.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("FinancialDataProcessor")
+
+# Suppress openpyxl user warnings
+warnings.simplefilter("ignore", UserWarning)
+
+
+@dataclass
+class Config:
+    """Configuration class for data processing parameters."""
+    map_file_path: str
+    bani_file_path: str
+    map_sheet_name: str
+    xrp_sheet_name: str
+    forecast_sheet_name: str
+    map_col_account_header: str
+    map_col_descriere_header: str
+    xrp_col_nat_cont_header: str
+    xrp_col_center_header: str
+    xrp_col_quantitate_header: str
+    forecast_center_code_header: str
+    forecast_descriere_header: str
+    forecast_value_header: str
+    descriere_map_to_forecast: Dict[str, str]
+    backup_file: bool = True
+
+
+class ExcelHelper:
+    """Helper class for Excel operations."""
+
+    @staticmethod
+    def find_column_indices(worksheet, headers: List[str], 
+                          required: Optional[List[bool]] = None) -> Dict[str, int]:
+        """
+        Find column indices for given headers in the first row.
+        
+        Args:
+            worksheet: The Excel worksheet
+            headers: List of header names to find
+            required: List of booleans indicating if each header is required
+            
+        Returns:
+            Dictionary mapping header names to column indices (1-based)
+        """
+        if required is None:
+            required = [True] * len(headers)
+        
+        # Convert headers to lowercase for case-insensitive comparison
+        headers_lower = [h.lower() for h in headers]
+        result = {header: None for header in headers}
+        
+        # Read the header row
+        header_row = next(worksheet.iter_rows(min_row=1, max_row=1, values_only=True))
+        
+        # Find each header in the row
+        for idx, cell_value in enumerate(header_row, start=1):
+            if cell_value:
+                cell_value_lower = str(cell_value).strip().lower()
+                for i, header_lower in enumerate(headers_lower):
+                    if cell_value_lower == header_lower:
+                        result[headers[i]] = idx
+        
+        # Check if all required headers were found
+        missing = [h for i, h in enumerate(headers) if required[i] and result[h] is None]
+        if missing:
+            raise ValueError(f"Could not find required column headers: {', '.join(missing)}")
+            
+        return result
+
+
+class MapProcessor:
+    """Processes the MAP file to build allowed accounts dictionary."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        
+    def build_allowed_accounts(self) -> Dict[str, str]:
+        """
+        Build a dictionary of allowed accounts from the MAP file.
+        
+        Returns:
+            Dictionary mapping account numbers to descriptions
+        """
+        logger.info(f"Loading MAP file: {self.config.map_file_path}")
+        try:
+            map_wb = openpyxl.load_workbook(self.config.map_file_path, data_only=True, read_only=True)
+            map_ws = map_wb[self.config.map_sheet_name]
+            
+            # Find column indices
+            headers = [self.config.map_col_account_header, self.config.map_col_descriere_header]
+            indices = ExcelHelper.find_column_indices(map_ws, headers)
+            
+            # Read rows to build the dictionary
+            allowed_accounts = {}
+            for row in map_ws.iter_rows(min_row=2, values_only=True):
+                account_val = row[indices[self.config.map_col_account_header] - 1]
+                descriere_val = row[indices[self.config.map_col_descriere_header] - 1]
+                
+                if account_val and descriere_val:
+                    account_key = str(account_val).strip()
+                    descriere = str(descriere_val).strip()
+                    allowed_accounts[account_key] = descriere
+            
+            map_wb.close()
+            logger.info(f"Processed {len(allowed_accounts)} allowed accounts from MAP file")
+            return allowed_accounts
+            
+        except Exception as e:
+            logger.error(f"Error processing MAP file: {e}")
+            raise
+
+
+class BaniProcessor:
+    """Processes the BANI file, aggregates data, and writes results."""
+    
+    def __init__(self, config: Config, allowed_accounts: Dict[str, str]):
+        self.config = config
+        self.allowed_accounts = allowed_accounts
+        
+    def aggregate_data(self) -> Dict[str, Dict[str, float]]:
+        """
+        Read data from the XRP sheet and aggregate by center and description.
+        
+        Returns:
+            Nested dictionary mapping center codes to descriptions and sums
+        """
+        logger.info(f"Loading BANI file: {self.config.bani_file_path}")
+        try:
+            bani_wb = openpyxl.load_workbook(self.config.bani_file_path)
+            xrp_ws = bani_wb[self.config.xrp_sheet_name]
+            
+            # Find column indices
+            headers = [
+                self.config.xrp_col_nat_cont_header,
+                self.config.xrp_col_center_header,
+                self.config.xrp_col_quantitate_header
+            ]
+            indices = ExcelHelper.find_column_indices(xrp_ws, headers)
+            
+            nat_cont_idx = indices[self.config.xrp_col_nat_cont_header]
+            center_idx = indices[self.config.xrp_col_center_header]
+            quant_idx = indices[self.config.xrp_col_quantitate_header]
+            
+            # Build aggregator
+            aggregator = {}  # aggregator[center][descriere] = numeric_sum
+            row_count = 0
+            matched_count = 0
+            
+            for row in xrp_ws.iter_rows(min_row=2, values_only=True):
+                row_count += 1
+                nat_cont = row[nat_cont_idx - 1]
+                center_val = row[center_idx - 1]
+                quant_val = row[quant_idx - 1]
+                
+                if not (nat_cont and center_val and quant_val):
+                    continue
+                    
+                nat_cont = str(nat_cont).strip()
+                center_val = str(center_val).strip()
+                
+                # Only include if nat_cont in allowed accounts
+                if nat_cont in self.allowed_accounts:
+                    matched_count += 1
+                    descriere_val = self.allowed_accounts[nat_cont]
+                    
+                    # Initialize nested dictionaries if needed
+                    if center_val not in aggregator:
+                        aggregator[center_val] = {}
+                    if descriere_val not in aggregator[center_val]:
+                        aggregator[center_val][descriere_val] = 0
+                        
+                    # Add to the running sum
+                    aggregator[center_val][descriere_val] += quant_val
+            
+            logger.info(f"Processed {row_count} rows, matched {matched_count} to allowed accounts")
+            logger.info(f"Found {len(aggregator)} centers with aggregated data")
+            
+            # Close workbook now - it will be reopened for writing later
+            bani_wb.close()
+            return aggregator
+            
+        except Exception as e:
+            logger.error(f"Error aggregating data: {e}")
+            raise
+            
+    def write_forecast_data(self, aggregator: Dict[str, Dict[str, float]]) -> int:
+        """
+        Write aggregated data to the Forecast sheet.
+        
+        Args:
+            aggregator: Nested dictionary with aggregated data
+            
+        Returns:
+            Number of cells updated
+        """
+        logger.info(f"Writing aggregated data to {self.config.forecast_sheet_name} sheet")
+        
+        # Create backup if enabled
+        if self.config.backup_file:
+            backup_path = f"{self.config.bani_file_path}.bak"
+            if not os.path.exists(backup_path):
+                import shutil
+                shutil.copy2(self.config.bani_file_path, backup_path)
+                logger.info(f"Created backup at {backup_path}")
+        
+        try:
+            bani_wb = openpyxl.load_workbook(self.config.bani_file_path)
+            forecast_ws = bani_wb[self.config.forecast_sheet_name]
+            
+            # Find column indices in forecast sheet
+            headers = [
+                self.config.forecast_center_code_header,
+                self.config.forecast_descriere_header,
+                self.config.forecast_value_header
+            ]
+            indices = ExcelHelper.find_column_indices(forecast_ws, headers)
+            
+            center_col_idx = indices[self.config.forecast_center_code_header]
+            descriere_col_idx = indices[self.config.forecast_descriere_header]
+            value_col_idx = indices[self.config.forecast_value_header]
+            
+            # Initialize tracking variables
+            current_center = None
+            cells_updated = 0
+            
+            # Process each row
+            for row_idx in range(2, forecast_ws.max_row + 1):
+                center_cell_val = forecast_ws.cell(row=row_idx, column=center_col_idx).value
+                descriere_cell_val = forecast_ws.cell(row=row_idx, column=descriere_col_idx).value
+                
+                # Update current center if found
+                if center_cell_val and str(center_cell_val).strip():
+                    current_center = str(center_cell_val).strip()
+                
+                # Skip if no center or description
+                if not current_center or not descriere_cell_val:
+                    continue
+                
+                descriere_text = str(descriere_cell_val).strip()
+                
+                # Apply mapping if exists
+                mapped_descriere = self.config.descriere_map_to_forecast.get(
+                    descriere_text, descriere_text)
+                
+                # Check if we have data for this center and description
+                if (current_center in aggregator and 
+                    mapped_descriere in aggregator[current_center]):
+                    sum_val = aggregator[current_center][mapped_descriere]
+                    
+                    # Write to the cell if value exists
+                    if sum_val != 0:
+                        forecast_ws.cell(
+                            row=row_idx, column=value_col_idx, value=sum_val)
+                        cells_updated += 1
+            
+            # Save changes
+            bani_wb.save(self.config.bani_file_path)
+            bani_wb.close()
+            logger.info(f"Updated {cells_updated} cells in the Forecast sheet")
+            return cells_updated
+            
+        except Exception as e:
+            logger.error(f"Error writing forecast data: {e}")
+            raise
+
+
+def main():
+    """Main function to process financial data."""
+    try:
+        # ----------------------------------------------------------------
+        # USER CONFIGURATIONS - Edit these values directly
+        # ----------------------------------------------------------------
+        config = Config(
+            # File paths
+            map_file_path=r"C:\Path\to\MAP.xlsx",   # MAP file
+            bani_file_path=r"C:\Path\to\BANI.xlsx", # BANI file
+            
+            # Sheet names
+            map_sheet_name="MAIN MAP",
+            xrp_sheet_name="XRP",
+            forecast_sheet_name="Forcast",
+            
+            # Headers in the MAP sheet
+            map_col_account_header="accounts",
+            map_col_descriere_header="Descriere 2",
+            
+            # Headers in the BANI sheet 'XRP'
+            xrp_col_nat_cont_header="nat cont",
+            xrp_col_center_header="Center",
+            xrp_col_quantitate_header="Quantitate",
+            
+            # Headers in the 'Forcast' sheet (row 1)
+            forecast_center_code_header="Center Code",
+            forecast_descriere_header="Descriere",
+            forecast_value_header="Oct Actual",
+            
+            # Map from "Descriere 2" in MAP to label used in the Forcast sheet
+            # Leave empty {} if they match exactly
+            descriere_map_to_forecast={
+                "Mercenari": "Mercenari & Arnold",
+                # Add more mappings as needed
+            },
+            
+            # Set to False to disable automatic backup before writing
+            backup_file=True
+        )
+        
+        # Validate file paths
+        if not os.path.exists(config.map_file_path):
+            raise FileNotFoundError(f"MAP file not found: {config.map_file_path}")
+        if not os.path.exists(config.bani_file_path):
+            raise FileNotFoundError(f"BANI file not found: {config.bani_file_path}")
+        
+        # 1. Build allowed accounts dictionary from MAP
+        map_processor = MapProcessor(config)
+        allowed_accounts = map_processor.build_allowed_accounts()
+        
+        # 2. Process BANI data
+        bani_processor = BaniProcessor(config, allowed_accounts)
+        aggregator = bani_processor.aggregate_data()
+        
+        # 3. Write results to Forecast sheet
+        cells_updated = bani_processor.write_forecast_data(aggregator)
+        
+        logger.info(f"Process completed successfully. Updated {cells_updated} cells.")
+        print(f"✅ Done! Aggregated data placed in the '{config.forecast_sheet_name}' sheet.")
+        print(f"   Updated {cells_updated} cells.")
+        
+    except Exception as e:
+        logger.error(f"Error in main process: {e}", exc_info=True)
+        print(f"❌ Error: {e}")
+        print("   See data_processor.log for details.")
+        return 1
+    
+    return 0
+
+
+if __name__ == "__main__":
+    exit_code = main()
+    exit(exit_code)

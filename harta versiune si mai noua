@@ -1,0 +1,204 @@
+import logging
+import math
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.comments import Comment
+
+# Suppress common user warnings about data validation
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+# ---------------------------------------------------------------------------
+# 1. Setup Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# ---------------------------------------------------------------------------
+# 2. File Paths (Adjust to your actual paths)
+# ---------------------------------------------------------------------------
+MAP_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\MAP.xlsx"
+BANI_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\BANI.xlsx"
+MAPPING_SHEET = "Mapping Main"
+XRP_SHEET = "XRP"
+FORCAST_SHEET = "Forcast"
+
+# ---------------------------------------------------------------------------
+# 3. Load Mapping Data (MAP.xlsx - "Mapping Main")
+# ---------------------------------------------------------------------------
+logging.info("Loading mapping data...")
+map_df = pd.read_excel(MAP_FILE_PATH, sheet_name=MAPPING_SHEET)
+
+# Keep only rows where Account is not NaN, convert 'Account' to int
+map_df = map_df.dropna(subset=["Account"])
+map_df["Account"] = map_df["Account"].astype(int)
+
+# ---------------------------------------------------------------------------
+# 4. Load and Clean BANI Data (BANI.xlsx - "XRP")
+# ---------------------------------------------------------------------------
+logging.info("Loading BANI (XRP) data...")
+bani_df = pd.read_excel(BANI_FILE_PATH, sheet_name=XRP_SHEET)
+
+# Keep only relevant columns (Nat Cont, Centru, Quantitate) and drop rows with NaN in any of them
+bani_df = bani_df[["Nat Cont", "Centru", "Quantitate"]].dropna()
+
+# Convert Nat Cont to int
+bani_df["Nat Cont"] = bani_df["Nat Cont"].astype(int)
+# Convert Centru to str (handles "123_123" or other text-based centers)
+bani_df["Centru"] = bani_df["Centru"].astype(str).str.strip()
+# Convert Quantitate to float (allow decimals)
+bani_df["Quantitate"] = bani_df["Quantitate"].astype(float)
+
+# ---------------------------------------------------------------------------
+# 5. Filter by Allowed Accounts from the Mapping
+# ---------------------------------------------------------------------------
+# Build a dict {account_int: desc2_string} from the mapping
+allowed_accounts = dict(zip(map_df["Account"], map_df["Description 2"].dropna()))
+# Keep only those rows in bani_df whose Nat Cont is in allowed_accounts
+filtered_bani_df = bani_df[bani_df["Nat Cont"].isin(allowed_accounts.keys())]
+
+# ---------------------------------------------------------------------------
+# 6. Merge in "Description 2" from Mapping, then Aggregate
+# ---------------------------------------------------------------------------
+logging.info("Merging with map and aggregating by (Centru, Description2)...")
+bani_with_desc = filtered_bani_df.merge(
+    map_df[["Account", "Description 2"]],
+    left_on="Nat Cont",
+    right_on="Account",
+    how="left"
+)
+
+# Manually rename certain descriptions to match how they appear in Forcast
+rename_map = {
+    "Arnold": "Arnold & Mercenari",
+    "Activitati/o": "Activitati/O"
+}
+bani_with_desc["Description 2"] = bani_with_desc["Description 2"].replace(rename_map)
+
+# Group by (Centru, Description 2) and sum the Quantitate
+aggregated_df = bani_with_desc.groupby(["Centru", "Description 2"], dropna=True, as_index=False)["Quantitate"].sum()
+logging.info("Aggregated data:\n%s", aggregated_df)
+
+# We'll build a set of "allowed Centru" from the aggregator
+allowed_centrus = set(aggregated_df["Centru"].unique())
+
+# ---------------------------------------------------------------------------
+# 7. Open BANI.xlsx with openpyxl and access "Forcast" sheet
+# ---------------------------------------------------------------------------
+logging.info("Opening workbook to update Forcast sheet...")
+wb = load_workbook(BANI_FILE_PATH)
+ws_forcast = wb[FORCAST_SHEET]
+
+# ---------------------------------------------------------------------------
+# 8. Find the Column Containing "Oct Actual"
+# ---------------------------------------------------------------------------
+logging.info("Locating 'Oct Actual' column...")
+max_row = ws_forcast.max_row
+max_col = ws_forcast.max_column
+oct_actual_col = None
+
+for r in range(1, max_row + 1):
+    for c in range(1, max_col + 1):
+        val = ws_forcast.cell(row=r, column=c).value
+        if val and str(val).strip().lower() == "oct actual":
+            oct_actual_col = c
+            logging.info(f"'Oct Actual' found at row={r}, col={c}")
+            break
+    if oct_actual_col is not None:
+        break
+
+if oct_actual_col is None:
+    logging.warning("Could not find 'Oct Actual' column. Exiting without updates.")
+    wb.save(BANI_FILE_PATH)
+    exit()
+
+# ---------------------------------------------------------------------------
+# 9. Identify each row that is a "Centru row" in Forcast
+#    We'll treat the *first non-empty cell* in the row as the potential Centru
+#    and check if that string is in our aggregator's allowed_centrus.
+# ---------------------------------------------------------------------------
+logging.info("Identifying Centru rows (by first non-empty cell match)...")
+
+centru_rows = []  # will hold tuples (row_index, centru_string)
+
+for r in range(1, max_row + 1):
+    row_vals = [ws_forcast.cell(row=r, column=cc).value for cc in range(1, max_col + 1)]
+    # find the first non-empty cell in that row
+    first_nonblank = None
+    for val in row_vals:
+        if val is not None and str(val).strip() != "":
+            first_nonblank = str(val).strip()
+            break
+    
+    if first_nonblank is not None:
+        # check if it's one of our aggregator centers
+        if first_nonblank in allowed_centrus:
+            # this row is a centru row
+            centru_rows.append((r, first_nonblank))
+
+logging.info(f"Found {len(centru_rows)} Centru rows: {centru_rows}")
+
+# ---------------------------------------------------------------------------
+# 10. Update "Oct Actual" values in each Centru block
+#    We define each block from this Centru row + 1 to the next Centru row - 1
+#    For each sub-block row, we match "Description 2" in any cell,
+#    then set the "Oct Actual" cell to the aggregator sum. Overwrite existing cell if any.
+# ---------------------------------------------------------------------------
+for i, (centru_row_index, centru_value) in enumerate(centru_rows):
+    logging.info(f"Processing Centru='{centru_value}' at row={centru_row_index} ...")
+    
+    # block ends at next centru row - 1 or end of sheet
+    if i + 1 < len(centru_rows):
+        next_centru_row = centru_rows[i + 1][0]
+        block_end_row = next_centru_row - 1
+    else:
+        block_end_row = max_row
+    
+    block_range = range(centru_row_index + 1, block_end_row + 1)
+    
+    # slice aggregator for this centre
+    sub_df = aggregated_df[aggregated_df["Centru"] == centru_value]
+    if sub_df.empty:
+        logging.info(f"No aggregator data for {centru_value}; skipping.")
+        continue
+    
+    # for each description in sub_df, find a row in the block that matches
+    for _, row_data in sub_df.iterrows():
+        desc_2 = str(row_data["Description 2"]).strip()
+        quantity_value = row_data["Quantitate"]  # float is allowed
+
+        # find the row in block_range that has desc_2 in any cell
+        found_row = None
+        for rr in block_range:
+            for cc in range(1, max_col + 1):
+                cell_val = ws_forcast.cell(row=rr, column=cc).value
+                if cell_val and str(cell_val).strip().lower() == desc_2.lower():
+                    found_row = rr
+                    break
+            if found_row:
+                break
+        
+        if found_row:
+            # Overwrite the "Oct Actual" cell
+            target_cell = ws_forcast.cell(row=found_row, column=oct_actual_col)
+            target_cell.value = quantity_value
+            
+            # Remove old comment, if any
+            if target_cell.comment:
+                target_cell.comment = None
+            
+            # Add new comment
+            target_cell.comment = Comment("Updated by script", "Script")
+            
+            logging.info(f"Updated Centru='{centru_value}' Desc='{desc_2}' row={found_row} with {quantity_value}")
+        else:
+            logging.info(f"Desc='{desc_2}' not found in block for Centru='{centru_value}'")
+
+# ---------------------------------------------------------------------------
+# 11. Save the Updated Workbook
+# ---------------------------------------------------------------------------
+logging.info("Saving updates to workbook...")
+wb.save(BANI_FILE_PATH)
+logging.info("Done. All updates saved.")

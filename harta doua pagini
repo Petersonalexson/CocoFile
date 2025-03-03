@@ -1,0 +1,142 @@
+import logging
+import pandas as pd
+from openpyxl import load_workbook
+import warnings
+
+# Suppress common user warnings about data validation, etc.
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+def main():
+    # -------------------------------------------------------------------------
+    # 1. Setup Logging
+    # -------------------------------------------------------------------------
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    # -------------------------------------------------------------------------
+    # 2. File Paths 
+    # -------------------------------------------------------------------------
+    MAP_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\MAP.xlsx"
+    BANI_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\BANI.xlsx"
+    MAPPING_SHEET = "Mapping Main"
+    XRP_SHEET = "XRP"
+    
+    # -------------------------------------------------------------------------
+    # 3. Load Mapping Data (MAP.xlsx)
+    # -------------------------------------------------------------------------
+    logging.info("Loading mapping data...")
+    map_df = pd.read_excel(MAP_FILE_PATH, sheet_name=MAPPING_SHEET)
+    
+    # Keep only rows where Account is not NaN, convert 'Account' to int
+    map_df.dropna(subset=["Account"], inplace=True)
+    map_df["Account"] = map_df["Account"].astype(int)
+    
+    # -------------------------------------------------------------------------
+    # 4. Load and Clean BANI Data (BANI.xlsx - "XRP")
+    # -------------------------------------------------------------------------
+    logging.info("Loading BANI (XRP) data...")
+    bani_df = pd.read_excel(BANI_FILE_PATH, sheet_name=XRP_SHEET)
+    
+    # Keep only relevant columns (Nat Cont, Centru, Quantitate) and drop any row missing them
+    bani_df = bani_df[["Nat Cont", "Centru", "Quantitate"]].dropna()
+    
+    # Convert columns appropriately
+    bani_df["Nat Cont"] = bani_df["Nat Cont"].astype(int)
+    bani_df["Centru"] = bani_df["Centru"].astype(str).str.strip()
+    bani_df["Quantitate"] = bani_df["Quantitate"].astype(float)
+    
+    # -------------------------------------------------------------------------
+    # 5. Filter by Allowed Accounts from the Mapping
+    # -------------------------------------------------------------------------
+    allowed_accounts = dict(zip(map_df["Account"], map_df["Description 2"].dropna()))
+    filtered_bani_df = bani_df[bani_df["Nat Cont"].isin(allowed_accounts.keys())]
+    
+    # -------------------------------------------------------------------------
+    # 6. Merge so we can have "Account" and "Description 2"
+    # -------------------------------------------------------------------------
+    logging.info("Merging with map data to get (Account, Description 2).")
+    merged_df = filtered_bani_df.merge(
+        map_df[["Account", "Description 2"]],
+        left_on="Nat Cont",
+        right_on="Account",
+        how="left"
+    )
+    
+    rename_map = {
+        "Arnold": "Arnold & Mercenari",
+        "Activitati/o": "Activitati/O"
+    }
+    merged_df["Description 2"] = merged_df["Description 2"].replace(rename_map)
+    
+    # -------------------------------------------------------------------------
+    # 7. Create two aggregated DataFrames:
+    #    7a) aggregated_df_full => group by (Centru, Account, Description 2)
+    #    7b) aggregated_df_desc => group by (Centru, Description 2)
+    # -------------------------------------------------------------------------
+    logging.info("Aggregating by (Centru, Account, Description 2) ...")
+    aggregated_df_full = merged_df.groupby(["Centru", "Account", "Description 2"], dropna=True, as_index=False)["Quantitate"].sum()
+    
+    logging.info("Aggregating by (Centru, Description 2) ...")
+    aggregated_df_desc = merged_df.groupby(["Centru", "Description 2"], dropna=True, as_index=False)["Quantitate"].sum()
+    
+    logging.info("Full Aggregation:\n%s", aggregated_df_full)
+    logging.info("Desc-only Aggregation:\n%s", aggregated_df_desc)
+    
+    # -------------------------------------------------------------------------
+    # 8. Write these two sets of results to two NEW SHEETS in BANI.xlsx
+    # -------------------------------------------------------------------------
+    logging.info("Opening BANI.xlsx to write new sheets ...")
+    wb = load_workbook(BANI_FILE_PATH)
+    
+    # -------------------------------------------------------------------------
+    # 8A. "Aggregated" sheet (Centru, Account, Description2, Quantitate)
+    # -------------------------------------------------------------------------
+    if "Aggregated" in wb.sheetnames:
+        del wb["Aggregated"]
+    ws_agg_full = wb.create_sheet("Aggregated")
+    
+    # Write header
+    ws_agg_full.cell(row=1, column=1).value = "Centru"
+    ws_agg_full.cell(row=1, column=2).value = "Account"
+    ws_agg_full.cell(row=1, column=3).value = "Description 2"
+    ws_agg_full.cell(row=1, column=4).value = "Quantitate"
+    
+    # Write data
+    for i, row_data in aggregated_df_full.iterrows():
+        # row i+2 for data
+        row_idx = i + 2
+        ws_agg_full.cell(row=row_idx, column=1).value = row_data["Centru"]
+        ws_agg_full.cell(row=row_idx, column=2).value = row_data["Account"]
+        ws_agg_full.cell(row=row_idx, column=3).value = row_data["Description 2"]
+        ws_agg_full.cell(row=row_idx, column=4).value = row_data["Quantitate"]
+    
+    # -------------------------------------------------------------------------
+    # 8B. "Aggregated_Desc" sheet (Centru, Description2, Quantitate)
+    # -------------------------------------------------------------------------
+    if "Aggregated_Desc" in wb.sheetnames:
+        del wb["Aggregated_Desc"]
+    ws_agg_desc = wb.create_sheet("Aggregated_Desc")
+    
+    # Write header
+    ws_agg_desc.cell(row=1, column=1).value = "Centru"
+    ws_agg_desc.cell(row=1, column=2).value = "Description 2"
+    ws_agg_desc.cell(row=1, column=3).value = "Quantitate"
+    
+    # Write data
+    for i, row_data in aggregated_df_desc.iterrows():
+        # row i+2 for data
+        row_idx = i + 2
+        ws_agg_desc.cell(row=row_idx, column=1).value = row_data["Centru"]
+        ws_agg_desc.cell(row=row_idx, column=2).value = row_data["Description 2"]
+        ws_agg_desc.cell(row=row_idx, column=3).value = row_data["Quantitate"]
+    
+    # -------------------------------------------------------------------------
+    # 9. Save
+    # -------------------------------------------------------------------------
+    wb.save(BANI_FILE_PATH)
+    logging.info("Done! Two sheets: 'Aggregated' and 'Aggregated_Desc' were created in %s.", BANI_FILE_PATH)
+
+if __name__ == "__main__":
+    main()

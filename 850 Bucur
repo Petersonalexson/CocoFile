@@ -1,0 +1,1630 @@
+# 6 43
+"""
+Ultra-Mega Reconciliation: Parameter-based with advanced Dashboard (8 charts),
+- ERP & Master "SimplePreview" with date filters (Start Date / End Date),
+- Enhanced PDF layout,
+- Now 'Name' also appears as an Attribute ("ItemName") so that differences in Name
+  show up in the final mismatch output.
+
+Additionally, we add Power BI-friendly Excel output with 3 sheets:
+  1) "MissingItems" (the final mismatch table)
+  2) "ERP_Extract"   (the meltdown of ERP data)
+  3) "Master_Extract"(the meltdown of Master data)
+All 3 sheets are saved as Excel Tables, so that Power BI can read them easily.
+"""
+
+import os
+import sys
+import json
+import logging
+import zipfile
+import shutil
+import io
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Dict, Set, List, Optional
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import customtkinter as ctk
+
+import pandas as pd
+import numpy as np
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_pdf import PdfPages
+
+try:
+    import chardet
+except ImportError:
+    chardet = None
+
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.utils import get_column_letter
+
+from PIL import Image
+
+# ----------------------------------------------------------------------------
+# LOGGING
+# ----------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+
+# ----------------------------------------------------------------------------
+# DEFAULT PATHS & CONFIG
+# ----------------------------------------------------------------------------
+DEFAULT_PATHS = {
+    "ERP_EXCEL_PATH": "data/ERP_Config.xlsx",
+    "MASTER_ZIP_PATH": "data/Master_Config.zip",
+    "EXCEPTION_PATH": "data/Exception_Table.xlsx",
+    "OUTPUT_PATH": "output/missing_items.xlsx",
+    "CONFIG_PATH": "config/ui_config.json",
+    "PARAMETER_PATH": "data/parameters.xlsx",
+    "MASTER_CSV_OUTPUT": "temp_master_csv",
+    "PDF_EXPORT_PATH": "output/dashboard_report.pdf",
+    # LOGO_PATH is stored in code (not in the GUI)
+    "LOGO_PATH": "images/company_logo.png"
+}
+
+def default_config() -> Dict:
+    return {
+        "paths": DEFAULT_PATHS.copy(),
+        # We'll store filters for ERP/Master previews
+        "erp_grid": {
+            "filters": {}  # column => set_of_allowed
+        },
+        "master_grid": {
+            "filters": {}
+        }
+    }
+
+def load_config(path: Path) -> Dict:
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load config: {e}")
+    return default_config()
+
+def save_config(cfg: Dict, path: Path):
+    """Save config to JSON, converting sets -> lists for JSON serialization."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # Convert ERP preview sets to lists
+        if "erp_grid" in cfg and "filters" in cfg["erp_grid"]:
+            new_filters = {}
+            for col, valset in cfg["erp_grid"]["filters"].items():
+                new_filters[col] = list(valset)  # set -> list
+            cfg["erp_grid"]["filters"] = new_filters
+
+        # Convert Master preview sets to lists
+        if "master_grid" in cfg and "filters" in cfg["master_grid"]:
+            new_filters = {}
+            for col, valset in cfg["master_grid"]["filters"].items():
+                new_filters[col] = list(valset)
+            cfg["master_grid"]["filters"] = new_filters
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        logging.info(f"Saved config to {path}")
+    except Exception as e:
+        logging.error(f"Error saving config: {e}")
+
+
+# ----------------------------------------------------------------------------
+# TEXT LOGGER HANDLER
+# ----------------------------------------------------------------------------
+class TextHandler(logging.Handler):
+    """Send logging output to a ctk.CTkTextbox."""
+    def __init__(self, widget: ctk.CTkTextbox):
+        super().__init__()
+        self.widget = widget
+
+    def emit(self, record):
+        msg = self.format(record) + "\n"
+        self.widget.after(0, self._append, msg)
+
+    def _append(self, msg):
+        self.widget.configure(state="normal")
+        self.widget.insert("end", msg)
+        self.widget.see("end")
+        self.widget.configure(state="disabled")
+
+
+# ----------------------------------------------------------------------------
+# PARAM READING
+# ----------------------------------------------------------------------------
+def read_param_file(path: Path) -> Dict[str, object]:
+    param = {
+        "dim_erp_keep": set(),
+        "dim_erp_map": {},
+        "dim_master_map": {},
+        "attr_erp_map": {},
+        "attr_master_map": {}
+    }
+    if not path.is_file():
+        logging.warning(f"Param file not found => {path}")
+        return param
+    try:
+        dim_df = pd.read_excel(path, sheet_name="Dimension Parameters")
+        dim_df.columns = dim_df.columns.astype(str).str.strip()
+
+        def s(x): return str(x).strip() if pd.notna(x) else ""
+
+        for _, row in dim_df.iterrows():
+            fn = s(row.get("FileName",""))
+            vsc = s(row.get("V S C",""))
+            dim = s(row.get("Dimension",""))
+            ev  = s(row.get("ERP Values",""))
+
+            if ev.lower() == "x" and vsc and dim:
+                param["dim_erp_keep"].add(vsc)
+            if vsc and dim:
+                param["dim_erp_map"][vsc] = dim
+            if fn and dim and ev.lower() == "x":
+                param["dim_master_map"][fn] = dim
+
+        attr_df = pd.read_excel(path, sheet_name="Attribute Parameters")
+        attr_df.columns = attr_df.columns.astype(str).str.strip()
+        for _, row in attr_df.iterrows():
+            e_orig = s(row.get("ERP Original Attributes",""))
+            m_orig = s(row.get("Master Original Attributes",""))
+            final_ = s(row.get("Attribute",""))
+            onoff  = s(row.get("On/Off",""))
+            if onoff.lower()=="x" and final_:
+                if e_orig:
+                    param["attr_erp_map"][e_orig] = final_
+                if m_orig:
+                    param["attr_master_map"][m_orig] = final_
+        return param
+    except Exception as e:
+        logging.error(f"Error reading param file => {e}")
+        return param
+
+
+# ----------------------------------------------------------------------------
+# ERP
+# ----------------------------------------------------------------------------
+def read_erp_excel(path: Path) -> pd.DataFrame:
+    if not path.is_file():
+        logging.warning(f"ERP Excel not found => {path}")
+        return pd.DataFrame()
+    try:
+        df = pd.read_excel(path, skiprows=3)
+        df.columns = df.columns.str.strip()
+        if "Enabled_Flag" in df.columns:
+            df = df[df["Enabled_Flag"]=="Enabled"]
+        return df
+    except Exception as e:
+        logging.error(f"Error reading ERP => {e}")
+        return pd.DataFrame()
+
+
+# ----------------------------------------------------------------------------
+# MASTER => .txt from ZIP
+# ----------------------------------------------------------------------------
+def read_txt_2encodings(raw: bytes) -> pd.DataFrame:
+    import io
+    for enc in ["utf-8-sig","utf-16-le"]:
+        try:
+            buf = io.BytesIO(raw)
+            df = pd.read_csv(buf, encoding=enc, on_bad_lines="skip", engine="python")
+            df.dropna(how="all", axis=0, inplace=True)
+            df.dropna(how="all", axis=1, inplace=True)
+            df.columns = df.columns.astype(str).str.strip()
+            logging.info(f"[read_txt_2encodings] success with {enc}, shape={df.shape}")
+            return df
+        except Exception as e:
+            logging.debug(f"[read_txt_2encodings] fail with {enc} => {e}")
+    logging.error("[read_txt_2encodings] cannot parse .txt => empty.")
+    return pd.DataFrame()
+
+def convert_master_txt_to_csv(zip_path: Path, out_dir: Path) -> List[Path]:
+    if not zip_path.is_file():
+        logging.warning(f"[Master] ZIP not found => {zip_path}")
+        return []
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csvs = []
+    with zipfile.ZipFile(zip_path,"r") as z:
+        txt_files= [f for f in z.namelist() if f.lower().endswith(".txt")]
+        for txt_file in txt_files:
+            base_name = os.path.basename(txt_file)
+            if not base_name:
+                continue
+            try:
+                with z.open(txt_file) as fo:
+                    raw = fo.read()
+                df = read_txt_2encodings(raw)
+                if df.empty:
+                    continue
+                df["RawFileName"] = base_name
+                if "Name" not in df.columns and len(df.columns)>0:
+                    first_col= df.columns[0]
+                    df.rename(columns={first_col:"Name"}, inplace=True)
+                out_csv = out_dir / (base_name.replace(".txt",".csv"))
+                df.to_csv(out_csv, index=False, encoding="utf-8")
+                csvs.append(out_csv)
+            except Exception as e:
+                logging.error(f"[Master] error reading {txt_file} => {e}")
+    return csvs
+
+def unify_master_csvs(csvs: List[Path]) -> pd.DataFrame:
+    frames=[]
+    for cp in csvs:
+        if not cp.is_file():
+            continue
+        try:
+            df = pd.read_csv(cp, encoding="utf-8", on_bad_lines="skip")
+            df.columns = df.columns.str.strip()
+            frames.append(df)
+        except Exception as e:
+            logging.error(f"[unify_master_csvs] reading {cp} => {e}")
+    if frames:
+        return pd.concat(frames, ignore_index=True)
+    return pd.DataFrame()
+
+
+# ----------------------------------------------------------------------------
+# MELTDOWN => meltdown_erp_for_preview, meltdown_master_for_preview
+# ----------------------------------------------------------------------------
+def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.DataFrame:
+    """
+    1) Filter by param 'dim_erp_keep' (matching V_S_C).
+    2) Create "Dimension" from V_S_C using 'dim_erp_map'.
+    3) Keep a "Name" column if "Value" exists (like old logic).
+    4) Also produce an attribute row "ItemName" that stores the same name value.
+    5) Then meltdown all relevant columns (mapped by 'attr_erp_map').
+    6) Output => columns: [Dimension, Name, Attribute, Value].
+    """
+    if "V_S_C" not in df.columns:
+        return pd.DataFrame()
+    keep = param.get("dim_erp_keep", set())
+    dmap = param.get("dim_erp_map", {})
+    amap = param.get("attr_erp_map", {})
+
+    df2 = df[df["V_S_C"].isin(keep)].copy()
+    if df2.empty:
+        return pd.DataFrame()
+
+    # 1) Insert "Dimension" col from V_S_C
+    df2["Dimension"] = df2["V_S_C"].apply(lambda x: dmap.get(x,x))
+
+    # 2) If there's a "Value" column, rename it to "Name"
+    if "Value" in df2.columns:
+        df2.rename(columns={"Value":"Name"}, inplace=True)
+    else:
+        df2["Name"] = ""
+
+    # 3) meltdown - skip these columns
+    skip_cols = {"V_S_C","Enabled_Flag","Dimension","Name"}
+    meltdown_cols = [c for c in df2.columns if c not in skip_cols]
+
+    # melt
+    melted = df2.melt(
+        id_vars=["Dimension","Name"],
+        value_vars=meltdown_cols,
+        var_name="OrigAttr",
+        value_name="ValX"
+    )
+
+    # keep only attributes that appear in amap
+    melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
+    melted["Attribute"] = melted["OrigAttr"].map(amap)
+
+    # strip "T" if Start/End Date
+    def strip_t(val):
+        if isinstance(val,str) and "T" in val:
+            return val.split("T")[0]
+        return val
+    melted["Value"] = np.where(
+        melted["Attribute"].isin(["Start Date","End Date"]),
+        melted["ValX"].apply(strip_t),
+        melted["ValX"]
+    )
+
+    # 4) Add a separate meltdown row for "ItemName" = Name
+    df_name_attr = df2[["Dimension","Name"]].copy()
+    df_name_attr["Attribute"] = "ItemName"
+    df_name_attr["Value"] = df_name_attr["Name"]  # same
+    df_name_attr.drop(columns=["Name"], inplace=True)
+
+    # combine
+    combined = pd.concat([
+        melted[["Dimension","Name","Attribute","Value"]],
+        df_name_attr[["Dimension","Attribute","Value"]].assign(Name="")  
+        # ^ We'll leave Name="" so it doesn't conflict with pivot index
+        #   Alternatively, you could keep the same Name, but usually we pivot by [Dimension, Name].
+        #   We'll keep it blank so the meltdown row is "Dimension, (no name), Attribute=ItemName, Value=..."
+    ], ignore_index=True)
+
+    return combined[["Dimension","Name","Attribute","Value"]]
+
+
+def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.DataFrame:
+    """
+    Similar meltdown for Master data.
+    1) Filter by param 'dim_master_map' => keep only RawFileName in that map.
+    2) 'Dimension' derived from the map.
+    3) Keep "Name" if it exists.
+    4) meltdown only mapped attributes
+    5) Add a separate row for "ItemName" from 'Name'
+    """
+    if df.empty or "RawFileName" not in df.columns:
+        return pd.DataFrame()
+    keep_map = param.get("dim_master_map", {})
+    amap = param.get("attr_master_map", {})
+
+    df2 = df[df["RawFileName"].isin(keep_map.keys())].copy()
+    if df2.empty:
+        return pd.DataFrame()
+
+    # create dimension col
+    df2["Dimension"] = df2["RawFileName"].apply(lambda x: keep_map.get(x,x))
+
+    # ensure a "Name" column
+    if "Name" not in df2.columns:
+        df2["Name"] = ""
+
+    skip_cols = {"RawFileName","Dimension","Name"}
+    meltdown_cols = [c for c in df2.columns if c not in skip_cols]
+
+    melted = df2.melt(
+        id_vars=["Dimension","Name"],
+        value_vars=meltdown_cols,
+        var_name="OrigAttr",
+        value_name="ValX"
+    )
+
+    # keep only mapped
+    melted = melted[melted["OrigAttr"].isin(amap.keys())].copy()
+    melted["Attribute"] = melted["OrigAttr"].map(amap)
+
+    def strip_t(val):
+        if isinstance(val,str) and "T" in val:
+            return val.split("T")[0]
+        return val
+    melted["Value"] = np.where(
+        melted["Attribute"].isin(["Start Date","End Date"]),
+        melted["ValX"].apply(strip_t),
+        melted["ValX"]
+    )
+
+    # itemName row
+    df_name_attr = df2[["Dimension","Name"]].copy()
+    df_name_attr["Attribute"] = "ItemName"
+    df_name_attr["Value"] = df_name_attr["Name"]
+    df_name_attr.drop(columns=["Name"], inplace=True)
+
+    combined = pd.concat([
+        melted[["Dimension","Name","Attribute","Value"]],
+        df_name_attr[["Dimension","Attribute","Value"]].assign(Name="")
+    ], ignore_index=True)
+
+    return combined[["Dimension","Name","Attribute","Value"]]
+
+
+def pivot_for_preview(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pivot so each row is (Dimension, Name), columns = distinct Attributes.
+    We do that ignoring the meltdown row that has Name="" (which was used for ItemName).
+    Because typically we want to see each item by (Dimension, Name).
+    """
+    if not df.empty and {"Dimension","Name","Attribute"}.issubset(df.columns):
+        # Filter out the meltdown rows that had Name=""
+        df = df[df["Name"]!=""].copy()
+
+        df = df.drop_duplicates(subset=["Dimension","Name","Attribute"])
+        try:
+            df = df.pivot(
+                index=["Dimension","Name"],
+                columns="Attribute",
+                values="Value"
+            ).reset_index()
+        except Exception as e:
+            logging.error(f"Pivot error => {e}")
+    return df
+
+
+# ----------------------------------------------------------------------------
+# COMPARE => meltdown => missing items
+# ----------------------------------------------------------------------------
+def melt_back(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reverse the pivot so that each row is (Dimension, Name, Attribute, Value).
+    We do NOT skip 'Name' from meltdown, so that 'ItemName' also appears
+    (and we can see mismatches in 'ItemName').
+    """
+    if df.empty or "Dimension" not in df.columns or "Name" not in df.columns:
+        return pd.DataFrame()
+
+    skip_cols = {"Dimension","Name"}  # keep these as IDs
+    meltdown_cols = [c for c in df.columns if c not in skip_cols]
+
+    melted = df.melt(
+        id_vars=["Dimension","Name"],
+        value_vars=meltdown_cols,
+        var_name="Attribute",
+        value_name="Value"
+    )
+    return melted[["Dimension","Name","Attribute","Value"]]
+
+def build_keys(df: pd.DataFrame)-> pd.DataFrame:
+    """Add Key columns for merging with exception table, etc."""
+    df = df.copy()
+    for c in ["Dimension","Name","Attribute","Value"]:
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].fillna("").astype(str).str.strip()
+    df["Comments_1"] = ""
+    df["Comments_2"] = ""
+    df["Action Item"] = ""
+    return df
+
+def compare_mode2(df_erp: pd.DataFrame, df_mst: pd.DataFrame) -> pd.DataFrame:
+    """
+    Single-row difference approach:
+      For each (Dimension, Name, Attribute), gather ERP value vs Master value:
+        - if both empty or both the same => no difference
+        - if only ERP is present => Status="Missing in Master"
+        - if only Master is present => Status="Missing in ERP"
+        - if both differ => Status="Difference in both"
+    Produces columns => [Dimension, Name, Attribute, ValueERP, ValueMaster, Status, Key]
+    """
+
+    # create dict => (dim,name,attr) => val
+    def to_dict(d: pd.DataFrame):
+        out = {}
+        for idx, row in d.iterrows():
+            triple = (row["Dimension"], row["Name"], row["Attribute"])
+            val = row["Value"]
+            out[triple] = val
+        return out
+
+    e_dict = to_dict(df_erp)
+    m_dict = to_dict(df_mst)
+
+    all_keys = set(e_dict.keys()) | set(m_dict.keys())
+
+    results = []
+    for triple in all_keys:
+        dim, nm, attr = triple
+        va = e_dict.get(triple, "")  # ERP
+        vb = m_dict.get(triple, "")  # Master
+        if va == vb:
+            # no difference => skip
+            continue
+        # else mismatch
+        if va and not vb:
+            status = "Missing in Master"
+        elif vb and not va:
+            status = "Missing in ERP"
+        else:
+            status = "Difference in both"
+
+        row = {
+            "Dimension": dim,
+            "Name": nm,
+            "Attribute": attr,
+            "ValueERP": va,
+            "ValueMaster": vb,
+            "Status": status
+        }
+        # build a unique key that includes both values
+        row["Key"] = f"{dim} | {nm} | {attr} | {va} | {vb}"
+        results.append(row)
+
+    df_res = pd.DataFrame(results)
+    return df_res
+
+
+def read_exception_table(path: Path)-> pd.DataFrame:
+    if not path.is_file():
+        logging.warning(f"Exception table not found => {path}")
+        return pd.DataFrame()
+    try:
+        df = pd.read_excel(path)
+        df.columns = df.columns.astype(str).str.strip()
+        return df
+    except Exception as e:
+        logging.error(f"Error reading exception => {e}")
+        return pd.DataFrame()
+
+def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame)-> pd.DataFrame:
+    """
+    Merge "Comments_1","Comments_2","hide exception" from the exception table,
+    then filter out rows with 'hide exception'=='yes'.
+    """
+    if df.empty or df_exc.empty or "Key" not in df.columns:
+        return df
+    keep = [c for c in df_exc.columns if c in ["Key","Comments_1","Comments_2","hide exception"]]
+    if not keep:
+        return df
+    exc = df_exc[keep].copy()
+    exc["Key"] = exc["Key"].astype(str).str.strip()
+
+    merged = df.merge(exc, on="Key", how="left", suffixes=("","_exc"))
+    merged["hide exception"] = merged.get("hide exception","").fillna("").str.lower()
+
+    final = merged[merged["hide exception"]!="yes"].copy()
+
+    if "Comments_1_exc" in final.columns:
+        final["Comments_1"] = np.where(final["Comments_1_exc"].notna(), final["Comments_1_exc"], final["Comments_1"])
+        final.drop(columns=["Comments_1_exc"], inplace=True)
+    if "Comments_2_exc" in final.columns:
+        final["Comments_2"] = np.where(final["Comments_2_exc"].notna(), final["Comments_2_exc"], final["Comments_2"])
+        final.drop(columns=["Comments_2_exc"], inplace=True)
+    if "hide exception" in final.columns:
+        final.drop(columns=["hide exception"], inplace=True)
+
+    return final
+
+
+def write_missing_items(
+    df_mismatch: pd.DataFrame,
+    df_erp_extract: pd.DataFrame,
+    df_mast_extract: pd.DataFrame,
+    out_path: Path
+):
+    """
+    Write to Excel, with 3 sheets:
+      1) "MissingItems"    => df_mismatch
+      2) "ERP_Extract"     => meltdown from ERP
+      3) "Master_Extract"  => meltdown from Master
+
+    Each is converted into a Power BI-friendly Excel Table.
+    """
+    if df_mismatch.empty:
+        logging.info("No mismatches => still writing an empty 'MissingItems' sheet.")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    wb = Workbook()
+
+    # 1) MissingItems sheet
+    ws_m = wb.active
+    ws_m.title = "MissingItems"
+
+    mismatch_cols = [
+        "Key","Dimension","Name","Attribute","ValueERP","ValueMaster",
+        "Comments_1","Comments_2","Action Item","Status"
+    ]
+    # ensure these columns exist
+    for c in mismatch_cols:
+        if c not in df_mismatch.columns:
+            df_mismatch[c] = ""
+    df_mismatch = df_mismatch[mismatch_cols]
+
+    # Write header
+    ws_m.append(mismatch_cols)
+    # Write data
+    for rowvals in df_mismatch.itertuples(index=False):
+        ws_m.append(rowvals)
+
+    # style
+    header_font = Font(bold=True)
+    fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
+    for cell in ws_m[1]:
+        cell.font = header_font
+        cell.fill = fill
+        cell.alignment = Alignment(horizontal="center")
+
+    # Auto-size columns
+    for col in ws_m.columns:
+        max_len = 0
+        letter = col[0].column_letter
+        for cell in col:
+            val = str(cell.value) if cell.value else ""
+            max_len = max(max_len, len(val))
+        ws_m.column_dimensions[letter].width = max_len+2
+    ws_m.freeze_panes = "A2"
+
+    # create a Table
+    last_row = ws_m.max_row
+    last_col = ws_m.max_column
+    tab_ref = f"A1:{get_column_letter(last_col)}{last_row}"
+    table_m = Table(displayName="MissingItemsTable", ref=tab_ref)
+    style_m = TableStyleInfo(
+        name="TableStyleMedium9",
+        showRowStripes=True,
+        showColumnStripes=False,
+        showFirstColumn=True
+    )
+    table_m.tableStyleInfo = style_m
+    ws_m.add_table(table_m)
+
+    # 2) ERP_Extract
+    ws_e = wb.create_sheet("ERP_Extract")
+    if df_erp_extract.empty:
+        # just create header
+        ws_e.append(["Dimension","Name","Attribute","Value"])
+    else:
+        # ensure columns exist
+        e_cols = ["Dimension","Name","Attribute","Value"]
+        for c in e_cols:
+            if c not in df_erp_extract.columns:
+                df_erp_extract[c] = ""
+        # write header
+        ws_e.append(e_cols)
+        # write rows
+        for rowvals in df_erp_extract[e_cols].itertuples(index=False):
+            ws_e.append(rowvals)
+    # style
+    for cell in ws_e[1]:
+        cell.font = header_font
+        cell.fill = fill
+        cell.alignment = Alignment(horizontal="center")
+    for col in ws_e.columns:
+        max_len = 0
+        letter = col[0].column_letter
+        for cell in col:
+            val = str(cell.value) if cell.value else ""
+            max_len = max(max_len, len(val))
+        ws_e.column_dimensions[letter].width = max_len+2
+    ws_e.freeze_panes = "A2"
+
+    last_row_e = ws_e.max_row
+    last_col_e = ws_e.max_column
+    tab_ref_e = f"A1:{get_column_letter(last_col_e)}{last_row_e}"
+    table_e = Table(displayName="ERPExtractTable", ref=tab_ref_e)
+    style_e = TableStyleInfo(
+        name="TableStyleMedium9",
+        showRowStripes=True,
+        showColumnStripes=False,
+        showFirstColumn=True
+    )
+    table_e.tableStyleInfo = style_e
+    ws_e.add_table(table_e)
+
+    # 3) Master_Extract
+    ws_ma = wb.create_sheet("Master_Extract")
+    if df_mast_extract.empty:
+        ws_ma.append(["Dimension","Name","Attribute","Value"])
+    else:
+        m_cols = ["Dimension","Name","Attribute","Value"]
+        for c in m_cols:
+            if c not in df_mast_extract.columns:
+                df_mast_extract[c] = ""
+        ws_ma.append(m_cols)
+        for rowvals in df_mast_extract[m_cols].itertuples(index=False):
+            ws_ma.append(rowvals)
+    # style
+    for cell in ws_ma[1]:
+        cell.font = header_font
+        cell.fill = fill
+        cell.alignment = Alignment(horizontal="center")
+    for col in ws_ma.columns:
+        max_len = 0
+        letter = col[0].column_letter
+        for cell in col:
+            val = str(cell.value) if cell.value else ""
+            max_len = max(max_len, len(val))
+        ws_ma.column_dimensions[letter].width = max_len+2
+    ws_ma.freeze_panes = "A2"
+
+    last_row_ma = ws_ma.max_row
+    last_col_ma = ws_ma.max_column
+    tab_ref_ma = f"A1:{get_column_letter(last_col_ma)}{last_row_ma}"
+    table_ma = Table(displayName="MasterExtractTable", ref=tab_ref_ma)
+    style_ma = TableStyleInfo(
+        name="TableStyleMedium9",
+        showRowStripes=True,
+        showColumnStripes=False,
+        showFirstColumn=True
+    )
+    table_ma.tableStyleInfo = style_ma
+    ws_ma.add_table(table_ma)
+
+    wb.save(out_path)
+    logging.info(f"Excel file with 3 sheets => {out_path}")
+
+
+# ----------------------------------------------------------------------------
+# SIMPLE PREVIEW
+# ----------------------------------------------------------------------------
+class SimplePreview(ctk.CTkFrame):
+    """
+    Preview for ERP/Master data, with optional manual filters,
+    plus an "auto End Date filter" toggle: keep only end dates >= today (or big year).
+    """
+    FILTERABLE = {"Start Date","End Date"}
+
+    def __init__(self, parent, name: str, filters_dict=None):
+        super().__init__(parent)
+        self.name = name
+        self.df = pd.DataFrame()
+
+        # Convert lists -> sets
+        self.filters: Dict[str, Set] = {}
+        if filters_dict:
+            for c, items in filters_dict.items():
+                if isinstance(items, list):
+                    self.filters[c] = set(items)
+                else:
+                    self.filters[c] = items
+
+        # Toggle: auto EndDate filter
+        self.auto_end_filter_var = tk.BooleanVar(value=False)
+
+        self.create_toolbar()
+        self.create_table()
+        self.create_statusbar()
+
+    def create_toolbar(self):
+        bar= ctk.CTkFrame(self, corner_radius=10, fg_color="#f0f0f0")
+        bar.pack(fill="x", padx=5, pady=5)
+
+        title_label = ctk.CTkLabel(
+            bar, text=f"{self.name} Preview",
+            fg_color="#800020", corner_radius=8,
+            text_color="white",
+            font=ctk.CTkFont(size=14, weight="bold")
+        )
+        title_label.pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            bar, text="ⓘ", width=30, command=self.show_info,
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+
+        # Auto End Date filter
+        self.enddate_check = ctk.CTkCheckBox(
+            bar, text="Auto End Date >= today?",
+            variable=self.auto_end_filter_var,
+            command=self.refresh_table,
+            fg_color="#800020", hover_color="#a52a2a", text_color="black"
+        )
+        self.enddate_check.pack(side="left", padx=(30,5))
+
+        ctk.CTkButton(
+            bar, text="Clear Date Filters", command=self.clear_filters,
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+
+    def show_info(self):
+        messagebox.showinfo(
+            "Info",
+            (f"{self.name} data. Columns 'Start Date' and 'End Date' are filterable.\n"
+             "You can manually filter by clicking the column heading in the table.\n"
+             "Or use the 'Auto End Date >= today?' toggle to automatically keep future End Dates.\n")
+        )
+
+    def create_table(self):
+        container = ctk.CTkFrame(self)
+        container.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.tree = ttk.Treeview(container, show="headings")
+        vsb = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(container, orient="horizontal", command=self.tree.xview)
+
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+    def create_statusbar(self):
+        self.status_label = ctk.CTkLabel(self, text="0 rows", fg_color="#f0f0f0", text_color="black")
+        self.status_label.pack(fill="x")
+
+    def set_data(self, df: pd.DataFrame):
+        self.df = df.copy()
+        self.refresh_table()
+
+    def refresh_table(self):
+        # Clear existing
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        if self.df.empty:
+            self.tree["columns"] = []
+            self.status_label.configure(text="0 rows")
+            return
+
+        cols = list(self.df.columns)
+        self.tree["columns"] = cols
+        for c in cols:
+            self.tree.heading(
+                c, text=c, anchor="w",
+                command=lambda col=c: self.on_heading_click(col)
+            )
+            self.tree.column(c, anchor="w", width=150)
+
+        # Apply the combined filters
+        df_f = self.apply_filters()
+
+        # Insert rows
+        for _, row in df_f.iterrows():
+            rowvals = [row[c] for c in cols]
+            self.tree.insert("", "end", values=rowvals)
+
+        self.status_label.configure(text=f"{len(df_f)} rows")
+
+    def apply_filters(self) -> pd.DataFrame:
+        df_f = self.df.copy()
+
+        # 1) If auto end-date filter is on, override the End Date filter
+        if self.auto_end_filter_var.get() and "End Date" in df_f.columns:
+            today = datetime.now().date()
+            allowed_values = set()
+
+            all_end_vals = df_f["End Date"].unique()
+            for val in all_end_vals:
+                sval = str(val).strip()
+                kept = False
+                if sval:
+                    try:
+                        dtp = datetime.strptime(sval, "%Y-%m-%d")
+                        if dtp.year > 2100 or dtp.date() >= today:
+                            kept = True
+                    except:
+                        if "9999" in sval:
+                            kept = True
+                        else:
+                            import re
+                            ymatch = re.findall(r"\d{4}", sval)
+                            for yy in ymatch:
+                                if int(yy)>2100:
+                                    kept = True
+                                    break
+                if kept:
+                    allowed_values.add(val)
+
+            # Remove any manual filter for End Date, override it:
+            if "End Date" in self.filters:
+                del self.filters["End Date"]
+            df_f = df_f[df_f["End Date"].isin(allowed_values)]
+        else:
+            pass
+
+        # 2) Apply the user's manual filters
+        for col, allowed in self.filters.items():
+            if col in df_f.columns and len(allowed)>0:
+                df_f = df_f[df_f[col].isin(allowed)]
+
+        return df_f
+
+    def on_heading_click(self, col_name: str):
+        if col_name in self.FILTERABLE:
+            self.show_filter_popup(col_name)
+
+    def show_filter_popup(self, col_name: str):
+        if self.df.empty or col_name not in self.df.columns:
+            return
+
+        popup = tk.Toplevel(self)
+        popup.title(f"Filter: {col_name}")
+        popup.geometry("300x400")
+
+        frame = ctk.CTkFrame(popup)
+        frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        unique_vals = self.df[col_name].unique()
+        display_map = {}
+        for v in unique_vals:
+            if pd.isna(v):
+                dsp = "(NaN)"
+            elif isinstance(v,str) and not v.strip():
+                dsp = "(blank)"
+            else:
+                dsp = str(v)
+            display_map[v] = dsp
+
+        sorted_vals = sorted(display_map.keys(), key=lambda x: display_map[x].lower())
+        current_set = self.filters.get(col_name, set(sorted_vals))
+
+        selall_var = tk.BooleanVar(value=True)
+        def toggle_all():
+            check = selall_var.get()
+            for vb in var_dict.values():
+                vb.set(check)
+
+        ctk.CTkCheckBox(
+            frame, text="Select All", variable=selall_var, command=toggle_all,
+            fg_color="#800020", hover_color="#a52a2a", text_color="black"
+        ).pack(anchor="w", pady=5)
+
+        scroll= ctk.CTkScrollableFrame(frame, width=250, height=250)
+        scroll.pack(fill="both", expand=True, padx=5, pady=5)
+
+        var_dict = {}
+        for rv in sorted_vals:
+            in_filter = rv in current_set
+            bvar = tk.BooleanVar(value=in_filter)
+            var_dict[rv] = bvar
+            ctk.CTkCheckBox(
+                scroll, text=display_map[rv], variable=bvar,
+                fg_color="#800020", hover_color="#a52a2a", text_color="black"
+            ).pack(anchor="w")
+
+        def apply_():
+            sel = {rv for rv,vb in var_dict.items() if vb.get()}
+            all_ = set(sorted_vals)
+            if sel==all_ or len(sel)==0:
+                if col_name in self.filters:
+                    del self.filters[col_name]
+            else:
+                self.filters[col_name] = sel
+            popup.destroy()
+            self.refresh_table()
+
+        bf = ctk.CTkFrame(frame)
+        bf.pack(fill="x", pady=5)
+        ctk.CTkButton(
+            bf, text="Apply", command=apply_,
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            bf, text="Cancel", command=popup.destroy,
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+
+    def clear_filters(self):
+        # Only clear the date filters from manual
+        to_remove = []
+        for c in self.filters:
+            if c in self.FILTERABLE:
+                to_remove.append(c)
+        for r in to_remove:
+            del self.filters[r]
+        # also uncheck the auto EndDate filter
+        self.auto_end_filter_var.set(False)
+        self.refresh_table()
+
+    def get_filtered_df(self) -> pd.DataFrame:
+        return self.apply_filters()
+
+
+# ----------------------------------------------------------------------------
+# ENHANCED PDF REPORT
+# ----------------------------------------------------------------------------
+class EnhancedPDFReport:
+    """
+    Professional PDF layout:
+    - 8.5x11 letter page
+    - Watermark top-right
+    - 2-page executive summary
+    - Each chart 16:9 ratio, centered on own page
+    - Timestamped output filename
+    """
+    def __init__(self, df_current: pd.DataFrame, df_history: pd.DataFrame, config: Dict):
+        self.df_current = df_current
+        self.df_history = df_history
+        self.config = config
+
+        self.colors = {
+            'primary': '#800020',
+            'secondary': '#2C3E50',
+            'text': '#2C1810',
+            'accent': '#4A90E2',
+            'background': '#FFFFFF'
+        }
+        self.CM_TO_INCH = 0.393701
+
+        self.PAGE_WIDTH = 8.5
+        self.PAGE_HEIGHT = 11
+        self.LOGO_X = self.PAGE_WIDTH - (1*self.CM_TO_INCH)
+        self.LOGO_Y = self.PAGE_HEIGHT - (1*self.CM_TO_INCH)
+        self.CHART_WIDTH = 6.4
+        self.CHART_HEIGHT = 3.6
+
+        self.logo_path = self.config["paths"].get("LOGO_PATH","images/company_logo.png")
+
+    def _stamp_logo(self, fig):
+        if not self.logo_path or not os.path.exists(self.logo_path):
+            return
+        try:
+            import matplotlib.image as mpimg
+            img = mpimg.imread(self.logo_path)
+            aspect_ratio = img.shape[0]/img.shape[1]
+            logo_width = 1.0
+            logo_height = logo_width*aspect_ratio
+            fig.figimage(
+                img,
+                xo=self.LOGO_X - logo_width,
+                yo=self.LOGO_Y - logo_height,
+                dpi=72,
+                alpha=0.15,
+                zorder=1
+            )
+        except Exception as e:
+            logging.error(f"Logo stamp error => {e}")
+
+    def _new_page(self):
+        fig= plt.figure(figsize=(self.PAGE_WIDTH,self.PAGE_HEIGHT))
+        fig.patch.set_facecolor(self.colors['background'])
+        plt.axis('off')
+        self._stamp_logo(fig)
+        return fig
+
+    def _get_output_path(self) -> Path:
+        base_path = self.config["paths"].get("PDF_EXPORT_PATH", "output/dashboard_report.pdf")
+        p = Path(base_path)
+        stamp= datetime.now().strftime("%Y%m%d_%H%M%S")
+        new_name= f"{p.stem}_{stamp}{p.suffix}"
+        final_path= p.with_name(new_name)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        return final_path
+
+    def _add_cover_page(self, pdf: PdfPages):
+        fig= self._new_page()
+        plt.text(0.5, 0.7, "Reconciliation Analysis Report",
+                 ha='center', fontsize=24, fontweight='bold',
+                 color=self.colors['primary'])
+        plt.text(0.5, 0.6, f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                 ha='center', fontsize=12, color=self.colors['text'])
+
+        plt.text(0.5, 0.1, "CONFIDENTIAL",
+                 ha='center', fontsize=9, color=self.colors['text'])
+        plt.text(0.5, 0.08, "Ultra-Mega Reconciliation System",
+                 ha='center', fontsize=9, color=self.colors['text'])
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    def _add_executive_summary_stats(self, pdf: PdfPages):
+        fig= self._new_page()
+        plt.text(0.5, 0.9, "Executive Summary - Statistics",
+                 ha='center', fontsize=20, fontweight='bold', color=self.colors['primary'])
+
+        if self.df_current.empty:
+            plt.text(0.5, 0.7, "No mismatches found in the current run.",
+                     ha='center', fontsize=14, color=self.colors['text'])
+        else:
+            total = len(self.df_current)
+            e_miss = (self.df_current["Status"]=="Missing in ERP").sum()
+            m_miss = (self.df_current["Status"]=="Missing in Master").sum()
+            both   = (self.df_current["Status"]=="Difference in both").sum()
+
+            plt.text(0.5, 0.7, f"Total Mismatches: {total:,}",
+                     ha='center', fontsize=16, color=self.colors['text'])
+            plt.text(0.5, 0.6, f"Missing in ERP: {e_miss:,}",
+                     ha='center', fontsize=16, color=self.colors['text'])
+            plt.text(0.5, 0.5, f"Missing in Master: {m_miss:,}",
+                     ha='center', fontsize=16, color=self.colors['text'])
+            plt.text(0.5, 0.4, f"Difference in both: {both:,}",
+                     ha='center', fontsize=16, color=self.colors['text'])
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    def _add_executive_summary_breakdowns(self, pdf: PdfPages):
+        fig= self._new_page()
+        plt.text(0.5, 0.9, "Executive Summary - Breakdowns",
+                 ha='center', fontsize=20, fontweight='bold', color=self.colors['primary'])
+
+        if not self.df_current.empty:
+            y_pos= 0.7
+            # top dims
+            if "Dimension" in self.df_current.columns:
+                top_dims = self.df_current["Dimension"].value_counts().head(10)
+                text = "Top Dimensions:\n\n" + "\n".join(
+                    f"• {dim}: {count:,} mismatches" for dim,count in top_dims.items()
+                )
+                plt.text(0.1, y_pos, text, fontsize=12, color=self.colors['text'])
+            
+            # top attrs
+            if "Attribute" in self.df_current.columns:
+                top_attrs= self.df_current["Attribute"].value_counts().head(10)
+                text= "Top Attributes:\n\n" + "\n".join(
+                    f"• {attr}: {count:,} mismatches" for attr,count in top_attrs.items()
+                )
+                plt.text(0.6, y_pos, text, fontsize=12, color=self.colors['text'])
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    def _add_chart_page(self, pdf: PdfPages, chart_func, title:str, **kwargs):
+        fig= self._new_page()
+        # center 16:9
+        ax= fig.add_axes([
+            (self.PAGE_WIDTH-self.CHART_WIDTH)/(2*self.PAGE_WIDTH),
+            (self.PAGE_HEIGHT-self.CHART_HEIGHT)/(2*self.PAGE_HEIGHT),
+            self.CHART_WIDTH/self.PAGE_WIDTH,
+            self.CHART_HEIGHT/self.PAGE_HEIGHT
+        ])
+        try:
+            chart_func(ax, **kwargs)
+            plt.text(0.5, 0.93, title,
+                     ha='center', fontsize=16, fontweight='bold',
+                     color=self.colors['primary'],
+                     transform=fig.transFigure)
+            pdf.savefig(fig)
+        except Exception as e:
+            logging.error(f"Chart error: {title} => {e}")
+        finally:
+            plt.close(fig)
+
+    def _plot_heatmap(self, ax, pivot):
+        im= ax.imshow(pivot, aspect='auto', cmap='Blues')
+        ax.set_xticks(range(len(pivot.columns)))
+        ax.set_xticklabels(pivot.columns, rotation=45, ha='right')
+        ax.set_yticks(range(len(pivot.index)))
+        ax.set_yticklabels(pivot.index)
+        plt.colorbar(im, ax=ax)
+        ax.set_title("")
+
+    def _add_all_charts(self, pdf: PdfPages):
+        dfc= self.df_current
+        if dfc.empty:
+            return
+
+        # 1) Heatmap example:
+        # pivot by (Dimension, Attribute) => freq of mismatches
+        if {"Dimension","Attribute"}.issubset(dfc.columns):
+            try:
+                pivot= dfc.groupby(["Dimension","Attribute"]).size().unstack(fill_value=0)
+                if not pivot.empty:
+                    self._add_chart_page(pdf, self._plot_heatmap, "Missing Items Heatmap", pivot=pivot)
+            except:
+                pass
+
+        # Additional charts could be added similarly
+
+    def generate(self) -> Path:
+        pdf_path= self._get_output_path()
+        with PdfPages(pdf_path) as pdf:
+            # cover
+            self._add_cover_page(pdf)
+            # summary stats
+            self._add_executive_summary_stats(pdf)
+            # summary breakdowns
+            self._add_executive_summary_breakdowns(pdf)
+            # charts
+            self._add_all_charts(pdf)
+        logging.info(f"Enhanced PDF => {pdf_path}")
+        return pdf_path
+
+
+# ----------------------------------------------------------------------------
+# ADVANCED DASHBOARD
+# ----------------------------------------------------------------------------
+class AdvancedDashboard(ctk.CTkFrame):
+    """
+    8 charts, dimension/attribute/time filter for "RunDate",
+    top_n toggle, no PDF button here (that's in Compare tab).
+    """
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.df_current = pd.DataFrame()
+        self.df_history = pd.DataFrame()
+        self.selected_dims: Set[str] = set()
+        self.selected_attrs: Set[str] = set()
+        self.top_n = 10
+
+        # top bar
+        self.topbar_scroll = ctk.CTkScrollableFrame(self, orientation="horizontal", height=60)
+        self.topbar_scroll.pack(fill="x", pady=5)
+
+        self.metric_label = ctk.CTkLabel(self.topbar_scroll, text="Metrics: 0 mismatches, 0 dimension", width=300)
+        self.metric_label.pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            self.topbar_scroll, text="Filter Dimension", command=self.show_dimension_filter,
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            self.topbar_scroll, text="Filter Attribute", command=self.show_attribute_filter,
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+
+        # quick date filters
+        ctk.CTkButton(
+            self.topbar_scroll, text="Last 7 Days", command=lambda: self.set_quick_range(7),
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            self.topbar_scroll, text="Last 30 Days", command=lambda: self.set_quick_range(30),
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            self.topbar_scroll, text="Last 90 Days", command=lambda: self.set_quick_range(90),
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            self.topbar_scroll, text="All Time", command=lambda: self.set_quick_range(9999),
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+
+        self.start_date_var = tk.StringVar(value=(datetime.now()-timedelta(days=30)).strftime("%Y-%m-%d"))
+        self.end_date_var   = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+
+        ctk.CTkEntry(self.topbar_scroll, textvariable=self.start_date_var,
+                     width=100, text_color="black").pack(side="left", padx=5)
+        ctk.CTkEntry(self.topbar_scroll, textvariable=self.end_date_var,
+                     width=100, text_color="black").pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            self.topbar_scroll, text="Update Timeline", command=self.update_data_filters,
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            self.topbar_scroll, text="Toggle Top 10 / All", command=self.toggle_top_n,
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
+
+        self.frames = {}
+        chart_names = ["Heatmap","Lollipop","Circular","Scatter","Radar","Normal Pie","Normal Bar","Band Chart"]
+        for lbl in chart_names:
+            fr = ctk.CTkFrame(self.notebook)
+            self.notebook.add(fr, text=lbl)
+            self.frames[lbl] = fr
+
+    def toggle_top_n(self):
+        if self.top_n == 10:
+            self.top_n = None
+        else:
+            self.top_n = 10
+        self.update_data_filters()
+
+    def set_quick_range(self, days: int):
+        if days>9000:
+            self.start_date_var.set("1900-01-01")
+            self.end_date_var.set("2100-12-31")
+        else:
+            dt_end = datetime.now()
+            dt_start = dt_end - timedelta(days=days)
+            self.start_date_var.set(dt_start.strftime("%Y-%m-%d"))
+            self.end_date_var.set(dt_end.strftime("%Y-%m-%d"))
+        self.update_data_filters()
+
+    def show_dimension_filter(self):
+        self.show_filter_popup("Dimension")
+
+    def show_attribute_filter(self):
+        self.show_filter_popup("Attribute")
+
+    def show_filter_popup(self, col: str):
+        base_df= self.df_history if not self.df_history.empty else self.df_current
+        if base_df.empty or col not in base_df.columns:
+            return
+        popup= tk.Toplevel(self)
+        popup.title(f"Filter: {col}")
+        popup.geometry("300x400")
+
+        frame= ctk.CTkFrame(popup)
+        frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        unique_vals= base_df[col].unique()
+        display_map={}
+        for v in unique_vals:
+            if pd.isna(v):
+                dsp= "(NaN)"
+            elif isinstance(v,str) and not v.strip():
+                dsp= "(blank)"
+            else:
+                dsp= str(v)
+            display_map[v]= dsp
+        sorted_vals= sorted(display_map.keys(), key=lambda x: display_map[x].lower())
+
+        if col=="Dimension":
+            curr = self.selected_dims
+        else:
+            curr = self.selected_attrs
+
+        if not curr:
+            curr = set(unique_vals)
+
+        selall_var= tk.BooleanVar(value=True)
+        def toggle_all():
+            check= selall_var.get()
+            for vb in var_dict.values():
+                vb.set(check)
+
+        ctk.CTkCheckBox(
+            frame, text="Select All", variable=selall_var, command=toggle_all,
+            fg_color="#800020", hover_color="#a52a2a", text_color="black"
+        ).pack(anchor="w", pady=5)
+
+        scroll= ctk.CTkScrollableFrame(frame, width=250, height=250)
+        scroll.pack(fill="both", expand=True, padx=5, pady=5)
+        var_dict={}
+        for rv in sorted_vals:
+            in_filter= rv in curr
+            bvar= tk.BooleanVar(value=in_filter)
+            var_dict[rv]= bvar
+            ctk.CTkCheckBox(
+                scroll, text=display_map[rv], variable=bvar,
+                fg_color="#800020", hover_color="#a52a2a", text_color="black"
+            ).pack(anchor="w")
+
+        def apply_():
+            sel= {rv for rv,vb in var_dict.items() if vb.get()}
+            if col=="Dimension":
+                self.selected_dims= sel
+            else:
+                self.selected_attrs= sel
+            popup.destroy()
+            self.update_data_filters()
+
+        bf= ctk.CTkFrame(frame)
+        bf.pack(fill="x", pady=5)
+        ctk.CTkButton(
+            bf, text="Apply", command=apply_,
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            bf, text="Cancel", command=popup.destroy,
+            fg_color="#800020", hover_color="#a52a2a", text_color="white"
+        ).pack(side="left", padx=5)
+
+    def update_data(self, df_current: pd.DataFrame, df_history: pd.DataFrame):
+        self.df_current= df_current.copy()
+        self.df_history= df_history.copy()
+        self.update_data_filters()
+
+    def update_data_filters(self):
+        dfc= self.df_current.copy()
+        if not dfc.empty:
+            # dimension/attribute filter
+            if self.selected_dims:
+                dfc= dfc[dfc["Dimension"].isin(self.selected_dims)]
+            if self.selected_attrs:
+                dfc= dfc[dfc["Attribute"].isin(self.selected_attrs)]
+
+            # date range filter if "RunDate" present
+            if "RunDate" in dfc.columns:
+                try:
+                    start= datetime.strptime(self.start_date_var.get(), "%Y-%m-%d")
+                    end= datetime.strptime(self.end_date_var.get(), "%Y-%m-%d")
+                    dfc["RunDate_dt"] = pd.to_datetime(dfc["RunDate"], errors="coerce")
+                    dfc= dfc[(dfc["RunDate_dt"]>= start) & (dfc["RunDate_dt"]<= end)]
+                except Exception as e:
+                    logging.error(f"Date filter error => {e}")
+
+        mism= len(dfc)
+        dims= dfc["Dimension"].nunique() if not dfc.empty and "Dimension" in dfc.columns else 0
+        self.metric_label.configure(text=f"Mismatches: {mism}, Dims: {dims}")
+
+        # (If we wanted to do a top_n logic, we could do that here.)
+
+
+
+# ----------------------------------------------------------------------------
+# MAIN APP
+# ----------------------------------------------------------------------------
+class MainApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Ultra-Mega Reconciliation: Param-based, Full Dashboard")
+        self.geometry("1600x900")
+        ctk.set_appearance_mode("light")
+
+        # Load config + param
+        self.config_dict = load_config(Path(DEFAULT_PATHS["CONFIG_PATH"]))
+        self.param_dict = read_param_file(
+            Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"]))
+        )
+
+        # We'll store meltdown (ERP / Master) so we can output them in the final Excel
+        self.melt_erp = pd.DataFrame()
+        self.melt_master = pd.DataFrame()
+
+        self.history_df = pd.DataFrame()
+
+        self.tabs = ttk.Notebook(self)
+        self.tabs.pack(fill="both", expand=True)
+
+        # 1) Paths Tab
+        self.tab_paths = ctk.CTkFrame(self.tabs)
+        self.tabs.add(self.tab_paths, text="Paths")
+        self.build_paths_tab(self.tab_paths)
+
+        # 2) ERP Preview
+        self.tab_erp = ctk.CTkFrame(self.tabs)
+        erp_filters= self.config_dict.get("erp_grid", {}).get("filters", {})
+        self.erp_preview= SimplePreview(self.tab_erp, "ERP", filters_dict=erp_filters)
+        self.erp_preview.pack(fill="both", expand=True)
+        self.tabs.add(self.tab_erp, text="ERP Preview")
+
+        # 3) Master Preview
+        self.tab_master = ctk.CTkFrame(self.tabs)
+        master_filters= self.config_dict.get("master_grid", {}).get("filters", {})
+        self.master_preview= SimplePreview(self.tab_master, "Master", filters_dict=master_filters)
+        self.master_preview.pack(fill="both", expand=True)
+        self.tabs.add(self.tab_master, text="Master Preview")
+
+        # 4) Compare
+        self.tab_compare= ctk.CTkFrame(self.tabs)
+        self.build_compare_tab(self.tab_compare)
+        self.tabs.add(self.tab_compare, text="Compare")
+
+        # 5) Dashboard
+        self.dashboard_tab= AdvancedDashboard(self.tabs)
+        self.tabs.add(self.dashboard_tab, text="Dashboard")
+
+        # Logging area
+        self.log_box= ctk.CTkTextbox(self, height=120)
+        self.log_box.pack(fill="both")
+        self.log_box.configure(state="disabled")
+        handler= TextHandler(self.log_box)
+        handler.setLevel(logging.INFO)
+        logging.getLogger().addHandler(handler)
+
+        # Master CSV dir
+        self.temp_csv_dir= Path(self.config_dict["paths"].get("MASTER_CSV_OUTPUT","temp_master_csv"))
+        self.temp_csv_dir.mkdir(parents=True, exist_ok=True)
+
+        # Automatic meltdown => preview
+        self.refresh_erp()
+        self.refresh_master()
+
+    def build_paths_tab(self, parent):
+        frm= ctk.CTkFrame(parent)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.erp_var= tk.StringVar(value=self.config_dict["paths"].get("ERP_EXCEL_PATH", DEFAULT_PATHS["ERP_EXCEL_PATH"]))
+        self.mast_var= tk.StringVar(value=self.config_dict["paths"].get("MASTER_ZIP_PATH", DEFAULT_PATHS["MASTER_ZIP_PATH"]))
+        self.exc_var= tk.StringVar(value=self.config_dict["paths"].get("EXCEPTION_PATH", DEFAULT_PATHS["EXCEPTION_PATH"]))
+        self.out_var= tk.StringVar(value=self.config_dict["paths"].get("OUTPUT_PATH", DEFAULT_PATHS["OUTPUT_PATH"]))
+        self.cfg_var= tk.StringVar(value=self.config_dict["paths"].get("CONFIG_PATH", DEFAULT_PATHS["CONFIG_PATH"]))
+        self.par_var= tk.StringVar(value=self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"]))
+        self.csv_var= tk.StringVar(value=self.config_dict["paths"].get("MASTER_CSV_OUTPUT", DEFAULT_PATHS["MASTER_CSV_OUTPUT"]))
+        self.pdf_var= tk.StringVar(value=self.config_dict["paths"].get("PDF_EXPORT_PATH", DEFAULT_PATHS["PDF_EXPORT_PATH"]))
+
+        def mkrow(lbl, var, is_dir=False):
+            rowf= ctk.CTkFrame(frm)
+            rowf.pack(fill="x", pady=5)
+            ctk.CTkLabel(rowf, text=lbl, width=180).pack(side="left", padx=5)
+            e= ctk.CTkEntry(rowf, textvariable=var, width=600)
+            e.pack(side="left", padx=5)
+
+            def br():
+                if is_dir:
+                    p= filedialog.askdirectory()
+                else:
+                    p= filedialog.askopenfilename()
+                if p:
+                    var.set(p)
+
+            ctk.CTkButton(rowf, text="Browse", command=br,
+                          fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+
+        mkrow("ERP Excel:", self.erp_var)
+        mkrow("Master ZIP:", self.mast_var)
+        mkrow("Exception Path:", self.exc_var)
+        mkrow("Missing Items Output:", self.out_var)
+        mkrow("JSON Config Path:", self.cfg_var)
+        mkrow("Parameter File:", self.par_var)
+        mkrow("Master CSV Folder:", self.csv_var, is_dir=True)
+        mkrow("PDF Export Path:", self.pdf_var, is_dir=False)
+
+        bf= ctk.CTkFrame(frm)
+        bf.pack(fill="x", pady=10)
+        ctk.CTkButton(bf, text="Save Config", command=self.save_all_config,
+                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+        ctk.CTkButton(bf, text="Refresh ERP", command=self.refresh_erp,
+                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+        ctk.CTkButton(bf, text="Refresh Master", command=self.refresh_master,
+                      fg_color="#800020", hover_color="#a52a2a").pack(side="left", padx=5)
+
+    def build_compare_tab(self, parent):
+        frm= ctk.CTkFrame(parent)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+        ctk.CTkLabel(frm, text="Generate Missing Items", font=("Arial",16)).pack(pady=5)
+        ctk.CTkButton(frm, text="Run Reconciliation", command=self.run_comparison,
+                      fg_color="#800020", hover_color="#a52a2a").pack(pady=10)
+
+        ctk.CTkButton(frm, text="Export PDF Report",
+                      command=self.export_pdf,
+                      fg_color="#800020", hover_color="#a52a2a").pack(pady=10)
+
+    def refresh_erp(self):
+        erp_path= Path(self.erp_var.get().strip())
+        raw_erp= read_erp_excel(erp_path)
+        if raw_erp.empty:
+            self.erp_preview.set_data(pd.DataFrame())
+            self.melt_erp = pd.DataFrame()
+            return
+        param= read_param_file(Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"])))
+        # meltdown
+        meltdown_erp = meltdown_erp_for_preview(raw_erp, param)
+        self.melt_erp = meltdown_erp.copy()  # store for final output
+        # pivot for preview
+        pivoted= pivot_for_preview(meltdown_erp)
+        self.erp_preview.set_data(pivoted)
+
+    def refresh_master(self):
+        zip_path= Path(self.mast_var.get().strip())
+        out_dir= Path(self.csv_var.get().strip())
+        csvs= convert_master_txt_to_csv(zip_path, out_dir)
+        raw_mast= unify_master_csvs(csvs)
+        if raw_mast.empty:
+            self.master_preview.set_data(pd.DataFrame())
+            self.melt_master = pd.DataFrame()
+            return
+        param= read_param_file(Path(self.config_dict["paths"].get("PARAMETER_PATH", DEFAULT_PATHS["PARAMETER_PATH"])))
+        meltdown_master = meltdown_master_for_preview(raw_mast, param)
+        self.melt_master = meltdown_master.copy()
+        pivoted= pivot_for_preview(meltdown_master)
+        self.master_preview.set_data(pivoted)
+
+    def run_comparison(self):
+        # get filtered pivots from UI
+        df_erp_wide= self.erp_preview.get_filtered_df()
+        df_mast_wide= self.master_preview.get_filtered_df()
+
+        # meltdown again => so each row is (Dimension, Name, Attribute, Value)
+        erp_long= melt_back(df_erp_wide)
+        erp_long= build_keys(erp_long)
+        mast_long= melt_back(df_mast_wide)
+        mast_long= build_keys(mast_long)
+
+        # compare
+        df_diff= compare_mode2(erp_long, mast_long)
+
+        # exceptions
+        exc_path= Path(self.exc_var.get().strip())
+        df_exc= read_exception_table(exc_path)
+        final= merge_exceptions(df_diff, df_exc)
+
+        # store run date
+        out_path= Path(self.out_var.get().strip())
+        run_date= datetime.now().strftime("%Y-%m-%d")
+        final["RunDate"] = run_date
+        if self.history_df.empty:
+            self.history_df= final.copy()
+        else:
+            self.history_df= pd.concat([self.history_df, final], ignore_index=True)
+
+        # push to dashboard
+        self.dashboard_tab.update_data(final, self.history_df)
+
+        # Write final excel (with meltdown extracts)
+        write_missing_items(final, self.melt_erp, self.melt_master, out_path)
+
+        messagebox.showinfo("Done", f"Missing items => {out_path}")
+
+    def export_pdf(self):
+        if self.history_df.empty:
+            messagebox.showinfo("PDF Export", "No mismatch data to export (history is empty).")
+            return
+
+        last_date= self.history_df["RunDate"].max()
+        df_current= self.history_df[self.history_df["RunDate"]==last_date].copy()
+        df_history= self.history_df.copy()
+
+        rep= EnhancedPDFReport(df_current, df_history, self.config_dict)
+        pdf_path= rep.generate()
+        messagebox.showinfo("PDF Export", f"PDF exported => {pdf_path}")
+
+    def save_all_config(self):
+        self.config_dict["paths"]["ERP_EXCEL_PATH"]    = self.erp_var.get().strip()
+        self.config_dict["paths"]["MASTER_ZIP_PATH"]   = self.mast_var.get().strip()
+        self.config_dict["paths"]["EXCEPTION_PATH"]    = self.exc_var.get().strip()
+        self.config_dict["paths"]["OUTPUT_PATH"]       = self.out_var.get().strip()
+        self.config_dict["paths"]["CONFIG_PATH"]       = self.cfg_var.get().strip()
+        self.config_dict["paths"]["PARAMETER_PATH"]    = self.par_var.get().strip()
+        self.config_dict["paths"]["MASTER_CSV_OUTPUT"] = self.csv_var.get().strip()
+        self.config_dict["paths"]["PDF_EXPORT_PATH"]   = self.pdf_var.get().strip()
+
+        # store ERP filters
+        self.config_dict.setdefault("erp_grid", {})
+        self.config_dict["erp_grid"]["filters"]= self.erp_preview.filters
+
+        # store Master filters
+        self.config_dict.setdefault("master_grid", {})
+        self.config_dict["master_grid"]["filters"]= self.master_preview.filters
+
+        save_config(self.config_dict, Path(self.config_dict["paths"]["CONFIG_PATH"]))
+        messagebox.showinfo("Saved", "Config (including date filters) saved successfully.")
+
+
+def main():
+    app= MainApp()
+    app.mainloop()
+
+if __name__=="__main__":
+    main()

@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 """
-Ultra-Mega Reconciliation - Full Script
- - Mismatch & CASE stored separately (two JSONs, two Bollinger JSONs).
- - 2-Sheet XLSX:
-    * "Mismatch" (burgundy+beige)
-    * "Case_Differences" (burgundy+beige)
- - 2 chart sheets:
-    * "Charts" => mismatch combos (dimension×attribute×status) + side-by-side bar charts
-    * "Case_Charts" => same combos + side-by-side bar charts for case
- - SHIFTED PDF with 8 distinct chart pages:
-    (Heatmap, Lollipop, Circular, Scatter, Radar, Pie, Bar, Bollinger)
- - Missing Name logic => if Master missing => copy ERP name into both 'Name' and 'Master'.
-   If ERP missing => copy Master name into both 'Name' and 'ERP'.
- - 'Trim Key?' => remove spaces from Key column.
- - 'Include CASE in Dashboard/PDF?' => merges mismatch + case for advanced dashboard & PDF.
+Ultra-Mega Reconciliation - Full Script with Param-based 'V_S_C' filtering
+ - Reads dimension/attribute settings from parameter file
+ - Filters ERP by 'V_S_C' in param["dim_erp_keep"]
+ - rename 'V_S_C' -> final dimension label, rename columns by param["attr_erp_map"]
+ - 2-Sheet XLSX => Mismatch + Case_Differences, plus Charts & Case_Charts
+ - SHIFTED PDF => 8 chart pages (Heatmap, Lollipop, Circular, Scatter, Radar, Pie, Bar, Bollinger)
+ - Name-first logic => if missing in Master => copy ERP's name, etc.
+ - 'Trim Key' => remove spaces from Key
+ - 'Include CASE' => unify mismatch + case for the advanced dashboard & PDF
 """
 
 import os
@@ -45,7 +40,6 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.chart import BarChart, Reference
-
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -87,7 +81,7 @@ def default_config() -> Dict:
 def load_config(path: Path) -> Dict:
     if path.is_file():
         try:
-            with open(path,"r",encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
             logging.warning(f"Could not load config => {e}")
@@ -96,22 +90,20 @@ def load_config(path: Path) -> Dict:
 def save_config(cfg: Dict, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        # sets->lists in erp_grid
         if "erp_grid" in cfg and "filters" in cfg["erp_grid"]:
-            new_erp={}
+            newf={}
             for col,svals in cfg["erp_grid"]["filters"].items():
-                new_erp[col]= list(svals)
-            cfg["erp_grid"]["filters"]= new_erp
+                newf[col]= list(svals)
+            cfg["erp_grid"]["filters"]= newf
 
-        # sets->lists in master_grid
         if "master_grid" in cfg and "filters" in cfg["master_grid"]:
-            new_m={}
+            newf={}
             for col,svals in cfg["master_grid"]["filters"].items():
-                new_m[col]= list(svals)
-            cfg["master_grid"]["filters"]= new_m
+                newf[col]= list(svals)
+            cfg["master_grid"]["filters"]= newf
 
         with open(path,"w",encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
+            json.dump(cfg,f,indent=2)
         logging.info(f"Saved config => {path}")
     except Exception as e:
         logging.error(f"Error saving config => {e}")
@@ -137,9 +129,22 @@ class TextHandler(logging.Handler):
 
 
 # ----------------------------------------------------------------------------
-# SAMPLE: read param, meltdown ERP, meltdown Master
+# READ PARAM
 # ----------------------------------------------------------------------------
-def read_param_file(path: Path)-> Dict[str,object]:
+def read_param_file(path: Path) -> Dict[str, object]:
+    """
+    Param file with 2 sheets:
+      - 'Dimension Parameters':
+          'FileName','V S C','Dimension','ERP Values'
+      - 'Attribute Parameters':
+          'ERP Original Attributes','Master Original Attributes','Attribute','On/Off'
+    We gather:
+      param["dim_erp_keep"] => which 'V_S_C' to keep from ERP
+      param["dim_erp_map"] => { vsc: final_dim }
+      param["dim_master_map"] => { filename: final_dim }
+      param["attr_erp_map"] => { ERPcol: final_attr }
+      param["attr_master_map"] => { MASTcol: final_attr }
+    """
     param= {
         "dim_erp_keep": set(),
         "dim_erp_map": {},
@@ -150,13 +155,50 @@ def read_param_file(path: Path)-> Dict[str,object]:
     if not path.is_file():
         logging.warning(f"Param => {path} not found.")
         return param
-    # Real usage => read from excel or so
-    return param
+    try:
+        dim_df= pd.read_excel(path, sheet_name="Dimension Parameters")
+        dim_df.columns= dim_df.columns.astype(str).str.strip()
+
+        def s(x)-> str:
+            return str(x).strip() if pd.notna(x) else ""
+
+        for _, row in dim_df.iterrows():
+            fn= s(row.get("FileName",""))
+            vsc= s(row.get("V S C",""))
+            dim= s(row.get("Dimension",""))
+            ev= s(row.get("ERP Values",""))
+            if ev.lower()=="x" and vsc and dim:
+                param["dim_erp_keep"].add(vsc)
+            if vsc and dim:
+                param["dim_erp_map"][vsc]= dim
+            if fn and dim and ev.lower()=="x":
+                param["dim_master_map"][fn]= dim
+
+        attr_df= pd.read_excel(path, sheet_name="Attribute Parameters")
+        attr_df.columns= attr_df.columns.astype(str).str.strip()
+        for _, row in attr_df.iterrows():
+            e_orig= s(row.get("ERP Original Attributes",""))
+            m_orig= s(row.get("Master Original Attributes",""))
+            final_= s(row.get("Attribute",""))
+            onoff= s(row.get("On/Off",""))
+            if onoff.lower()=="x" and final_:
+                if e_orig:
+                    param["attr_erp_map"][e_orig]= final_
+                if m_orig:
+                    param["attr_master_map"][m_orig]= final_
+        return param
+
+    except Exception as e:
+        logging.error(f"read_param_file => {e}")
+        return param
 
 
-def read_erp_excel(path: Path)-> pd.DataFrame:
+# ----------------------------------------------------------------------------
+# READ ERP => meltdown with V_S_C filter
+# ----------------------------------------------------------------------------
+def read_erp_excel(path: Path) -> pd.DataFrame:
     if not path.is_file():
-        logging.warning(f"ERP => {path} not found.")
+        logging.warning(f"ERP => not found => {path}")
         return pd.DataFrame()
     try:
         df= pd.read_excel(path, skiprows=3)
@@ -166,13 +208,77 @@ def read_erp_excel(path: Path)-> pd.DataFrame:
         logging.error(f"read_erp_excel => {e}")
         return pd.DataFrame()
 
+
+def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str, object]) -> pd.DataFrame:
+    if "V_S_C" not in df.columns:
+        logging.warning("ERP meltdown => 'V_S_C' missing => returning empty.")
+        return pd.DataFrame()
+
+    keep= param["dim_erp_keep"]   # which V_S_C to keep
+    dmap= param["dim_erp_map"]    # rename V_S_C => final dimension
+    amap= param["attr_erp_map"]   # rename column => final attribute
+
+    df2= df[df["V_S_C"].isin(keep)].copy()
+    if df2.empty:
+        return pd.DataFrame()
+
+    # We'll meltdown the result
+    skip_cols= {"V_S_C"}
+    id_vars= []
+    if "Value" in df2.columns:
+        id_vars.append("Value")
+        skip_cols.add("Value")
+
+    df2["DimRaw"]= df2["V_S_C"]
+    skip_cols.add("DimRaw")
+    id_vars.insert(0,"DimRaw")
+
+    meltdown_cols= [c for c in df2.columns if c not in skip_cols]
+    melted= df2.melt(
+        id_vars= id_vars,
+        value_vars= meltdown_cols,
+        var_name="OrigAttr",
+        value_name="ValX"
+    )
+
+    def rename_dim(v):
+        return dmap.get(v,v)
+    melted["Dimension"]= melted["DimRaw"].apply(rename_dim)
+
+    if "Value" in id_vars:
+        melted.rename(columns={"Value":"Name"}, inplace=True)
+    else:
+        melted["Name"]= ""
+
+    # filter to only the attributes we have mapped
+    melted= melted[melted["OrigAttr"].isin(amap.keys())].copy()
+    melted["Attribute"]= melted["OrigAttr"].map(amap)
+
+    # optionally handle date columns => strip T
+    def strip_t(x):
+        if isinstance(x,str) and "T" in x:
+            return x.split("T")[0]
+        return x
+
+    melted["Value"]= np.where(
+        melted["Attribute"].isin(["Start Date","End Date"]),
+        melted["ValX"].apply(strip_t),
+        melted["ValX"]
+    )
+    return melted[["Dimension","Name","Attribute","Value"]]
+
+
+# ----------------------------------------------------------------------------
+# READ MASTER => meltdown with param
+# ----------------------------------------------------------------------------
+import io
+
 def try_read_csv_bytes(raw: bytes)-> pd.DataFrame:
     encs= ["utf-8-sig","utf-16-le","utf-16-be","cp1252","latin-1","ascii"]
-    import io
-    for enc in encs:
+    for e in encs:
         try:
             buf= io.BytesIO(raw)
-            df= pd.read_csv(buf, encoding=enc, on_bad_lines="skip", engine="python")
+            df= pd.read_csv(buf, encoding=e, on_bad_lines="skip", engine="python")
             df.dropna(how="all", axis=0, inplace=True)
             df.dropna(how="all", axis=1, inplace=True)
             df.columns= df.columns.astype(str).str.strip()
@@ -182,24 +288,30 @@ def try_read_csv_bytes(raw: bytes)-> pd.DataFrame:
             return df
         except:
             pass
+    logging.error("All enc fail => empty DF")
     return pd.DataFrame()
 
 def unify_master_txt_in_folder(folder: Path)-> pd.DataFrame:
     if not folder.is_dir():
+        logging.warning(f"Master folder => not exist => {folder}")
         return pd.DataFrame()
     frames=[]
     for f in folder.glob("*.txt"):
-        raw= f.read_bytes()
-        df_= try_read_csv_bytes(raw)
-        if not df_.empty:
-            df_["RawFileName"]= f.name
-            frames.append(df_)
+        try:
+            raw= f.read_bytes()
+            df_= try_read_csv_bytes(raw)
+            if not df_.empty:
+                df_["RawFileName"]= f.name
+                frames.append(df_)
+        except Exception as e:
+            logging.error(f"unify_master_txt_in_folder => {f} => {e}")
     if frames:
         return pd.concat(frames, ignore_index=True)
     return pd.DataFrame()
 
 def convert_master_txt_to_csv(zip_path: Path, out_dir: Path)-> List[Path]:
     if not zip_path.is_file():
+        logging.warning(f"Master ZIP => not found => {zip_path}")
         return []
     if out_dir.exists():
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -211,53 +323,91 @@ def convert_master_txt_to_csv(zip_path: Path, out_dir: Path)-> List[Path]:
             bn= os.path.basename(txtf)
             if not bn:
                 continue
-            with z.open(txtf) as fo:
-                raw= fo.read()
-            df_= try_read_csv_bytes(raw)
-            if df_.empty:
-                continue
-            df_["RawFileName"]= bn
-            out_csv= out_dir/(bn.replace(".txt",".csv"))
-            df_.to_csv(out_csv, index=False, encoding="utf-8")
-            csvs.append(out_csv)
+            try:
+                with z.open(txtf) as fo:
+                    raw= fo.read()
+                df= try_read_csv_bytes(raw)
+                if df.empty:
+                    continue
+                df["RawFileName"]= bn
+                out_csv= out_dir/(bn.replace(".txt",".csv"))
+                df.to_csv(out_csv, index=False, encoding="utf-8")
+                csvs.append(out_csv)
+            except Exception as e:
+                logging.error(f"Reading {txtf} => {e}")
     return csvs
 
 def unify_master_csvs(csvs: List[Path])-> pd.DataFrame:
     frames=[]
     for cp in csvs:
-        if not cp.is_file():
-            continue
-        try:
-            df_= pd.read_csv(cp, encoding="utf-8", on_bad_lines="skip")
-            df_.columns= df_.columns.str.strip()
-            frames.append(df_)
-        except Exception as e:
-            logging.error(f"unify_master_csvs => {cp} => {e}")
+        if cp.is_file():
+            try:
+                df= pd.read_csv(cp, encoding="utf-8", on_bad_lines="skip")
+                df.columns= df.columns.str.strip()
+                frames.append(df)
+            except Exception as e:
+                logging.error(f"unify_master_csvs => {cp} => {e}")
     if frames:
         return pd.concat(frames, ignore_index=True)
     return pd.DataFrame()
 
-
-def meltdown_erp_for_preview(df: pd.DataFrame, param: Dict[str,object])-> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
-    out= df.copy()
-    # e.g. rename "V_S_C"->"Dimension","Value"->"Name"
-    if "V_S_C" in out.columns:
-        out.rename(columns={"V_S_C":"Dimension"}, inplace=True)
-    if "Value" in out.columns:
-        out.rename(columns={"Value":"Name"}, inplace=True)
-    return out
-
 def meltdown_master_for_preview(df: pd.DataFrame, param: Dict[str,object])-> pd.DataFrame:
     if df.empty or "RawFileName" not in df.columns:
         return pd.DataFrame()
-    out= df.copy()
-    out.rename(columns={"RawFileName":"Dimension"}, inplace=True)
-    return out
+    keep_map= param["dim_master_map"]  # rename RawFileName => dimension
+    amap= param["attr_master_map"]     # rename columns => final attribute
+
+    df2= df[df["RawFileName"].isin(keep_map.keys())].copy()
+    if df2.empty:
+        return pd.DataFrame()
+
+    df2["DimRaw"]= df2["RawFileName"]
+    skip_cols= {"RawFileName","DimRaw"}
+    id_vars= ["DimRaw"]
+    if "Name" in df2.columns:
+        id_vars.append("Name")
+        skip_cols.add("Name")
+
+    meltdown_cols= [c for c in df2.columns if c not in skip_cols]
+    melted= df2.melt(
+        id_vars=id_vars,
+        value_vars= meltdown_cols,
+        var_name="OrigAttr",
+        value_name="ValX"
+    )
+
+    def rename_dim(x):
+        return keep_map.get(x,x)
+    melted["Dimension"]= melted["DimRaw"].apply(rename_dim)
+
+    if "Name" in id_vars:
+        melted.rename(columns={"Name":"Name"}, inplace=True)
+    else:
+        melted["Name"]= ""
+
+    def strip_t(v):
+        if isinstance(v,str) and "T" in v:
+            return v.split("T")[0]
+        return v
+
+    melted= melted[melted["OrigAttr"].isin(amap.keys())].copy()
+    melted["Attribute"]= melted["OrigAttr"].map(amap)
+    melted["Value"]= np.where(
+        melted["Attribute"].isin(["Start Date","End Date"]),
+        melted["ValX"].apply(strip_t),
+        melted["ValX"]
+    )
+    return melted[["Dimension","Name","Attribute","Value"]]
+
 
 def pivot_for_preview(df: pd.DataFrame)-> pd.DataFrame:
-    return df.drop_duplicates()
+    if df.empty or not {"Dimension","Name","Attribute"}.issubset(df.columns):
+        return pd.DataFrame()
+    df2= df.drop_duplicates(subset=["Dimension","Name","Attribute"])
+    try:
+        return df2.pivot(index=["Dimension","Name"], columns="Attribute", values="Value").reset_index()
+    except:
+        return pd.DataFrame()
 
 def meltdown_to_long(df_wide: pd.DataFrame)-> pd.DataFrame:
     if df_wide.empty or {"Dimension","Name"}.difference(df_wide.columns):
@@ -274,16 +424,18 @@ def meltdown_to_long(df_wide: pd.DataFrame)-> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------
-# EXCEPTIONS
+# EXCEPTIONS => read + merge
 # ----------------------------------------------------------------------------
 def read_exception_table(path: Path)-> pd.DataFrame:
     if not path.is_file():
+        logging.warning(f"Exception => {path} not found")
         return pd.DataFrame()
     try:
         df= pd.read_excel(path)
         df.columns= df.columns.astype(str).str.strip()
         return df
-    except:
+    except Exception as e:
+        logging.error(f"Exception => {e}")
         return pd.DataFrame()
 
 def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame)-> pd.DataFrame:
@@ -313,7 +465,7 @@ def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame)-> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------
-# compare_name_first => missing => copy from other side's Name
+# compare_name_first => missing => copy name from other side
 # ----------------------------------------------------------------------------
 def compare_name_first(erp_long: pd.DataFrame,
                        mast_long: pd.DataFrame,
@@ -342,14 +494,13 @@ def compare_name_first(erp_long: pd.DataFrame,
         e_name= e_map.get("Name","")
         m_name= m_map.get("Name","")
 
-        name_issue=False
+        name_issue= False
 
+        # Missing in ERP => copy Master name into 'Name' + 'ERP'
         if dn not in e_dict and dn in m_dict:
-            # missing in ERP => copy Master name into both 'Name' + 'ERP'
             row= {
                 "Dimension": dim, "Name": nm, "Attribute":"Name",
-                "Master": m_name,
-                "ERP": m_name,  # fill
+                "Master": m_name, "ERP": m_name,  # copy
                 "Comments_1":"", "Comments_2":"",
                 "Status":"Missing in ERP"
             }
@@ -360,12 +511,11 @@ def compare_name_first(erp_long: pd.DataFrame,
             mismatch_rows.append(row)
             name_issue=True
 
+        # Missing in Master => copy ERP name
         elif dn in e_dict and dn not in m_dict:
-            # missing in Master => copy ERP name into both 'Name' + 'Master'
             row= {
                 "Dimension": dim, "Name": nm, "Attribute":"Name",
-                "Master": e_name,
-                "ERP": e_name,
+                "Master": e_name, "ERP": e_name,
                 "Comments_1":"", "Comments_2":"",
                 "Status":"Missing in Master"
             }
@@ -376,10 +526,11 @@ def compare_name_first(erp_long: pd.DataFrame,
             mismatch_rows.append(row)
             name_issue=True
 
+        # both => check if name differs
         elif e_name and m_name and e_name!= m_name:
             if e_name.lower()== m_name.lower():
                 row= {
-                    "Dimension": dim,"Name": nm,"Attribute":"Name",
+                    "Dimension": dim, "Name": nm, "Attribute":"Name",
                     "Master": m_name, "ERP": e_name,
                     "Comments_1":"", "Comments_2":"",
                     "Status":"CASE"
@@ -391,7 +542,7 @@ def compare_name_first(erp_long: pd.DataFrame,
                 case_rows.append(row)
             else:
                 row= {
-                    "Dimension": dim,"Name": nm,"Attribute":"Name",
+                    "Dimension": dim, "Name": nm, "Attribute":"Name",
                     "Master": m_name, "ERP": e_name,
                     "Comments_1":"", "Comments_2":"",
                     "Status":"Difference in both"
@@ -406,7 +557,7 @@ def compare_name_first(erp_long: pd.DataFrame,
         if name_issue:
             continue
 
-        # name matched => compare attributes
+        # name matched => compare other attributes
         all_atts= set(e_map.keys())| set(m_map.keys())
         all_atts.discard("Name")
         for at in all_atts:
@@ -414,8 +565,8 @@ def compare_name_first(erp_long: pd.DataFrame,
             mv= m_map.get(at,"")
             if ev.lower()== mv.lower() and ev!= mv and ev and mv:
                 row= {
-                    "Dimension": dim,"Name": nm,"Attribute":at,
-                    "Master": mv,"ERP": ev,
+                    "Dimension": dim, "Name": nm, "Attribute": at,
+                    "Master": mv, "ERP": ev,
                     "Comments_1":"", "Comments_2":"",
                     "Status":"CASE"
                 }
@@ -440,7 +591,7 @@ def compare_name_first(erp_long: pd.DataFrame,
                     ms= mv
                     es= ev
                 row= {
-                    "Dimension": dim,"Name": nm,"Attribute": at,
+                    "Dimension": dim, "Name": nm, "Attribute": at,
                     "Master": ms,"ERP": es,
                     "Comments_1":"", "Comments_2":"",
                     "Status": st
@@ -458,17 +609,11 @@ def compare_name_first(erp_long: pd.DataFrame,
 
 
 # ----------------------------------------------------------------------------
-# ENHANCED EXCEL => 2 data sheets + 2 chart sheets
+# 2-SHEET XLSX + 2 chart sheets
 # ----------------------------------------------------------------------------
 def write_enhanced_excel(mismatch_df: pd.DataFrame,
                          case_df: pd.DataFrame,
                          out_path: Path):
-    """
-    1) 'Mismatch' => burgundy+beige
-    2) 'Case_Differences' => burgundy+beige
-    3) 'Charts' => dimension/attribute/status combos for mismatch
-    4) 'Case_Charts' => dimension/attribute/status combos for case
-    """
     if mismatch_df.empty and case_df.empty:
         logging.info("No mismatches => skip writing xlsx.")
         return
@@ -493,11 +638,11 @@ def write_enhanced_excel(mismatch_df: pd.DataFrame,
     for rv in case_df[c_].itertuples(index=False):
         ws_c.append(rv)
 
-    # "Charts" => mismatch combos
+    # mismatch => "Charts"
     ws_ch= wb.create_sheet("Charts")
     create_granular_charts(ws_ch, mismatch_df, "Mismatch")
 
-    # "Case_Charts"
+    # case => "Case_Charts"
     ws_cc= wb.create_sheet("Case_Charts")
     create_granular_charts(ws_cc, case_df, "Case")
 
@@ -514,12 +659,10 @@ def write_enhanced_excel(mismatch_df: pd.DataFrame,
 
 
 def create_granular_charts(ws, df: pd.DataFrame, sheet_type: str):
-    """
-    dimension/attribute/status combos + side-by-side bar charts
-    """
     if df.empty:
         ws["A1"]= f"No {sheet_type} data."
         return
+
     # dimension => A1..B
     ws["A1"]= "Dimension"
     ws["B1"]= "Count"
@@ -556,7 +699,7 @@ def create_granular_charts(ws, df: pd.DataFrame, sheet_type: str):
         row_i+=1
     status_end= row_i-1
 
-    # combos => dimension x attribute => A12..C
+    # dimension×attribute => row=12 => A12..C
     ws["A12"]= f"Dimension x Attribute [{sheet_type}]"
     ws.merge_cells("A12:C12")
     ws["A13"]= "Dimension"
@@ -566,12 +709,12 @@ def create_granular_charts(ws, df: pd.DataFrame, sheet_type: str):
     dxa.sort_values(["Dimension","Count"], ascending=[True,False], inplace=True)
     r_=14
     for _, rowv in dxa.iterrows():
-        ws.cell(row=r_, column=1,value=rowv["Dimension"])
-        ws.cell(row=r_, column=2,value=rowv["Attribute"])
-        ws.cell(row=r_, column=3,value=rowv["Count"])
+        ws.cell(row=r_, column=1, value=rowv["Dimension"])
+        ws.cell(row=r_, column=2, value=rowv["Attribute"])
+        ws.cell(row=r_, column=3, value=rowv["Count"])
         r_+=1
 
-    # dimension x status => E12..G
+    # dimension×status => E12..G
     ws["E12"]= f"Dimension x Status [{sheet_type}]"
     ws.merge_cells("E12:G12")
     ws["E13"]= "Dimension"
@@ -581,12 +724,12 @@ def create_granular_charts(ws, df: pd.DataFrame, sheet_type: str):
     dxs.sort_values(["Dimension","Count"], ascending=[True,False], inplace=True)
     r_=14
     for _, rowv in dxs.iterrows():
-        ws.cell(row=r_, column=5,value=rowv["Dimension"])
-        ws.cell(row=r_, column=6,value=rowv["Status"])
-        ws.cell(row=r_, column=7,value=rowv["Count"])
+        ws.cell(row=r_, column=5, value=rowv["Dimension"])
+        ws.cell(row=r_, column=6, value=rowv["Status"])
+        ws.cell(row=r_, column=7, value=rowv["Count"])
         r_+=1
 
-    # attribute x status => I12..K
+    # attribute×status => I12..K
     ws["I12"]= f"Attribute x Status [{sheet_type}]"
     ws.merge_cells("I12:K12")
     ws["I13"]= "Attribute"
@@ -596,24 +739,25 @@ def create_granular_charts(ws, df: pd.DataFrame, sheet_type: str):
     axs.sort_values(["Attribute","Count"], ascending=[True,False], inplace=True)
     r_=14
     for _, rowv in axs.iterrows():
-        ws.cell(row=r_, column=9,value=rowv["Attribute"])
-        ws.cell(row=r_, column=10,value=rowv["Status"])
-        ws.cell(row=r_, column=11,value=rowv["Count"])
+        ws.cell(row=r_, column=9, value=rowv["Attribute"])
+        ws.cell(row=r_, column=10, value=rowv["Status"])
+        ws.cell(row=r_, column=11, value=rowv["Count"])
         r_+=1
 
-    # side-by-side bar charts => dimension, attribute, status
-    create_side_by_side_charts(ws, dcounts,(1,2), f"Dimension Dist [{sheet_type}]",
-                               acounts,(4,5), f"Attribute Dist [{sheet_type}]",
+    create_side_by_side_charts(ws,
+                               dcounts,(1,2),f"Dimension Dist [{sheet_type}]",
+                               acounts,(4,5),f"Attribute Dist [{sheet_type}]",
                                "N1")
-    create_side_by_side_charts(ws, scounts,(7,8), f"Status Dist [{sheet_type}]",
-                               None, None, None,
+    create_side_by_side_charts(ws,
+                               scounts,(7,8),f"Status Dist [{sheet_type}]",
+                               None,None,None,
                                "N7")
 
     style_granular_sheet(ws)
 
 def create_side_by_side_charts(ws,
-                               df1: pd.DataFrame, col_range1: Tuple[int,int], title1: str,
-                               df2: pd.DataFrame, col_range2: Tuple[int,int], title2: str,
+                               df1: pd.DataFrame, col_range1: Tuple[int,int], title1:str,
+                               df2: pd.DataFrame, col_range2: Tuple[int,int], title2:str,
                                anchor:str):
     from openpyxl.chart import BarChart
     if df1 is not None and not df1.empty:
@@ -623,8 +767,8 @@ def create_side_by_side_charts(ws,
         chart1.height= 10
         chart1.width= 12
 
-        start_row=2
-        end_row=1+ len(df1)
+        start_row= 2
+        end_row= 1 + len(df1)
         cstart,cend= col_range1
         data_ref= Reference(ws, min_col=cend, max_col=cend, min_row=start_row, max_row=end_row)
         cats_ref= Reference(ws, min_col=cstart, max_col=cstart, min_row=start_row, max_row=end_row)
@@ -639,8 +783,8 @@ def create_side_by_side_charts(ws,
         chart2.height= 10
         chart2.width= 12
 
-        start_row=2
-        end_row=1+ len(df2)
+        start_row= 2
+        end_row= 1 + len(df2)
         cstart2,cend2= col_range2
         data_ref2= Reference(ws, min_col=cend2, max_col=cend2, min_row=start_row, max_row=end_row)
         cats_ref2= Reference(ws, min_col=cstart2, max_col=cstart2, min_row=start_row, max_row=end_row)
@@ -653,11 +797,12 @@ def style_granular_sheet(ws):
     max_c= ws.max_column
     for col in ws.columns:
         let= col[0].column_letter
-        ml=0
+        ml= 0
         for c_ in col:
             val= str(c_.value) if c_.value else ""
             ml= max(ml,len(val))
         ws.column_dimensions[let].width= ml+4
+
 
 def style_data_sheet(ws):
     burgundy= PatternFill(start_color="800020", end_color="800020", fill_type="solid")
@@ -673,13 +818,11 @@ def style_data_sheet(ws):
     max_r= ws.max_row
     max_c= ws.max_column
     if max_r>0:
-        # header => row1 => burgundy
         for cell in ws[1]:
             cell.fill= burgundy
             cell.font= white_font
             cell.alignment= Alignment(horizontal="center", vertical="center")
             cell.border= thin_border
-        # data => row2..end => beige
         for rr in range(2, max_r+1):
             for cc in range(1, max_c+1):
                 c_= ws.cell(rr,cc)
@@ -709,14 +852,14 @@ def style_data_sheet(ws):
 
 
 # ----------------------------------------------------------------------------
-# SHIFTED PDF => 8 charts
+# SHIFTED PDF => 8 distinct chart pages
 # ----------------------------------------------------------------------------
 class EnhancedPDFReport:
     def __init__(self, df_current: pd.DataFrame, df_history: pd.DataFrame, config: Dict):
         self.df_current= df_current
         self.df_history= df_history
         self.config= config
-        self.page_count= 0
+        self.page_count=0
         self.colors= {
             "primary":"#800020",
             "text":"#2C1810",
@@ -783,7 +926,7 @@ class EnhancedPDFReport:
         y=0.75
         if self.df_current.empty:
             plt.text(0.5,y,"No mismatches/case found.",
-                     ha="center", fontsize=14, color=self.colors["text"], transform=fig.transFigure)
+                     ha="center",fontsize=14,color=self.colors["text"],transform=fig.transFigure)
         else:
             tot= len(self.df_current)
             c_erp= (self.df_current["Status"]=="Missing in ERP").sum()
@@ -802,10 +945,11 @@ class EnhancedPDFReport:
         pdf.savefig(fig)
         plt.close(fig)
 
-    def _chart_page(self,pdf: PdfPages, title:str, plot_func, **kwargs):
+    def _chart_page(self,pdf: PdfPages, title: str, plot_func, **kwargs):
         fig= self._new_page()
         fig.suptitle(title, fontsize=14, fontweight="bold", color=self.colors["primary"], y=0.93)
-        ax= fig.add_axes([0.30, 0.2, 0.65, 0.55])  # SHIFT ~1 inch left
+        # SHIFT ~1" left
+        ax= fig.add_axes([0.30,0.2,0.65,0.55])
         try:
             plot_func(ax, **kwargs)
             pdf.savefig(fig)
@@ -824,39 +968,32 @@ class EnhancedPDFReport:
             pivot= df_m.groupby(["Dimension","Attribute"]).size().unstack(fill_value=0)
             if not pivot.empty:
                 self._chart_page(pdf,"Heatmap", self._plot_heatmap, pivot=pivot)
-
         # 2) Lollipop
         cdim= df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False).head(10)
         if not cdim.empty:
             self._chart_page(pdf,"Lollipop", self._plot_lollipop, cdim=cdim)
-
         # 3) Circular
         cattr= df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
         if not cattr.empty:
             self._chart_page(pdf,"Circular", self._plot_circular, cattr=cattr)
-
         # 4) Scatter
         cdim_sc= df_m.groupby("Dimension")["Key"].count().reset_index(name="Count")
-        cdim_sc.sort_values("Count", ascending=False, inplace=True)
+        cdim_sc.sort_values("Count", ascending=False,inplace=True)
         cdim_sc= cdim_sc.head(10)
         if not cdim_sc.empty:
             self._chart_page(pdf,"Scatter", self._plot_scatter, cdim=cdim_sc)
-
         # 5) Radar
         cdim_ra= df_m.groupby("Dimension")["Key"].count().sort_values(ascending=False).head(10)
         if not cdim_ra.empty and len(cdim_ra)>1:
             self._chart_page(pdf,"Radar", self._plot_radar, cdim=cdim_ra)
-
         # 6) Pie
         dist= df_m["Status"].value_counts()
         if not dist.empty:
             self._chart_page(pdf,"Pie: Status distribution", self._plot_pie, dist=dist)
-
         # 7) Bar
         cattr_b= df_m.groupby("Attribute")["Key"].count().sort_values(ascending=False).head(10)
         if not cattr_b.empty:
             self._chart_page(pdf,"Bar: Missing attributes", self._plot_bar, cattr=cattr_b)
-
         # 8) Bollinger
         if not self.df_history.empty and "RunDate" in self.df_history.columns:
             date_ct= self.df_history.groupby("RunDate")["Key"].count().reset_index(name="Count")
@@ -864,7 +1001,6 @@ class EnhancedPDFReport:
             if not date_ct.empty:
                 self._chart_page(pdf,"Bollinger Over Time", self._plot_bollinger, date_ct=date_ct)
 
-    # chart funcs
     def _plot_heatmap(self, ax, pivot):
         im= ax.imshow(pivot,aspect="auto",cmap="Reds")
         ax.set_xticks(range(len(pivot.columns)))
@@ -895,7 +1031,7 @@ class EnhancedPDFReport:
         labs= cdim["Dimension"].values
         ax.scatter(xvals,yvals,color="green")
         for i, la in enumerate(labs):
-            ax.text(xvals[i], yvals[i], la, ha="center", va="bottom", rotation=60, fontsize=8)
+            ax.text(xvals[i],yvals[i], la,ha="center",va="bottom",rotation=60,fontsize=8)
         ax.set_xticks([])
         ax.set_ylabel("Count")
         ax.set_title("Scatter Chart")
@@ -909,7 +1045,7 @@ class EnhancedPDFReport:
         ax.set_theta_offset(np.pi/2)
         ax.set_theta_direction(-1)
         ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(cat, fontsize=8)
+        ax.set_xticklabels(cat,fontsize=8)
         ax.plot(angles,val,color="red",linewidth=2)
         ax.fill(angles,val,color="red",alpha=0.3)
         ax.set_title("Radar Chart")
@@ -921,12 +1057,12 @@ class EnhancedPDFReport:
     def _plot_bar(self, ax, cattr):
         bars= ax.bar(range(len(cattr)), cattr.values, color="blue")
         ax.set_xticks(range(len(cattr)))
-        ax.set_xticklabels(cattr.index,rotation=45,ha="right",fontsize=8)
+        ax.set_xticklabels(cattr.index, rotation=45, ha="right", fontsize=8)
         ax.set_ylabel("Count")
         ax.set_title("Bar Chart")
         for b in bars:
             h= b.get_height()
-            ax.text(b.get_x()+ b.get_width()/2., h, str(int(h)), ha="center", va="bottom")
+            ax.text(b.get_x()+b.get_width()/2., h, str(int(h)), ha="center", va="bottom")
 
     def _plot_bollinger(self, ax, date_ct):
         date_ct["RunDate_dt"]= pd.to_datetime(date_ct["RunDate"], errors="coerce")
@@ -950,7 +1086,7 @@ class EnhancedPDFReport:
 
 
 # ----------------------------------------------------------------------------
-# SIMPLE PREVIEW => FUTURE END DATE
+# SIMPLE PREVIEW => future end date
 # ----------------------------------------------------------------------------
 class SimplePreview(ctk.CTkFrame):
     FILTERABLE= {"Start Date","End Date"}
@@ -1183,6 +1319,7 @@ class SimplePreview(ctk.CTkFrame):
             del self.filters[d]
         self.future_var.set(False)
         self.refresh_table()
+
 
 
 # ----------------------------------------------------------------------------

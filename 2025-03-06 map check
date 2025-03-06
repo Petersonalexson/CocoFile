@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+
+import pandas as pd
+from pathlib import Path
+
+def find_unmapped_accounts(
+    xrp_path: str,
+    mapping_path: str,
+    account_col_xrp: str = "Account",
+    account_col_map: str = "Account",
+    desc2_col_map: str = "Description2",
+    out_xlsx: str = "unmapped_accounts.xlsx",
+) -> None:
+    """
+    Reads two files:
+      1) xrp_path => the XRP file with a list of accounts
+      2) mapping_path => the mapping file that maps accounts to a 'Description2'
+    
+    Then identifies which XRP accounts:
+      - are NOT present in the mapping file, OR
+      - are in the mapping file but have a blank/NaN 'Description2'
+    
+    Exports them to a new Excel file with a sheet "Unmapped_Accounts".
+    
+    :param xrp_path: Path to the XRP file (Excel, CSV, etc.)
+    :param mapping_path: Path to the mapping file (Excel, CSV, etc.)
+    :param account_col_xrp: Column name in XRP data for the account code
+    :param account_col_map: Column name in Mapping data for the account code
+    :param desc2_col_map: Column name in Mapping data for the 'Description 2'
+    :param out_xlsx: Path to output Excel file
+    """
+
+    # -------------------------------
+    # 1) LOAD DATA
+    # -------------------------------
+    # Here we assume both are Excel files. Adjust to read_csv if needed.
+    # Also, you can specify sheet_name if your Excel has multiple sheets.
+    xrp_df = pd.read_excel(xrp_path)
+    map_df = pd.read_excel(mapping_path)
+
+    # Clean up columns: strip whitespace from column names, if desired
+    xrp_df.columns = xrp_df.columns.str.strip()
+    map_df.columns = map_df.columns.str.strip()
+
+    # Also standardize column names for merging, if you wish:
+    # e.g. rename them to 'Account' on both sides:
+    xrp_df.rename(columns={account_col_xrp: "Account"}, inplace=True)
+    map_df.rename(columns={account_col_map: "Account", desc2_col_map: "Description2"}, inplace=True)
+
+    # -------------------------------
+    # 2) MERGE XRP + MAPPING
+    # -------------------------------
+    # We'll do a LEFT JOIN from the XRP table to see if there's a matching record in the mapping
+    merged = xrp_df.merge(map_df, on="Account", how="left", suffixes=("", "_map"))
+
+    # -------------------------------
+    # 3) IDENTIFY UNMAPPED
+    # -------------------------------
+    # "Unmapped" means either the account was not found in mapping (Description2 is NaN)
+    # or it was found, but the 'Description2' field is blank/NaN.
+    cond_unmapped = merged["Description2"].isna() | (merged["Description2"] == "")
+
+    # Create a DataFrame with only these unmapped rows
+    unmapped_df = merged[cond_unmapped].copy()
+
+    # If you like, you can keep only certain columns in the output
+    # For example, let's keep everything from the original xrp_df plus the matched "Description2"
+    # (You could also keep the entire 'merged' with all columns if you prefer.)
+    # For demonstration, let's keep everything, but you can filter down:
+    # unmapped_df = unmapped_df[xrp_df.columns.to_list() + ["Description2"]]
+
+    # -------------------------------
+    # 4) EXPORT TO NEW SHEET
+    # -------------------------------
+    # If you just want a single Excel file with only the "Unmapped_Accounts" sheet, do:
+    if unmapped_df.empty:
+        print("No unmapped accounts found!")
+    else:
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+            # Create a sheet called "Unmapped_Accounts"
+            unmapped_df.to_excel(writer, sheet_name="Unmapped_Accounts", index=False)
+
+        print(f"Unmapped accounts => {out_xlsx} (sheet: Unmapped_Accounts)")
+
+
+if __name__ == "__main__":
+    # Adjust the below paths/parameters to match your environment:
+    xrp_file = "data/XRP_Accounts.xlsx"
+    mapping_file = "data/AccountMapping.xlsx"
+
+    # Run the function
+    find_unmapped_accounts(
+        xrp_path=xrp_file,
+        mapping_path=mapping_file,
+        account_col_xrp="Account",       # Column name in the XRP data with the account code
+        account_col_map="Account",       # Column in the mapping that has the account code
+        desc2_col_map="Description2",    # Column in the mapping with 'Description2'
+        out_xlsx="unmapped_accounts.xlsx"
+    )

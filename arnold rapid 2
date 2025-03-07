@@ -1,0 +1,194 @@
+import logging
+import pandas as pd
+import warnings
+from openpyxl import load_workbook
+from openpyxl.comments import Comment
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Suppress openpyxl user warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+# -----------------------------------------------------------------------------
+# 1. File paths and sheet names (adjust these to match your setup)
+# -----------------------------------------------------------------------------
+BANI_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\BANI.xlsx"
+XRP_SHEET = "XRP"
+
+ARNOLD_SHEET_NAME = "Arnold"
+SYLV_SHEET_NAME   = "Sylv"
+
+# We'll also produce a new Excel with aggregator results:
+AGGREGATION_REPORT_PATH = r"C:\Users\alexp\OneDrive\Desktop\Aggregation_Report.xlsx"
+
+# -----------------------------------------------------------------------------
+# 2. Load the XRP data from BANI.xlsx
+#    We'll keep columns: "XO Number", "Voice", "Amount".
+# -----------------------------------------------------------------------------
+logging.info("Loading XRP data from BANI.xlsx...")
+xrp_df = pd.read_excel(BANI_FILE_PATH, sheet_name=XRP_SHEET)
+
+needed_columns = ["XO Number", "Voice", "Amount"]
+xrp_df = xrp_df[needed_columns]
+
+# Convert columns to consistent types
+xrp_df["XO Number"] = xrp_df["XO Number"].astype(str).str.strip().replace(["nan", "None"], "")
+xrp_df["Voice"]     = xrp_df["Voice"].astype(str).str.strip().replace(["nan", "None"], "")
+xrp_df["Amount"]    = xrp_df["Amount"].astype(float)
+
+logging.info(f"Loaded {len(xrp_df)} rows from XRP sheet.")
+
+# -----------------------------------------------------------------------------
+# 3. Forward-fill XO Number if:
+#    - Current row's XO Number is blank
+#    - Current row's Voice == last row's Voice
+# -----------------------------------------------------------------------------
+
+resolved_xo_numbers = []
+last_xo_num = ""
+last_voice  = ""
+
+for i, row in xrp_df.iterrows():
+    xo_num = row["XO Number"]
+    voice  = row["Voice"]
+    
+    if xo_num:  # If XO Number is not blank
+        # Use it, update last_xo_num and last_voice
+        last_xo_num = xo_num
+        last_voice  = voice
+        resolved_xo_numbers.append(xo_num)
+    else:
+        # xo_num is blank
+        if voice and (voice == last_voice):
+            # Forward-fill from the previous row
+            resolved_xo_numbers.append(last_xo_num)
+        else:
+            # No fill, keep it blank
+            resolved_xo_numbers.append("")
+            last_xo_num = ""
+            last_voice  = ""
+
+# Add a column "Resolved XO Number"
+xrp_df["Resolved XO Number"] = resolved_xo_numbers
+
+# -----------------------------------------------------------------------------
+# 4. Aggregate by "Resolved XO Number", summing "Amount"
+#    Exclude blank XO Numbers.
+# -----------------------------------------------------------------------------
+grouped = (
+    xrp_df[xrp_df["Resolved XO Number"] != ""]
+    .groupby("Resolved XO Number", dropna=False)["Amount"]
+    .sum()
+    .reset_index()
+)
+
+# Build the aggregator dictionary: { xo_num: total_amount }
+aggregator = {}
+for _, row in grouped.iterrows():
+    r_xo = row["Resolved XO Number"]
+    r_amt = row["Amount"]
+    aggregator[r_xo] = r_amt
+
+logging.info(f"Built aggregator with {len(aggregator)} XO Number(s).")
+
+# -----------------------------------------------------------------------------
+# 5. Create a new Excel with the aggregator results
+# -----------------------------------------------------------------------------
+logging.info(f"Creating aggregation report at '{AGGREGATION_REPORT_PATH}'...")
+
+report_df = grouped.copy()
+report_df.rename(columns={"Resolved XO Number": "XO Number", "Amount": "Total Amount"}, inplace=True)
+
+# Sort by XO Number (optional)
+report_df.sort_values(by=["XO Number"], inplace=True)
+
+report_df.to_excel(AGGREGATION_REPORT_PATH, sheet_name="Aggregation", index=False)
+logging.info("Aggregation report saved.")
+
+# -----------------------------------------------------------------------------
+# 6. Update the "Arnold" and "Sylv" sheets in BANI.xlsx
+# -----------------------------------------------------------------------------
+wb = load_workbook(BANI_FILE_PATH)
+
+# 6a. ARNOLD
+if ARNOLD_SHEET_NAME in wb.sheetnames:
+    logging.info(f"Updating sheet '{ARNOLD_SHEET_NAME}' ...")
+    ws_arnold = wb[ARNOLD_SHEET_NAME]
+
+    # Hard-coded columns for Arnold
+    col_xo_number  = 5   # E
+    col_actual_jan = 17  # Q
+    start_row_arnold = 56
+    max_row_arnold   = ws_arnold.max_row
+
+    for r in range(start_row_arnold, max_row_arnold + 1):
+        val_num = ws_arnold.cell(row=r, column=col_xo_number).value
+        xo_num = str(val_num).strip() if val_num else ""
+
+        if not xo_num:
+            continue
+
+        if xo_num in aggregator:
+            sum_val = aggregator[xo_num]
+
+            target_cell = ws_arnold.cell(row=r, column=col_actual_jan)
+            target_cell.value = sum_val
+
+            # Clear old comment if any
+            if target_cell.comment:
+                target_cell.comment = None
+
+            target_cell.comment = Comment("Updated by script", "Script")
+
+            logging.info(f"[Arnold] Row {r} (XO Number='{xo_num}') => {sum_val}")
+        else:
+            logging.debug(f"[Arnold] Row {r} (XO Number='{xo_num}') not in aggregator.")
+else:
+    logging.info(f"Sheet '{ARNOLD_SHEET_NAME}' not found; skipping.")
+
+# 6b. SYLV
+if SYLV_SHEET_NAME in wb.sheetnames:
+    logging.info(f"Updating sheet '{SYLV_SHEET_NAME}' ...")
+    ws_sylv = wb[SYLV_SHEET_NAME]
+
+    # Hard-coded columns for Sylv
+    col_xo_number  = 2   # B
+    col_feb_actual = 16  # P
+    start_row_sylv = 22
+    max_row_sylv   = ws_sylv.max_row
+
+    for r in range(start_row_sylv, max_row_sylv + 1):
+        val_num = ws_sylv.cell(row=r, column=col_xo_number).value
+        xo_num = str(val_num).strip() if val_num else ""
+
+        if not xo_num:
+            continue
+
+        if xo_num in aggregator:
+            sum_val = aggregator[xo_num]
+
+            target_cell = ws_sylv.cell(row=r, column=col_feb_actual)
+            target_cell.value = sum_val
+
+            if target_cell.comment:
+                target_cell.comment = None
+
+            target_cell.comment = Comment("Updated by script", "Script")
+
+            logging.info(f"[Sylv] Row {r} (XO Number='{xo_num}') => {sum_val}")
+        else:
+            logging.debug(f"[Sylv] Row {r} (XO Number='{xo_num}') not in aggregator.")
+else:
+    logging.info(f"Sheet '{SYLV_SHEET_NAME}' not found; skipping.")
+
+# -----------------------------------------------------------------------------
+# 7. Save the workbook
+# -----------------------------------------------------------------------------
+logging.info("Saving updates to BANI workbook...")
+wb.save(BANI_FILE_PATH)
+wb.close()
+logging.info("Done. All updates saved.")

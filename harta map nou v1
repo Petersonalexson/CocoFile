@@ -1,0 +1,90 @@
+import logging
+import pandas as pd
+import warnings
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+# Suppress common user warnings about data validation, etc.
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+# -----------------------------------------------------------------------------
+# 1. Setup Logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# -----------------------------------------------------------------------------
+# 2. File Paths (Update for your setup)
+# -----------------------------------------------------------------------------
+MAP_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\MAP.xlsx"
+BANI_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\BANI.xlsx"
+
+MAPPING_SHEET = "Mapping Main"
+XRP_SHEET = "XRP"
+UNMAPPED_SHEET_NAME = "Unmapped_Accounts"  # or whatever name you prefer
+
+# -----------------------------------------------------------------------------
+# 3. Load Mapping (MAP.xlsx)
+#    We'll assume 'Account' is the column that holds valid mapped accounts
+# -----------------------------------------------------------------------------
+logging.info("Loading mapping data...")
+map_df = pd.read_excel(MAP_FILE_PATH, sheet_name=MAPPING_SHEET)
+
+# Drop rows with no 'Account', then ensure 'Account' is a string (if you use str matching)
+map_df = map_df.dropna(subset=["Account"])
+map_df["Account"] = map_df["Account"].astype(str).str.strip()
+
+# Build a set of mapped accounts
+mapped_accounts = set(map_df["Account"].unique())
+logging.info(f"Found {len(mapped_accounts)} mapped account(s) in {MAP_FILE_PATH}.")
+
+# -----------------------------------------------------------------------------
+# 4. Load BANI (XRP) data
+# -----------------------------------------------------------------------------
+logging.info(f"Loading XRP data from {BANI_FILE_PATH}...")
+bani_df = pd.read_excel(BANI_FILE_PATH, sheet_name=XRP_SHEET)
+
+# We’ll assume 'Nat Cont' is the column containing the account references
+# Convert Nat Cont to string for matching
+bani_df["Nat Cont"] = bani_df["Nat Cont"].astype(str).str.strip()
+
+# -----------------------------------------------------------------------------
+# 5. Identify Unmapped Rows
+# -----------------------------------------------------------------------------
+unmapped_df = bani_df[~bani_df["Nat Cont"].isin(mapped_accounts)]
+
+if unmapped_df.empty:
+    logging.info("No unmapped accounts found. Nothing else to do.")
+else:
+    logging.info(f"Found {len(unmapped_df)} unmapped row(s). We will create a new sheet '{UNMAPPED_SHEET_NAME}'.")
+
+    # -----------------------------------------------------------------------------
+    # 6. Create or Overwrite the "Unmapped_Accounts" sheet in BANI.xlsx
+    #    We'll use openpyxl to open BANI.xlsx, remove the old sheet (if it exists),
+    #    then create a fresh one, and write unmapped_df to it.
+    # -----------------------------------------------------------------------------
+    wb = load_workbook(BANI_FILE_PATH)
+
+    # If a sheet with that name already exists, remove it to avoid duplicates
+    if UNMAPPED_SHEET_NAME in wb.sheetnames:
+        std = wb[UNMAPPED_SHEET_NAME]
+        wb.remove(std)
+
+    # Create a new sheet
+    ws_unmapped = wb.create_sheet(UNMAPPED_SHEET_NAME)
+
+    # Write the unmapped_df using dataframe_to_rows
+    # Include headers
+    rows = dataframe_to_rows(unmapped_df, index=False, header=True)
+
+    for row_data in rows:
+        ws_unmapped.append(row_data)
+
+    # Save changes
+    wb.save(BANI_FILE_PATH)
+    wb.close()
+    logging.info(f"Unmapped rows written to new sheet '{UNMAPPED_SHEET_NAME}' in {BANI_FILE_PATH}.")
+
+logging.info("Done.")

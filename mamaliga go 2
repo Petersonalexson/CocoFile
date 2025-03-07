@@ -6,14 +6,12 @@ Ultra-Mega Reconciliation - Full Script with Param-based 'V_S_C' filtering
  - rename 'V_S_C' -> final dimension label, rename columns by param["attr_erp_map"]
  - 2-Sheet XLSX => Mismatch + Case_Differences
  - Additional "Mismatch_Charts" sheet => 3 charts (by dimension/attribute/status)
- - "CorrelationMatrix" sheet => correlation table of numeric-encoded categories
+ - "CorrelationMatrix" sheet => correlation table from numeric-encoded categories
  - SHIFTED PDF => 8 chart pages (Heatmap, Lollipop, Circular, Scatter, Radar, Pie, Bar, Bollinger w/ Candlesticks)
  - Name-first logic => if missing in Master => blank Master + ERP name; if missing in ERP => blank ERP + Master name
- - Postprocess => fill the missing name from the other side in the final Excel
+ - Postprocess => fill the missing name from the “Name” column into Master/ERP in the final Excel
  - 'Trim Key' => remove spaces from Key
  - 'Include CASE' => unify mismatch + case for the advanced dashboard & PDF
-
-Now with a `demo_run` function at the bottom, so you can test it without the UI.
 """
 
 import os
@@ -48,6 +46,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.chart import BarChart, Reference
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
 
 # ----------------------------------------------------------------------------
 # DEFAULT CONFIG
@@ -452,7 +451,7 @@ def merge_exceptions(df: pd.DataFrame, df_exc: pd.DataFrame)-> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------
-# compare_name_first => revised to leave blank for missing side, so postprocess can fill
+# compare_name_first => if missing in Master => Master blank, ERP name
 # ----------------------------------------------------------------------------
 def compare_name_first(erp_long: pd.DataFrame,
                        mast_long: pd.DataFrame,
@@ -553,6 +552,7 @@ def compare_name_first(erp_long: pd.DataFrame,
             ev= e_map.get(at,"")
             mv= m_map.get(at,"")
             if ev.lower()== mv.lower() and ev!= mv and ev and mv:
+                # same spelled differently => CASE
                 row= {
                     "Dimension": dim, "Name": nm, "Attribute": at,
                     "Master": mv, "ERP": ev,
@@ -598,47 +598,47 @@ def compare_name_first(erp_long: pd.DataFrame,
 
 
 # ----------------------------------------------------------------------------
-# EXCEL: mismatch, case, mismatch_charts, correlation
+# EXCEL => mismatch, case, mismatch_charts, correlation
 # ----------------------------------------------------------------------------
 def style_data_sheet(ws):
     burgundy= PatternFill(start_color="800020", end_color="800020", fill_type="solid")
     beige= PatternFill(start_color="F5DEB3", end_color="F5DEB3", fill_type="solid")
     white_font= Font(color="FFFFFF", bold=True)
+    dark_font= Font(color="2C1810")
     thin_border= Border(
         left=Side(style='thin', color='2C1810'),
         right=Side(style='thin', color='2C1810'),
         top=Side(style='thin', color='2C1810'),
         bottom=Side(style='thin', color='2C1810')
     )
-    ws.freeze_panes= "A2"
-
     max_r= ws.max_row
     max_c= ws.max_column
     if max_r>0:
-        # header row
+        # style header
         for cell in ws[1]:
             cell.fill= burgundy
             cell.font= white_font
             cell.alignment= Alignment(horizontal="center", vertical="center")
             cell.border= thin_border
-
         # data rows
         for rr in range(2, max_r+1):
             for cc in range(1, max_c+1):
                 c_= ws.cell(rr,cc)
                 c_.fill= beige
+                c_.font= dark_font
                 c_.border= thin_border
+                c_.alignment= Alignment(horizontal="left", vertical="center")
 
-        # adjust column widths
-        for col in ws.columns:
-            let= col[0].column_letter
-            ml=0
-            for c_ in col:
-                val= str(c_.value) if c_.value else ""
-                ml= max(ml,len(val))
-            ws.column_dimensions[let].width= ml+4
+    for col in ws.columns:
+        let= col[0].column_letter
+        ml=0
+        for c_ in col:
+            val= str(c_.value) if c_.value else ""
+            ml= max(ml,len(val))
+        ws.column_dimensions[let].width= ml+4
+    ws.freeze_panes= "A2"
 
-        # table
+    if max_r>1:
         ref= f"A1:{get_column_letter(max_c)}{max_r}"
         tbl= Table(displayName=f"{ws.title}Table", ref=ref)
         st= TableStyleInfo(name="TableStyleMedium9",
@@ -752,7 +752,11 @@ def write_enhanced_excel(mismatch_df: pd.DataFrame,
                          case_df: pd.DataFrame,
                          out_path: Path):
     """
-    Excel file => Mismatch, Case_Differences, Mismatch_Charts, CorrelationMatrix
+    Creates an Excel with:
+      - "Mismatch" sheet
+      - "Case_Differences" sheet
+      - "Mismatch_Charts" sheet
+      - "CorrelationMatrix" sheet
     """
     if mismatch_df.empty and case_df.empty:
         logging.info("No mismatches => skip writing xlsx.")
@@ -797,7 +801,7 @@ def write_enhanced_excel(mismatch_df: pd.DataFrame,
 
 
 # ----------------------------------------------------------------------------
-# PDF SHIFTED => 8 charts, with candlestick Bollinger
+# SHIFTED PDF => 8 charts, candlestick Bollinger
 # ----------------------------------------------------------------------------
 class EnhancedPDFReport:
     def __init__(self, df_current: pd.DataFrame, df_history: pd.DataFrame, config: Dict):
@@ -1009,10 +1013,14 @@ class EnhancedPDFReport:
             ax.text(b.get_x()+b.get_width()/2., h, str(int(h)), ha="center", va="bottom")
 
     def _plot_bollinger(self, ax, date_ct):
+        """
+        Perform candlestick logic: open=previous row's rolling_mean, close=this row's rolling_mean,
+        high= upper_band, low= lower_band. Then also show actual mismatch Count in blue dots.
+        """
         date_ct["RunDate_dt"]= pd.to_datetime(date_ct["RunDate"], errors="coerce")
         date_ct.sort_values("RunDate_dt", inplace=True)
         date_ct.reset_index(drop=True, inplace=True)
-        # compute rolling stats
+
         date_ct["rolling_mean"]= date_ct["Count"].rolling(3,min_periods=1).mean()
         date_ct["rolling_std"]= date_ct["Count"].rolling(3,min_periods=1).std(ddof=0)
         date_ct["upper_band"]= date_ct["rolling_mean"]+2*date_ct["rolling_std"]
@@ -1955,7 +1963,7 @@ class MainApp(ctk.CTk):
         outp= Path(self.config_dict["paths"].get("OUTPUT_PATH","output/missing_items.xlsx"))
         write_enhanced_excel(mismatch_df, case_df, outp)
 
-        # Post-process => fill name
+        # Post-process => copy from "Name" column if "Missing in Master"/"Missing in ERP"
         self._postprocess_missing_items(outp)
 
         run_ts= datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2008,10 +2016,9 @@ class MainApp(ctk.CTk):
 
     def _postprocess_missing_items(self, out_path: Path):
         """
-        After writing missing_items.xlsx, reopen it and for any row in Mismatch:
-          if Attribute=='Name' and Status=='Missing in Master': copy ERP -> Master
-          if Attribute=='Name' and Status=='Missing in ERP': copy Master -> ERP
-        Then re-save.
+        After writing missing_items.xlsx, reopen "Mismatch" sheet and:
+          - If Status=='Missing in Master' and Attribute=='Name': copy the row's 'Name' column -> Master
+          - If Status=='Missing in ERP' and Attribute=='Name': copy the row's 'Name' column -> ERP
         """
         if not out_path.is_file():
             return
@@ -2019,17 +2026,22 @@ class MainApp(ctk.CTk):
         if "Mismatch" not in wb.sheetnames:
             return
         ws= wb["Mismatch"]
-        # The columns: Key,Dimension,Name,Attribute,Master,ERP,Comments_1,Comments_2,Status
-        # Indices (0-based):   0     1       2     3       4     5      6          7      8
+        # columns: Key,Dimension,Name,Attribute,Master,ERP,Comments_1,Comments_2,Status
+        # indexes:  0,   1,       2,   3,        4,      5,   6,        7,          8
         for row_cells in ws.iter_rows(min_row=2, values_only=False):
-            attr = row_cells[3].value
-            mast = row_cells[4].value
-            erp = row_cells[5].value
-            stat = row_cells[8].value
-            if attr == "Name" and stat == "Missing in Master":
-                row_cells[4].value = erp
-            elif attr == "Name" and stat == "Missing in ERP":
-                row_cells[5].value = mast
+            name_val= row_cells[2].value  # from "Name" col
+            attr    = row_cells[3].value
+            mast    = row_cells[4].value
+            erp     = row_cells[5].value
+            status  = row_cells[8].value
+
+            if attr=="Name" and status=="Missing in Master":
+                # copy "Name" => Master
+                row_cells[4].value = name_val
+            elif attr=="Name" and status=="Missing in ERP":
+                # copy "Name" => ERP
+                row_cells[5].value = name_val
+
         wb.save(out_path)
         logging.info("Post-processed missing_items.xlsx => name-filling done.")
 
@@ -2126,3 +2138,7 @@ class MainApp(ctk.CTk):
 def main():
     app= MainApp()
     app.mainloop()
+
+
+if __name__=="__main__":
+    main()

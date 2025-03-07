@@ -1,0 +1,252 @@
+import logging
+import pandas as pd
+import warnings
+from openpyxl import load_workbook
+from openpyxl.comments import Comment
+
+# Suppress openpyxl user warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+# -----------------------------------------------------------------------------
+# 1. Logging Setup
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# -----------------------------------------------------------------------------
+# 2. File Paths & Sheet Names (Adjust to match your environment)
+# -----------------------------------------------------------------------------
+MAP_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\MAP.xlsx"
+BANI_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\BANI.xlsx"
+REPORT_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\Aggregated_Report.xlsx"
+
+MAPPING_SHEET = "Mapping Main"
+XRP_SHEET = "XRP"
+
+ARNOLD_DESC2 = "Arnold"  # Used to filter mapping for Arnold accounts
+SYLV_DESC2   = "Sylv"    # Used to filter mapping for Sylv accounts
+
+ARNOLD_SHEET_NAME = "Arnold"  # In BANI.xlsx
+SYLV_SHEET_NAME   = "Sylv"    # In BANI.xlsx
+
+# -----------------------------------------------------------------------------
+# 3. Load the Mapping (MAP.xlsx)
+# -----------------------------------------------------------------------------
+logging.info("Loading mapping data...")
+map_df = pd.read_excel(MAP_FILE_PATH, sheet_name=MAPPING_SHEET)
+
+# Drop rows where 'Account' is missing
+map_df = map_df.dropna(subset=["Account"])
+
+# Convert to string (so that we can match string-based 'Nat Cont' in BANI data)
+map_df["Account"] = map_df["Account"].astype(str).str.strip()
+
+# Also ensure 'Description 2' is string
+map_df["Description 2"] = map_df["Description 2"].astype(str).str.strip()
+
+# -----------------------------------------------------------------------------
+# 4. Load BANI (XRP) data
+# -----------------------------------------------------------------------------
+logging.info("Loading BANI (XRP) data from sheet '%s'...", XRP_SHEET)
+bani_df = pd.read_excel(BANI_FILE_PATH, sheet_name=XRP_SHEET)
+
+# We assume these columns exist: "Nat Cont", "Centru" (XO CC), "Quantitate", "Num" (XO number)
+needed_columns = ["Nat Cont", "Centru", "Quantitate", "Num"]
+bani_df = bani_df[needed_columns].dropna(subset=["Nat Cont", "Centru", "Quantitate"])
+
+# Convert each column to appropriate type
+bani_df["Nat Cont"]    = bani_df["Nat Cont"].astype(str).str.strip()
+bani_df["Centru"]      = bani_df["Centru"].astype(str).str.strip()
+bani_df["Quantitate"]  = bani_df["Quantitate"].astype(float)
+bani_df["Num"]         = bani_df["Num"].fillna("").astype(str).str.strip()
+
+# -----------------------------------------------------------------------------
+# 5. Build Aggregators for Arnold and Sylv
+# -----------------------------------------------------------------------------
+def build_aggregator(desc2_value):
+    """
+    1) Filter map_df by 'Description 2' == desc2_value.
+    2) Collect its 'Account' values into a set.
+    3) Filter bani_df for those accounts in 'Nat Cont'.
+    4) Group by (Centru, Num), sum 'Quantitate'.
+    5) Return a dict {(xo_cc, xo_num): total_quantitate}.
+    """
+    subset_map = map_df[map_df["Description 2"] == desc2_value]
+    if subset_map.empty:
+        logging.warning(f"No mapping rows found for '{desc2_value}'. Returning empty aggregator.")
+        return {}
+    
+    # Extract the accounts for that group
+    accounts = set(subset_map["Account"].unique())
+    
+    # Filter BANI
+    filtered_bani = bani_df[bani_df["Nat Cont"].isin(accounts)]
+    if filtered_bani.empty:
+        logging.info(f"No rows in BANI match accounts for '{desc2_value}'.")
+        return {}
+    
+    # Aggregate
+    grouped = filtered_bani.groupby(["Centru", "Num"], dropna=False)["Quantitate"].sum().reset_index()
+    
+    # Build dict
+    lookup = {}
+    for _, row in grouped.iterrows():
+        c = row["Centru"]  # XO CC
+        n = row["Num"]     # XO Number
+        q = row["Quantitate"]
+        lookup[(c, n)] = q
+    
+    logging.info(f"Built aggregator for '{desc2_value}' with {len(lookup)} item(s).")
+    return lookup
+
+logging.info("Building Arnold aggregator...")
+arnold_lookup = build_aggregator(ARNOLD_DESC2)
+
+logging.info("Building Sylv aggregator...")
+sylv_lookup   = build_aggregator(SYLV_DESC2)
+
+if not arnold_lookup and not sylv_lookup:
+    logging.info("No aggregator data for Arnold or Sylv. Exiting.")
+    exit()
+
+# -----------------------------------------------------------------------------
+# 6. Before Updating BANI, create a new Excel with a table of aggregated values
+# -----------------------------------------------------------------------------
+logging.info(f"Creating an aggregated report: {REPORT_FILE_PATH}")
+
+rows_report = []
+columns_report = ["Description2", "XO CC", "XO Number", "Sum Quantitate"]
+
+# Convert Arnold aggregator to rows
+for (xo_cc, xo_num), total in arnold_lookup.items():
+    rows_report.append([ARNOLD_DESC2, xo_cc, xo_num, total])
+
+# Convert Sylv aggregator to rows
+for (xo_cc, xo_num), total in sylv_lookup.items():
+    rows_report.append([SYLV_DESC2, xo_cc, xo_num, total])
+
+# Build a DataFrame
+report_df = pd.DataFrame(rows_report, columns=columns_report)
+
+# Sort it by Description2, then XO CC, XO Number (optional)
+report_df.sort_values(by=["Description2", "XO CC", "XO Number"], inplace=True)
+
+# Write to a new Excel file
+report_df.to_excel(REPORT_FILE_PATH, sheet_name="Aggregated", index=False)
+logging.info(f"Report saved to {REPORT_FILE_PATH}")
+
+# -----------------------------------------------------------------------------
+# 7. Open BANI workbook to update "Arnold" and "Sylv" sheets
+# -----------------------------------------------------------------------------
+wb = load_workbook(BANI_FILE_PATH)
+
+# -----------------------------------------------------------------------------
+# 8. Update ARNOLD sheet
+#    - XO CC:    col A (1)
+#    - XO Number:col E (5)
+#    - Actual Jan: col Q (17)
+#    - Headers in row 54 & 55 merged, data from row 56 onward
+# -----------------------------------------------------------------------------
+if ARNOLD_SHEET_NAME in wb.sheetnames and arnold_lookup:
+    logging.info(f"Updating sheet '{ARNOLD_SHEET_NAME}' for Arnold data...")
+    ws_arnold = wb[ARNOLD_SHEET_NAME]
+
+    col_xo_cc       = 1   # A
+    col_xo_number   = 5   # E
+    col_actual_jan  = 17  # Q
+
+    start_row = 56
+    max_row = ws_arnold.max_row
+
+    for r in range(start_row, max_row + 1):
+        # Read XO CC
+        val_cc = ws_arnold.cell(row=r, column=col_xo_cc).value
+        xo_cc = str(val_cc).strip() if val_cc else ""
+
+        # Read XO Number
+        val_num = ws_arnold.cell(row=r, column=col_xo_number).value
+        xo_num = str(val_num).strip() if val_num else ""
+
+        if not xo_cc and not xo_num:
+            # blank row, skip
+            continue
+
+        key = (xo_cc, xo_num)
+        if key in arnold_lookup:
+            sum_val = arnold_lookup[key]
+            cell_actual = ws_arnold.cell(row=r, column=col_actual_jan)
+
+            # Overwrite
+            cell_actual.value = sum_val
+
+            # Clear old comment if any
+            if cell_actual.comment:
+                cell_actual.comment = None
+
+            # Add comment
+            cell_actual.comment = Comment("Updated by script", "Script")
+
+            logging.info(f"[Arnold] Row {r} (XO CC='{xo_cc}', XO Number='{xo_num}') -> {sum_val}")
+        else:
+            logging.debug(f"[Arnold] Row {r} (XO CC='{xo_cc}', XO Number='{xo_num}') not in aggregator.")
+else:
+    logging.info(f"No updates for sheet '{ARNOLD_SHEET_NAME}' (not found or aggregator empty).")
+
+# -----------------------------------------------------------------------------
+# 9. Update SYLV sheet
+#    - XO Number: col B (2)
+#    - XO CC:     col C (3)
+#    - Feb Actual: col P (16)
+#    - Headers in row 21, data starts row 22
+# -----------------------------------------------------------------------------
+if SYLV_SHEET_NAME in wb.sheetnames and sylv_lookup:
+    logging.info(f"Updating sheet '{SYLV_SHEET_NAME}' for Sylv data...")
+    ws_sylv = wb[SYLV_SHEET_NAME]
+
+    col_xo_number  = 2  # B
+    col_xo_cc      = 3  # C
+    col_feb_actual = 16 # P
+
+    start_row = 22
+    max_row = ws_sylv.max_row
+
+    for r in range(start_row, max_row + 1):
+        val_num = ws_sylv.cell(row=r, column=col_xo_number).value
+        val_cc  = ws_sylv.cell(row=r, column=col_xo_cc).value
+
+        xo_num = str(val_num).strip() if val_num else ""
+        xo_cc  = str(val_cc).strip()  if val_cc  else ""
+
+        if not xo_num and not xo_cc:
+            continue
+
+        key = (xo_cc, xo_num)
+        if key in sylv_lookup:
+            sum_val = sylv_lookup[key]
+            cell_feb = ws_sylv.cell(row=r, column=col_feb_actual)
+
+            # Overwrite
+            cell_feb.value = sum_val
+
+            # Remove old comment
+            if cell_feb.comment:
+                cell_feb.comment = None
+
+            # Add new comment
+            cell_feb.comment = Comment("Updated by script", "Script")
+
+            logging.info(f"[Sylv] Row {r} (XO CC='{xo_cc}', XO Number='{xo_num}') -> {sum_val}")
+        else:
+            logging.debug(f"[Sylv] Row {r} (XO CC='{xo_cc}', XO Number='{xo_num}') not in aggregator.")
+else:
+    logging.info(f"No updates for sheet '{SYLV_SHEET_NAME}' (not found or aggregator empty).")
+
+# -----------------------------------------------------------------------------
+# 10. Save the workbook
+# -----------------------------------------------------------------------------
+logging.info("Saving updates to BANI workbook...")
+wb.save(BANI_FILE_PATH)
+wb.close()
+logging.info("Done. All updates saved.")

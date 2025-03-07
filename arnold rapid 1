@@ -1,0 +1,194 @@
+import logging
+import pandas as pd
+import warnings
+from openpyxl import load_workbook
+from openpyxl.comments import Comment
+
+# -----------------------------------------------------------------------------
+# 1. Setup logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Suppress openpyxl user warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+# -----------------------------------------------------------------------------
+# 2. File paths and sheet names
+#    Adjust for your actual environment.
+# -----------------------------------------------------------------------------
+BANI_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\BANI.xlsx"
+XRP_SHEET = "XRP"
+
+# We will update two sheets in BANI.xlsx:
+ARNOLD_SHEET_NAME = "Arnold"
+SYLV_SHEET_NAME   = "Sylv"
+
+# -----------------------------------------------------------------------------
+# 3. Load BANI (XRP) data
+#    We only care about columns: "XO Number", "Voice", "Amount".
+# -----------------------------------------------------------------------------
+logging.info("Reading BANI (XRP) data...")
+xrp_df = pd.read_excel(BANI_FILE_PATH, sheet_name=XRP_SHEET)
+
+# Keep only the relevant columns
+needed_cols = ["XO Number", "Voice", "Amount"]
+xrp_df = xrp_df[needed_cols]
+
+# Convert to appropriate types / strip strings
+xrp_df["XO Number"] = xrp_df["XO Number"].astype(str)
+xrp_df["Voice"]     = xrp_df["Voice"].astype(str)
+xrp_df["Amount"]    = xrp_df["Amount"].astype(float)
+
+# Note: it's common to see "nan" or "" if original cell was empty,
+# so let's unify truly blank XO Number as "" for easier checks
+xrp_df["XO Number"] = xrp_df["XO Number"].replace(["nan", "None"], "")
+
+# -----------------------------------------------------------------------------
+# 4. Forward-fill the XO Number for rows that have the SAME "Voice"
+#    as the previous row, but no XO Number.
+# -----------------------------------------------------------------------------
+
+# We'll iterate row by row. If row's "XO Number" is blank,
+# and row's "Voice" == last_voice, we fill XO Number with last_xo_num.
+last_xo_num = ""
+last_voice  = ""
+
+resolved_xo_numbers = []
+for i, row in xrp_df.iterrows():
+    xo_num = row["XO Number"].strip()
+    voice  = row["Voice"].strip()
+    amt    = row["Amount"]
+    
+    if xo_num:  # if not blank
+        # This row explicitly has an XO Number
+        last_xo_num = xo_num
+        last_voice  = voice
+        resolved_xo_numbers.append(xo_num)
+    else:
+        # XO Number is blank
+        # If the voice is the same as the last row's voice, reuse last_xo_num
+        if voice and (voice == last_voice):
+            resolved_xo_numbers.append(last_xo_num)
+        else:
+            # Otherwise, we have no XO Number to fill, keep blank
+            resolved_xo_numbers.append("")
+            # Reset last_xo_num, last_voice so we don't forward-fill further
+            last_xo_num = ""
+            last_voice  = ""
+
+# Add a new column "Resolved XO Number"
+xrp_df["Resolved XO Number"] = resolved_xo_numbers
+
+# -----------------------------------------------------------------------------
+# 5. Group by "Resolved XO Number", sum "Amount"
+#    That means all rows that share the same final XO Number get lumped together.
+# -----------------------------------------------------------------------------
+grouped = (
+    xrp_df
+    .groupby("Resolved XO Number", dropna=False)["Amount"]
+    .sum()
+    .reset_index()
+)
+
+# We'll build a dict {xo_number: sum_amount}
+aggregator = {}
+for _, row in grouped.iterrows():
+    r_xo = row["Resolved XO Number"]
+    r_amt = row["Amount"]
+    if r_xo:  # skip truly blank XO Number
+        aggregator[r_xo] = r_amt
+
+logging.info(f"Built aggregator with {len(aggregator)} XO Number(s).")
+
+# -----------------------------------------------------------------------------
+# 6. Open the BANI workbook in openpyxl and update the "Arnold" and "Sylv" sheets
+#    According to your described columns:
+#    Arnold: XO Number = col E (5), Actual Jan in col Q (17), rows 56+
+#    Sylv:   XO Number = col B (2), Feb Actual in col P (16), rows 22+
+# -----------------------------------------------------------------------------
+wb = load_workbook(BANI_FILE_PATH)
+
+# 6a) Update "Arnold" sheet
+if ARNOLD_SHEET_NAME in wb.sheetnames:
+    logging.info(f"Updating sheet '{ARNOLD_SHEET_NAME}' by XO Number only...")
+    ws_arnold = wb[ARNOLD_SHEET_NAME]
+
+    col_xo_number   = 5   # E
+    col_actual_jan  = 17  # Q
+    start_row_arnold = 56
+    max_row_arnold   = ws_arnold.max_row
+
+    for r in range(start_row_arnold, max_row_arnold + 1):
+        val_num = ws_arnold.cell(row=r, column=col_xo_number).value
+        xo_num = str(val_num).strip() if val_num else ""
+
+        if not xo_num:
+            continue  # blank, skip
+
+        if xo_num in aggregator:
+            sum_val = aggregator[xo_num]
+            target_cell = ws_arnold.cell(row=r, column=col_actual_jan)
+            
+            # Overwrite
+            target_cell.value = sum_val
+
+            # Clear old comment
+            if target_cell.comment:
+                target_cell.comment = None
+            
+            # Add new comment
+            target_cell.comment = Comment("Updated by script", "Script")
+
+            logging.info(f"[Arnold] Row {r}, XO Number='{xo_num}' => {sum_val}")
+        else:
+            logging.debug(f"[Arnold] Row {r}, XO Number='{xo_num}' not in aggregator.")
+else:
+    logging.info(f"Sheet '{ARNOLD_SHEET_NAME}' not found in workbook; skipping.")
+
+# 6b) Update "Sylv" sheet
+if SYLV_SHEET_NAME in wb.sheetnames:
+    logging.info(f"Updating sheet '{SYLV_SHEET_NAME}' by XO Number only...")
+    ws_sylv = wb[SYLV_SHEET_NAME]
+
+    col_xo_number = 2   # B
+    col_feb_actual = 16 # P
+    start_row_sylv = 22
+    max_row_sylv   = ws_sylv.max_row
+
+    for r in range(start_row_sylv, max_row_sylv + 1):
+        val_num = ws_sylv.cell(row=r, column=col_xo_number).value
+        xo_num = str(val_num).strip() if val_num else ""
+
+        if not xo_num:
+            continue  # blank, skip
+
+        if xo_num in aggregator:
+            sum_val = aggregator[xo_num]
+            target_cell = ws_sylv.cell(row=r, column=col_feb_actual)
+
+            # Overwrite
+            target_cell.value = sum_val
+
+            # Remove old comment if any
+            if target_cell.comment:
+                target_cell.comment = None
+
+            # Add new comment
+            target_cell.comment = Comment("Updated by script", "Script")
+
+            logging.info(f"[Sylv] Row {r}, XO Number='{xo_num}' => {sum_val}")
+        else:
+            logging.debug(f"[Sylv] Row {r}, XO Number='{xo_num}' not in aggregator.")
+else:
+    logging.info(f"Sheet '{SYLV_SHEET_NAME}' not found in workbook; skipping.")
+
+# -----------------------------------------------------------------------------
+# 7. Save the updated workbook
+# -----------------------------------------------------------------------------
+logging.info("Saving updates to BANI workbook...")
+wb.save(BANI_FILE_PATH)
+wb.close()
+logging.info("Done. All updates saved.")

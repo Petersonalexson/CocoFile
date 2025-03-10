@@ -1,0 +1,244 @@
+import logging
+import pandas as pd
+import warnings
+from openpyxl import load_workbook
+from openpyxl.comments import Comment
+
+# -----------------------------------------------------------------------------
+# 1. Setup Logging and Warnings
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+# -----------------------------------------------------------------------------
+# 2. File Paths and Sheet Names (Adjust as needed)
+# -----------------------------------------------------------------------------
+MAP_FILE_PATH  = r"C:\Users\alexp\OneDrive\Desktop\MAP.xlsx"
+BANI_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\BANI.xlsx"
+
+MAPPING_SHEET       = "Mapping Main"
+XRP_SHEET           = "XRP"
+COPYWRITE_SHEET_NAME= "Copywrite"
+
+AGGREGATED_FILE     = r"C:\Users\alexp\OneDrive\Desktop\Aggregated_Copywrite.xlsx"
+
+# -----------------------------------------------------------------------------
+# 3. Load Mapping, Filter for "Copywrite" Accounts
+# -----------------------------------------------------------------------------
+logging.info("Loading mapping data from MAP.xlsx...")
+map_df = pd.read_excel(MAP_FILE_PATH, sheet_name=MAPPING_SHEET)
+
+# Drop rows missing 'Account'
+map_df = map_df.dropna(subset=["Account"])
+
+# Convert 'Account' to string
+map_df["Account"] = map_df["Account"].astype(str).str.strip()
+map_df["Description 2"] = map_df["Description 2"].astype(str).str.strip()
+
+# Keep only rows with 'Description 2' == "Copywrite"
+copy_map = map_df[map_df["Description 2"] == "Copywrite"]
+if copy_map.empty:
+    logging.warning("No rows in mapping with 'Copywrite'. Exiting.")
+    exit()
+
+copywrite_accounts = set(copy_map["Account"].unique())
+logging.info(f"Found {len(copywrite_accounts)} Copywrite account(s).")
+
+# -----------------------------------------------------------------------------
+# 4. Load XRP Data, Keep Relevant Columns
+# -----------------------------------------------------------------------------
+logging.info("Loading XRP sheet from BANI.xlsx...")
+xrp_df = pd.read_excel(BANI_FILE_PATH, sheet_name=XRP_SHEET)
+
+needed_cols = ["Nat Account", "Amount", "XO number", "Journal Description", "XO CC"]
+xrp_df = xrp_df[needed_cols].dropna(subset=["Nat Account", "Amount"])
+
+# Convert types
+xrp_df["Nat Account"]         = xrp_df["Nat Account"].astype(str).str.strip()
+xrp_df["XO number"]           = xrp_df["XO number"].fillna("").astype(str).str.strip()
+xrp_df["Journal Description"] = xrp_df["Journal Description"].fillna("").astype(str).str.strip()
+xrp_df["XO CC"]               = xrp_df["XO CC"].fillna("").astype(str).str.strip()
+xrp_df["Amount"]              = xrp_df["Amount"].astype(float)
+
+# Filter only copywrite accounts
+filtered_df = xrp_df[xrp_df["Nat Account"].isin(copywrite_accounts)]
+if filtered_df.empty:
+    logging.info("No XRP rows match Copywrite accounts. Exiting.")
+    exit()
+
+logging.info(f"Filtered to {len(filtered_df)} row(s) with Copywrite accounts.")
+
+# -----------------------------------------------------------------------------
+# 5. Define keyword -> fallback XO mappings for Journal Description
+#    If a row has blank XO number, we look for these keywords in Journal Description.
+# -----------------------------------------------------------------------------
+journal_desc_map = {
+    "royalty": "9999",
+    "special": "8888",
+    # Add more as needed
+}
+
+def derive_final_xo(row):
+    """
+    Returns a 'Final XO' for aggregator:
+      1) If row['XO number'] != "", use that.
+      2) Else if row['Journal Description'] has a known keyword -> that mapped XO.
+      3) Else fallback to row['XO CC'] if not blank.
+      4) Otherwise return "" (unmapped).
+    """
+    raw_xo = row["XO number"].strip()
+    if raw_xo:
+        return raw_xo
+    
+    jdesc = row["Journal Description"].lower()
+    for kw, forced_xo in journal_desc_map.items():
+        if kw in jdesc:
+            return forced_xo
+    
+    # If still blank, fallback to XO CC
+    xcc = row["XO CC"].strip()
+    if xcc:
+        return xcc
+    
+    return ""  # fully unmapped
+
+# Create a new column "Final XO"
+filtered_df["Final XO"] = filtered_df.apply(derive_final_xo, axis=1)
+
+# -----------------------------------------------------------------------------
+# 6. Group by (Final XO, Journal Description, XO CC) and sum Amount
+#    This way you also see the breakdown by Journal Description in the aggregator.
+# -----------------------------------------------------------------------------
+groupable = filtered_df[filtered_df["Final XO"] != ""].copy()
+
+aggregated_df = (
+    groupable
+    .groupby(["Final XO", "Journal Description", "XO CC"], dropna=False)["Amount"]
+    .sum()
+    .reset_index()
+)
+
+logging.info(f"Aggregated into {len(aggregated_df)} distinct groups.")
+
+# We'll store them in a dictionary keyed by (final_xo, jdesc, xcc)
+aggregator = {}
+for _, row in aggregated_df.iterrows():
+    fxo  = row["Final XO"]
+    jdes = row["Journal Description"]
+    xcc  = row["XO CC"]
+    amt  = row["Amount"]
+    aggregator[(fxo, jdes, xcc)] = amt
+
+# -----------------------------------------------------------------------------
+# 7. Create "Aggregated_Copywrite.xlsx" with these columns:
+#    ["Final XO", "XO CC", "Journal Description", "Sum Amount"]
+# -----------------------------------------------------------------------------
+logging.info(f"Creating aggregator file '{AGGREGATED_FILE}'...")
+out_df = aggregated_df.rename(columns={"Final XO": "Final XO",
+                                       "Journal Description": "Journal Description",
+                                       "XO CC": "XO CC",
+                                       "Amount": "Sum Amount"})
+# Sort by final XO, then Journal Desc, then XO CC for readability
+out_df.sort_values(by=["Final XO", "Journal Description", "XO CC"], inplace=True)
+
+out_df.to_excel(AGGREGATED_FILE, sheet_name="Aggregated", index=False)
+logging.info("Aggregator file created successfully.")
+
+# -----------------------------------------------------------------------------
+# 8. Update the "Copywrite" sheet in BANI.xlsx
+#    Layout (row 15 is header, row 16+ has data):
+#      col D (4) = XO number
+#      col E (5) = XO CC
+#      col F (6) = Journal Description
+#      col S (19)= Jun Actual
+# -----------------------------------------------------------------------------
+wb = load_workbook(BANI_FILE_PATH)
+if COPYWRITE_SHEET_NAME not in wb.sheetnames:
+    logging.warning(f"Sheet '{COPYWRITE_SHEET_NAME}' not found in {BANI_FILE_PATH}. Exiting.")
+    wb.close()
+    exit()
+
+ws_copy = wb[COPYWRITE_SHEET_NAME]
+logging.info(f"Updating sheet '{COPYWRITE_SHEET_NAME}'...")
+
+# Hard-coded columns
+col_xo_number   = 4   # D
+col_xo_cc       = 5   # E
+col_jdesc       = 6   # F
+col_jun_actual  = 19  # S
+start_row       = 16
+max_row         = ws_copy.max_row
+
+def get_final_xo(xo_str, jdesc_str, cc_str):
+    """
+    Reproduce the same "Final XO" logic for a row in the Copywrite sheet:
+      1) If XO Number != "", use that
+      2) Else if jdesc_str has known keyword, use that forced XO
+      3) Else fallback to cc_str
+      4) Else ""
+    """
+    xo_str = xo_str.strip()
+    if xo_str:
+        return xo_str
+    
+    lower_desc = jdesc_str.lower()
+    for kw, forced_xo in journal_desc_map.items():
+        if kw in lower_desc:
+            return forced_xo
+
+    cc_str = cc_str.strip()
+    if cc_str:
+        return cc_str
+
+    return ""
+
+for r in range(start_row, max_row + 1):
+    # read the three columns
+    val_xo_num = ws_copy.cell(row=r, column=col_xo_number).value
+    val_cc     = ws_copy.cell(row=r, column=col_xo_cc).value
+    val_jdesc  = ws_copy.cell(row=r, column=col_jdesc).value
+
+    xo_num_str = str(val_xo_num).strip() if val_xo_num else ""
+    cc_str     = str(val_cc).strip()     if val_cc     else ""
+    jdesc_str  = str(val_jdesc).strip()  if val_jdesc  else ""
+
+    # if row is effectively blank, skip
+    if not (xo_num_str or cc_str or jdesc_str):
+        continue
+
+    # Compute final XO
+    final_xo = get_final_xo(xo_num_str, jdesc_str, cc_str)
+
+    if not final_xo:
+        # Means we can't form aggregator key => skip
+        logging.debug(f"Row {r}: No final XO derived. Skipping.")
+        continue
+
+    # aggregator key is (final_xo, jdesc_str, cc_str)
+    agg_key = (final_xo, jdesc_str, cc_str)
+    if agg_key in aggregator:
+        sum_val = aggregator[agg_key]
+        target_cell = ws_copy.cell(row=r, column=col_jun_actual)
+        target_cell.value = sum_val
+
+        # Clear old comment
+        if target_cell.comment:
+            target_cell.comment = None
+
+        # Add new comment
+        target_cell.comment = Comment("Updated by script", "Script")
+
+        logging.info(f"Row {r}: (Final XO='{final_xo}', JDesc='{jdesc_str}', CC='{cc_str}') => {sum_val}")
+    else:
+        logging.debug(f"Row {r}: key={agg_key} not in aggregator; skipping.")
+
+# -----------------------------------------------------------------------------
+# 9. Save changes to BANI workbook
+# -----------------------------------------------------------------------------
+logging.info("Saving updates to BANI workbook...")
+wb.save(BANI_FILE_PATH)
+wb.close()
+logging.info("Done! All updates saved.")

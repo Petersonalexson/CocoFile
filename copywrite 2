@@ -1,0 +1,179 @@
+import logging
+import pandas as pd
+import warnings
+from openpyxl import load_workbook
+from openpyxl.comments import Comment
+
+# -----------------------------------------------------------------------------
+# 1. Setup logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Suppress user warnings from openpyxl
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+# -----------------------------------------------------------------------------
+# 2. File paths and sheet names
+# -----------------------------------------------------------------------------
+MAP_FILE_PATH    = r"C:\Users\alexp\OneDrive\Desktop\MAP.xlsx"
+BANI_FILE_PATH   = r"C:\Users\alexp\OneDrive\Desktop\BANI.xlsx"
+AGGREGATED_FILE  = r"C:\Users\alexp\OneDrive\Desktop\Aggregated_Copywrite.xlsx"
+
+MAPPING_SHEET    = "Mapping Main"
+XRP_SHEET        = "XRP"
+COPYWRITE_SHEET  = "Copywrite"  # The sheet we'll update
+
+# -----------------------------------------------------------------------------
+# 3. Load the Mapping (MAP.xlsx) and filter for 'Copywrite' accounts
+# -----------------------------------------------------------------------------
+logging.info("Loading mapping from MAP.xlsx...")
+map_df = pd.read_excel(MAP_FILE_PATH, sheet_name=MAPPING_SHEET)
+
+# Drop any rows missing 'Account'
+map_df = map_df.dropna(subset=["Account"])
+
+# Convert to string and strip
+map_df["Account"]       = map_df["Account"].astype(str).str.strip()
+map_df["Description 2"] = map_df["Description 2"].astype(str).str.strip()
+
+# Keep only those with "Copywrite"
+copy_map = map_df[map_df["Description 2"] == "Copywrite"]
+if copy_map.empty:
+    logging.warning("No rows found in mapping with 'Copywrite'. Exiting.")
+    exit()
+
+copywrite_accounts = set(copy_map["Account"].unique())
+logging.info(f"Found {len(copywrite_accounts)} Copywrite account(s).")
+
+# -----------------------------------------------------------------------------
+# 4. Load XRP data from BANI.xlsx
+#    We'll keep columns: Nat Account, Amount, XO number, Journal Description
+# -----------------------------------------------------------------------------
+logging.info("Loading XRP sheet from BANI.xlsx...")
+xrp_df = pd.read_excel(BANI_FILE_PATH, sheet_name=XRP_SHEET)
+
+needed_cols = ["Nat Account", "Amount", "XO number", "Journal Description"]
+xrp_df = xrp_df[needed_cols].dropna(subset=["Nat Account", "Amount"])
+
+# Convert
+xrp_df["Nat Account"]        = xrp_df["Nat Account"].astype(str).str.strip()
+xrp_df["XO number"]          = xrp_df["XO number"].fillna("").astype(str).str.strip()
+xrp_df["Journal Description"] = xrp_df["Journal Description"].fillna("").astype(str).str.strip()
+xrp_df["Amount"]             = xrp_df["Amount"].astype(float)
+
+# Filter to only copywrite accounts
+filtered_df = xrp_df[xrp_df["Nat Account"].isin(copywrite_accounts)]
+if filtered_df.empty:
+    logging.info("No XRP rows match Copywrite accounts. Exiting.")
+    exit()
+
+logging.info(f"Filtered to {len(filtered_df)} rows for Copywrite accounts.")
+
+# -----------------------------------------------------------------------------
+# 5. If XO number is blank, try to glean from Journal Description
+#    Example logic: define some keywords. If the row's Journal Description
+#    contains any of them, we assign that XO number.
+# -----------------------------------------------------------------------------
+keyword_to_xo = {
+    "royalty": "9999",
+    "special": "8888",
+    # Add more as needed
+}
+
+def resolve_xo(row):
+    raw_xo = row["XO number"].strip()
+    if raw_xo:
+        return raw_xo
+    
+    # If blank, see if Journal Description has a known keyword
+    jdesc = row["Journal Description"].lower()
+    for kw, forced_xo in keyword_to_xo.items():
+        if kw in jdesc:
+            return forced_xo
+    # If no match, remain blank
+    return ""
+
+filtered_df["Resolved XO Number"] = filtered_df.apply(resolve_xo, axis=1)
+
+# -----------------------------------------------------------------------------
+# 6. Group by "Resolved XO Number" (skipping blank)
+# -----------------------------------------------------------------------------
+agg_df = (
+    filtered_df[filtered_df["Resolved XO Number"] != ""]
+    .groupby("Resolved XO Number", dropna=False)["Amount"]
+    .sum()
+    .reset_index()
+)
+
+logging.info(f"Aggregated into {len(agg_df)} XO Number(s).")
+
+# Create a dict for quick lookups
+aggregator = {}
+for _, row in agg_df.iterrows():
+    xnum = row["Resolved XO Number"]
+    amt  = row["Amount"]
+    aggregator[xnum] = amt
+
+# -----------------------------------------------------------------------------
+# 7. Create an external Excel "Aggregated_Copywrite.xlsx" with two columns:
+#    XO Number, Sum Amount
+# -----------------------------------------------------------------------------
+logging.info(f"Creating aggregated file '{AGGREGATED_FILE}'...")
+report_df = agg_df.rename(columns={"Resolved XO Number": "XO Number", "Amount": "Sum Amount"})
+report_df.sort_values(by="XO Number", inplace=True)  # optional sort
+report_df.to_excel(AGGREGATED_FILE, sheet_name="Aggregated", index=False)
+logging.info("Aggregator file created successfully.")
+
+# -----------------------------------------------------------------------------
+# 8. Open the Copywrite sheet in BANI.xlsx and update "Jun Actual" in col S
+#    Headers are in row 15: XO number = col D, Jun Actual = col S
+#    Data from row 16 onward.
+# -----------------------------------------------------------------------------
+wb = load_workbook(BANI_FILE_PATH)
+
+if COPYWRITE_SHEET not in wb.sheetnames:
+    logging.warning(f"Sheet '{COPYWRITE_SHEET}' not found in {BANI_FILE_PATH}. Exiting.")
+    wb.close()
+    exit()
+
+ws_copy = wb[COPYWRITE_SHEET]
+logging.info(f"Updating sheet '{COPYWRITE_SHEET}'...")
+
+col_xo_number = 4   # D
+col_jun_actual= 19  # S
+start_row     = 16
+max_row       = ws_copy.max_row
+
+for r in range(start_row, max_row + 1):
+    val_xo = ws_copy.cell(row=r, column=col_xo_number).value
+    xo_str = str(val_xo).strip() if val_xo else ""
+    if not xo_str:
+        # blank row, skip
+        continue
+
+    if xo_str in aggregator:
+        sum_val = aggregator[xo_str]
+        target_cell = ws_copy.cell(row=r, column=col_jun_actual)
+        target_cell.value = sum_val
+
+        # Clear old comment, if any
+        if target_cell.comment:
+            target_cell.comment = None
+
+        # Add a new comment
+        target_cell.comment = Comment("Updated by script", "Script")
+
+        logging.info(f"Row {r}, XO Number='{xo_str}' => {sum_val}")
+    else:
+        logging.debug(f"Row {r}, XO Number='{xo_str}' not in aggregator; skipping.")
+
+# -----------------------------------------------------------------------------
+# 9. Save the changes to BANI
+# -----------------------------------------------------------------------------
+logging.info("Saving updates to BANI workbook...")
+wb.save(BANI_FILE_PATH)
+wb.close()
+logging.info("Done! All updates saved.")

@@ -5,7 +5,7 @@ from openpyxl import load_workbook
 from openpyxl.comments import Comment
 
 # -----------------------------------------------------------------------------
-# 1. Setup Logging
+# 1. Setup Logging and Warnings
 # -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -14,29 +14,34 @@ logging.basicConfig(
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 # -----------------------------------------------------------------------------
-# 2. File Paths & Sheet Names
+# 2. File Paths, Sheet Names, and Column Definitions
 # -----------------------------------------------------------------------------
 MAP_FILE_PATH  = r"C:\Users\alexp\OneDrive\Desktop\MAP.xlsx"
 BANI_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\BANI.xlsx"
 
-MAPPING_SHEET       = "Mapping Main"
-XRP_SHEET           = "XRP"
+MAPPING_SHEET        = "Mapping Main"
+XRP_SHEET            = "XRP"
+COPYWRITE_SHEET_NAME = "Copywrite"  # We'll only update this one
 
-COPYWRITE_SHEET_NAME= "Copywrite"
-LISCING_SHEET_NAME  = "liscing"   # The second sheet we also want to update
+AGGREGATED_FILE      = r"C:\Users\alexp\OneDrive\Desktop\Aggregated_Copywrite.xlsx"
 
-AGGREGATED_FILE     = r"C:\Users\alexp\OneDrive\Desktop\Aggregated_Copywrite.xlsx"
-
-# Filter the mapping for rows where "Description 2" == this:
+# We'll filter the mapping to "Description 2" == "Copywrite"
 TARGET_DESC2_VALUE = "Copywrite"
 
-# We'll define columns in the sheets we update ("Copywrite" & "liscing") – same layout
-COL_ACCOUNT          = 1   # A
-COL_DESCRIPTION2     = 2   # B
-COL_VOICE            = 3   # C
-COL_XO_NUMBER        = 4   # D
-COL_JOURNAL_DESC     = 5   # E
-COL_JUN_ACTUAL       = 19  # S
+# In the "Copywrite" sheet, assume:
+#   A=1 => Account
+#   B=2 => Description 2
+#   C=3 => Voice
+#   D=4 => XO Number
+#   E=5 => Journal Description
+#   S=19 => "Jun Actual"
+#   Row 15 is header, data from row 16 onward
+COL_ACCOUNT       = 1
+COL_DESCRIPTION2  = 2
+COL_VOICE         = 3
+COL_XO_NUMBER     = 4
+COL_JOUR_DESC     = 5
+COL_JUN_ACTUAL    = 19
 
 HEADER_ROW      = 15
 DATA_START_ROW  = 16
@@ -44,7 +49,7 @@ DATA_START_ROW  = 16
 # -----------------------------------------------------------------------------
 # 3. Load Mapping & Filter for "Copywrite" Accounts
 # -----------------------------------------------------------------------------
-logging.info("Loading mapping from MAP.xlsx...")
+logging.info("Loading mapping data from MAP.xlsx...")
 map_df = pd.read_excel(MAP_FILE_PATH, sheet_name=MAPPING_SHEET)
 
 # Drop rows with no Account
@@ -54,17 +59,17 @@ map_df = map_df.dropna(subset=["Account"])
 map_df["Account"]       = map_df["Account"].astype(str).str.strip()
 map_df["Description 2"] = map_df["Description 2"].astype(str).str.strip()
 
-# Filter for the target desc2
+# Filter for "Copywrite"
 copy_map = map_df[map_df["Description 2"] == TARGET_DESC2_VALUE]
 if copy_map.empty:
-    logging.warning(f"No mapping rows found where 'Description 2' == '{TARGET_DESC2_VALUE}'. Exiting.")
+    logging.warning(f"No rows found in mapping where 'Description 2' == '{TARGET_DESC2_VALUE}'. Exiting.")
     exit()
 
 copywrite_accounts = set(copy_map["Account"].unique())
 logging.info(f"Found {len(copywrite_accounts)} '{TARGET_DESC2_VALUE}' account(s).")
 
 # -----------------------------------------------------------------------------
-# 4. Load XRP from BANI, keep relevant columns
+# 4. Load XRP Data
 # -----------------------------------------------------------------------------
 logging.info("Loading XRP sheet from BANI.xlsx...")
 xrp_df = pd.read_excel(BANI_FILE_PATH, sheet_name=XRP_SHEET)
@@ -72,6 +77,7 @@ xrp_df = pd.read_excel(BANI_FILE_PATH, sheet_name=XRP_SHEET)
 needed_cols = ["Nat Account", "Voice", "Amount", "XO Number", "Journal Description"]
 xrp_df = xrp_df[needed_cols].dropna(subset=["Nat Account", "Voice", "Amount"])
 
+# Convert columns to consistent types
 xrp_df["Nat Account"]        = xrp_df["Nat Account"].astype(str).str.strip()
 xrp_df["Voice"]              = xrp_df["Voice"].astype(str).str.strip()
 xrp_df["Amount"]             = xrp_df["Amount"].astype(float)
@@ -81,13 +87,16 @@ xrp_df["Journal Description"] = xrp_df["Journal Description"].fillna("").astype(
 logging.info(f"Loaded {len(xrp_df)} rows from '{XRP_SHEET}'.")
 
 # -----------------------------------------------------------------------------
-# 5. Filter rows to copywrite_accounts, merge "Description 2"
+# 5. Filter to "Copywrite" accounts, then Merge in "Description 2"
 # -----------------------------------------------------------------------------
 filtered_df = xrp_df[xrp_df["Nat Account"].isin(copywrite_accounts)].copy()
 if filtered_df.empty:
-    logging.info("No XRP rows match 'Copywrite' accounts. Exiting.")
+    logging.info("No XRP rows match Copywrite accounts. Exiting.")
     exit()
 
+logging.info(f"Filtered to {len(filtered_df)} rows for Copywrite accounts.")
+
+# Merge in "Description 2" from the partial map
 filtered_df = filtered_df.merge(
     copy_map[["Account", "Description 2"]].drop_duplicates(),
     left_on="Nat Account",
@@ -96,12 +105,11 @@ filtered_df = filtered_df.merge(
 )
 filtered_df.drop(columns=["Account"], inplace=True)
 
-# So columns are: Nat Account, Voice, Amount, XO Number, Journal Description, Description 2
-
-logging.info(f"Filtered to {len(filtered_df)} rows after merging with mapping.")
+# Now columns: Nat Account, Voice, Amount, XO Number, Journal Description, Description 2
 
 # -----------------------------------------------------------------------------
-# 6. Group by (Nat Account, Description 2, Voice), pick "Final XO" & sum Amount
+# 6. Aggregation Logic: Group by (Nat Account, Description 2, Voice),
+#    derive a single "Final XO Number" for that group, sum the Amount.
 # -----------------------------------------------------------------------------
 desc_to_xo_map = {
     "royalty": "9999",
@@ -109,24 +117,25 @@ desc_to_xo_map = {
     # add more as needed
 }
 
-aggregator = {}  # key => sum
-# key = (account, desc2, voice, final_xo)
+aggregator = {}
+# key => (account, desc2, voice, final_xo)
 
 grouped = filtered_df.groupby(["Nat Account", "Description 2", "Voice"], dropna=False)
 
 for group_key, group_df in grouped:
+    # group_key = (nat_acc, desc2_val, voice_val)
     nat_acc, desc2_val, voice_val = group_key
 
-    # Find a final XO
+    # Step A: pick a final XO
     distinct_xos = group_df["XO Number"][group_df["XO Number"] != ""].unique()
     chosen_xo = ""
     if len(distinct_xos) > 0:
         chosen_xo = distinct_xos[0]
         if len(distinct_xos) > 1:
             logging.warning(f"Group (Acc={nat_acc}, Desc2='{desc2_val}', Voice='{voice_val}') "
-                            f"has multiple XO Numbers {list(distinct_xos)}. Picking {chosen_xo}.")
+                            f"has multiple XO Numbers {list(distinct_xos)}. Picking first: {chosen_xo}.")
     else:
-        # fallback by journal desc
+        # fallback by Journal Description
         fallback_xo = ""
         for _, row in group_df.iterrows():
             jdesc = row["Journal Description"].lower()
@@ -138,17 +147,19 @@ for group_key, group_df in grouped:
                 break
         chosen_xo = fallback_xo
 
+    # Step B: sum amounts
     total_amt = group_df["Amount"].sum()
+
     aggregator[(nat_acc, desc2_val, voice_val, chosen_xo)] = total_amt
 
 logging.info(f"Built aggregator with {len(aggregator)} group keys.")
 
 # -----------------------------------------------------------------------------
-# 7. Create aggregator DataFrame => [Account, Description2, Voice, Final XO Number, Sum Amount]
+# 7. Build a DataFrame for the aggregator file
 # -----------------------------------------------------------------------------
 rows = []
-for (acc, d2, voice, fxo), amt in aggregator.items():
-    rows.append([acc, d2, voice, fxo, amt])
+for (acc, d2, voice, fxo), sum_val in aggregator.items():
+    rows.append([acc, d2, voice, fxo, sum_val])
 
 agg_df = pd.DataFrame(rows, columns=[
     "Account", "Description2", "Voice", "Final XO Number", "Sum Amount"
@@ -160,92 +171,77 @@ agg_df.to_excel(AGGREGATED_FILE, sheet_name="Aggregator", index=False)
 logging.info("Aggregator file created successfully.")
 
 # -----------------------------------------------------------------------------
-# 8. Function to re-derive "Final XO" for a row's (XO Number, Journal Description)
+# 8. Update the "Copywrite" Sheet by the aggregator
 # -----------------------------------------------------------------------------
-def compute_final_xo(xo_num, jdesc):
-    xo_num = xo_num.strip()
-    if xo_num:
-        return xo_num
-    
+wb = load_workbook(BANI_FILE_PATH)
+
+if COPYWRITE_SHEET_NAME not in wb.sheetnames:
+    logging.warning(f"Sheet '{COPYWRITE_SHEET_NAME}' not found in {BANI_FILE_PATH}. Exiting.")
+    wb.close()
+    exit()
+
+ws_copy = wb[COPYWRITE_SHEET_NAME]
+logging.info(f"Updating sheet '{COPYWRITE_SHEET_NAME}'...")
+
+# We'll reapply the same logic that determined final XO
+def derive_final_xo(xo_num, jdesc):
+    """
+    1) If xo_num not blank, use it
+    2) else if jdesc has known keyword -> forced xo
+    3) else ""
+    """
+    xo = xo_num.strip()
+    if xo:
+        return xo
     jdesc_lower = jdesc.lower()
     for kw, forced_xo in desc_to_xo_map.items():
         if kw in jdesc_lower:
             return forced_xo
     return ""
 
-def update_sheet_by_aggregator(ws, sheet_name):
-    """
-    Reads each data row from 'ws' starting at DATA_START_ROW,
-    extracts (Account, Desc2, Voice, XO Number, JournalDesc),
-    re-derives final XO, forms aggregator key => sum, writes to col S.
-    """
-    max_row = ws.max_row
-    updated_count = 0
+max_row = ws_copy.max_row
+updated_count = 0
 
-    for r in range(DATA_START_ROW, max_row + 1):
-        val_acc  = ws.cell(row=r, column=COL_ACCOUNT).value
-        val_d2   = ws.cell(row=r, column=COL_DESCRIPTION2).value
-        val_voice= ws.cell(row=r, column=COL_VOICE).value
-        val_xo   = ws.cell(row=r, column=COL_XO_NUMBER).value
-        val_jdesc= ws.cell(row=r, column=COL_JOURNAL_DESC).value
+for r in range(DATA_START_ROW, max_row + 1):
+    val_acc  = ws_copy.cell(row=r, column=COL_ACCOUNT).value
+    val_d2   = ws_copy.cell(row=r, column=COL_DESCRIPTION2).value
+    val_voice= ws_copy.cell(row=r, column=COL_VOICE).value
+    val_xo   = ws_copy.cell(row=r, column=COL_XO_NUMBER).value
+    val_jdesc= ws_copy.cell(row=r, column=COL_JOUR_DESC).value
 
-        acc_str  = str(val_acc).strip()   if val_acc   else ""
-        d2_str   = str(val_d2).strip()    if val_d2    else ""
-        voice_str= str(val_voice).strip() if val_voice else ""
-        xo_str   = str(val_xo).strip()    if val_xo    else ""
-        jdesc_str= str(val_jdesc).strip() if val_jdesc else ""
+    acc_str  = str(val_acc).strip()   if val_acc   else ""
+    d2_str   = str(val_d2).strip()    if val_d2    else ""
+    voice_str= str(val_voice).strip() if val_voice else ""
+    xo_str   = str(val_xo).strip()    if val_xo    else ""
+    jdesc_str= str(val_jdesc).strip() if val_jdesc else ""
 
-        # If missing critical fields, skip
-        if not (acc_str and d2_str and voice_str):
-            continue
+    if not (acc_str and d2_str and voice_str):
+        # incomplete row, skip
+        continue
 
-        # same final XO logic
-        final_xo = compute_final_xo(xo_str, jdesc_str)
+    final_xo = derive_final_xo(xo_str, jdesc_str)
 
-        agg_key = (acc_str, d2_str, voice_str, final_xo)
-        if agg_key in aggregator:
-            sum_val = aggregator[agg_key]
-            target_cell = ws.cell(row=r, column=COL_JUN_ACTUAL)
-            target_cell.value = sum_val
+    key = (acc_str, d2_str, voice_str, final_xo)
+    if key in aggregator:
+        sum_val = aggregator[key]
+        target_cell = ws_copy.cell(row=r, column=COL_JUN_ACTUAL)
+        target_cell.value = sum_val
 
-            # remove old comment
-            if target_cell.comment:
-                target_cell.comment = None
+        # remove old comment
+        if target_cell.comment:
+            target_cell.comment = None
+        
+        # add new comment
+        target_cell.comment = Comment("Updated by script", "Script")
 
-            target_cell.comment = Comment("Updated by script", "Script")
-            updated_count += 1
-        else:
-            # not in aggregator
-            pass
+        updated_count += 1
 
-    logging.info(f"Updated {updated_count} row(s) in sheet '{sheet_name}'.")
-
+logging.info(f"Updated {updated_count} row(s) in sheet '{COPYWRITE_SHEET_NAME}'.")
 
 # -----------------------------------------------------------------------------
-# 9. Open BANI workbook, update "Copywrite" and "liscing" sheets by aggregator
+# 9. Save the updated BANI workbook
 # -----------------------------------------------------------------------------
-wb = load_workbook(BANI_FILE_PATH)
-
-# a) Copywrite
-if COPYWRITE_SHEET_NAME in wb.sheetnames:
-    ws_copy = wb[COPYWRITE_SHEET_NAME]
-    logging.info(f"Updating sheet '{COPYWRITE_SHEET_NAME}'...")
-    update_sheet_by_aggregator(ws_copy, COPYWRITE_SHEET_NAME)
-else:
-    logging.info(f"Sheet '{COPYWRITE_SHEET_NAME}' not found; skipping.")
-
-# b) liscing
-if LISCING_SHEET_NAME in wb.sheetnames:
-    ws_liscing = wb[LISCING_SHEET_NAME]
-    logging.info(f"Updating sheet '{LISCING_SHEET_NAME}'...")
-    update_sheet_by_aggregator(ws_liscing, LISCING_SHEET_NAME)
-else:
-    logging.info(f"Sheet '{LISCING_SHEET_NAME}' not found; skipping.")
-
-# -----------------------------------------------------------------------------
-# 10. Save changes to BANI
-# -----------------------------------------------------------------------------
-logging.info("Saving updated BANI workbook...")
+logging.info("Saving updates to BANI workbook...")
 wb.save(BANI_FILE_PATH)
 wb.close()
 logging.info("Done. All updates saved.")

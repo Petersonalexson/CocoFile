@@ -5,7 +5,7 @@ from openpyxl import load_workbook
 from openpyxl.comments import Comment
 
 # -----------------------------------------------------------------------------
-# 1. Setup Logging and Warnings
+# 1. Setup Logging
 # -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -19,149 +19,170 @@ warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 MAP_FILE_PATH    = r"C:\Users\alexp\OneDrive\Desktop\MAP.xlsx"
 BANI_FILE_PATH   = r"C:\Users\alexp\OneDrive\Desktop\BANI.xlsx"
 
-MAPPING_SHEET      = "Mapping Main"
-XRP_SHEET          = "XRP"
-COPYWRITE_SHEET    = "Copywrite"
+MAPPING_SHEET    = "Mapping Main"
+XRP_SHEET        = "XRP"
+COPYWRITE_SHEET  = "Copywrite"
 
-AGGREGATED_FILE    = r"C:\Users\alexp\OneDrive\Desktop\Aggregated_Copywrite.xlsx"
+AGGREGATED_FILE  = r"C:\Users\alexp\OneDrive\Desktop\Aggregated_Copywrite.xlsx"
 
-# We only want mapping rows where "Description 2" == "Copywrite"
+# We only keep mapping rows where "Description 2" == "Copywrite"
 TARGET_DESC2_VALUE = "Copywrite"
 
-# For the "Copywrite" sheet, let's define columns:
-COL_ACCOUNT         = 1   # A
-COL_VOICE           = 3   # C
-COL_XO_NUMBER       = 4   # D
-COL_JOURNAL_DESC    = 5   # E
-COL_JUN_ACTUAL      = 19  # S
-HEADER_ROW          = 15
-DATA_START_ROW      = 16
+# In the "Copywrite" sheet:
+# Row 15 is a header, so data from row 16 onward
+ROW_HEADER      = 15
+DATA_START_ROW  = 16
+
+# Column definitions (1-based):
+#   D=4 => "PO Number" (the fallback aggregator key, if JD doesn't override)
+#   S=19 => "Jun Actual"
+COL_PO_NUMBER   = 4   # D
+COL_JUN_ACTUAL  = 19  # S
+
+# If we also read "Voice" and "Amount" from "XRP", we sum them.
+# We'll store them in the aggregator. We do not necessarily store them in the Copywrite sheet.
 
 # -----------------------------------------------------------------------------
-# 3. Load Mapping & Filter to Copywrite Accounts
+# 3. Load Mapping & Filter for Copywrite Accounts
+#    Also gather JD->XO forced mapping if present.
 # -----------------------------------------------------------------------------
-logging.info("Loading mapping from MAP.xlsx...")
+logging.info("Loading mapping data from MAP.xlsx...")
 map_df = pd.read_excel(MAP_FILE_PATH, sheet_name=MAPPING_SHEET)
 
-# Drop rows missing 'Account'
-map_df = map_df.dropna(subset=["Account"])
-
-# Convert to string
+map_df = map_df.dropna(subset=["Account"])  # remove rows with no 'Account'
 map_df["Account"]       = map_df["Account"].astype(str).str.strip()
 map_df["Description 2"] = map_df["Description 2"].astype(str).str.strip()
 
-# Filter
 copy_map = map_df[map_df["Description 2"] == TARGET_DESC2_VALUE]
 if copy_map.empty:
-    logging.warning(f"No rows in mapping found with 'Description 2' == '{TARGET_DESC2_VALUE}'. Exiting.")
+    logging.warning(f"No mapping rows found where 'Description 2' == '{TARGET_DESC2_VALUE}'. Exiting.")
     exit()
 
 copywrite_accounts = set(copy_map["Account"].unique())
-logging.info(f"Found {len(copywrite_accounts)} '{TARGET_DESC2_VALUE}' account(s).")
+logging.info(f"Found {len(copywrite_accounts)} Copywrite account(s).")
 
 # -----------------------------------------------------------------------------
-# 4. Load and Filter the XRP Data
+# Create a dictionary of JournalDesc->ForcedXO from the copy_map, if that is
+# how your "JD -> XO" mapping is stored. For example, suppose your mapping has
+# columns "JD Key" (the text) and "JD XO" (the forced XO). We'll do something
+# like:
 # -----------------------------------------------------------------------------
-logging.info("Loading XRP data from BANI.xlsx...")
+jd_to_xo = {}
+
+# We'll just guess you might have columns called "JD Key" (the text to match)
+# and "JD XO" (the forced XO number). If not, adapt this code.
+if "JD Key" in copy_map.columns and "JD XO" in copy_map.columns:
+    # Build a dictionary from JD Key -> JD XO
+    for _, row in copy_map.dropna(subset=["JD Key", "JD XO"]).iterrows():
+        jkey = row["JD Key"].strip().lower()
+        forced_xo = row["JD XO"].strip()
+        jd_to_xo[jkey] = forced_xo
+
+logging.info(f"Built JD->XO dictionary with {len(jd_to_xo)} entries from mapping.")
+
+# -----------------------------------------------------------------------------
+# 4. Load XRP from BANI, focusing on columns: [Nat Account, Voice, Amount, PO Number, Journal Description]
+# -----------------------------------------------------------------------------
+logging.info(f"Loading '{XRP_SHEET}' sheet from BANI...")
 xrp_df = pd.read_excel(BANI_FILE_PATH, sheet_name=XRP_SHEET)
 
-needed_cols = ["Nat Account", "Voice", "Amount", "XO Number", "Journal Description"]
-xrp_df = xrp_df[needed_cols].dropna(subset=["Nat Account", "Voice", "Amount"])
+needed_cols = ["Nat Account", "Voice", "Amount", "PO Number", "Journal Description"]
+xrp_df = xrp_df[needed_cols].dropna(subset=["Nat Account", "Amount"])
 
 # Convert types
 xrp_df["Nat Account"]        = xrp_df["Nat Account"].astype(str).str.strip()
-xrp_df["Voice"]              = xrp_df["Voice"].astype(str).str.strip()
+xrp_df["Voice"]              = xrp_df["Voice"].fillna(0).astype(float)
 xrp_df["Amount"]             = xrp_df["Amount"].astype(float)
-xrp_df["XO Number"]          = xrp_df["XO Number"].fillna("").astype(str).str.strip()
+xrp_df["PO Number"]          = xrp_df["PO Number"].fillna("").astype(str).str.strip()
 xrp_df["Journal Description"] = xrp_df["Journal Description"].fillna("").astype(str).str.strip()
 
-# Keep only rows matching the Copywrite accounts
+logging.info(f"Loaded {len(xrp_df)} rows from '{XRP_SHEET}' in BANI.")
+
+# -----------------------------------------------------------------------------
+# 5. Filter to Copywrite Accounts
+# -----------------------------------------------------------------------------
 filtered_df = xrp_df[xrp_df["Nat Account"].isin(copywrite_accounts)].copy()
 if filtered_df.empty:
-    logging.info("No XRP rows match Copywrite accounts. Exiting.")
+    logging.info("No rows in XRP match copywrite accounts. Exiting.")
     exit()
 
-logging.info(f"Filtered to {len(filtered_df)} row(s) for Copywrite accounts.")
+logging.info(f"Filtered to {len(filtered_df)} row(s) for copywrite accounts.")
 
 # -----------------------------------------------------------------------------
-# 5. Determine Aggregator Key for each row:
-#    - If XO Number is not blank, aggregator_key = XO Number
-#    - Else aggregator_key = some fallback from Journal Description
-#      (could be the entire string, or a forced code if you want a mapping)
-#
-# Then we'll group by (NatAccount, aggregator_key, Voice) to sum "Amount".
+# 6. Aggregator Key Priority: JD first, then PO Number
+#    Steps:
+#      A) If row['Journal Description'] matches a known JD->XO from 'jd_to_xo', aggregator_key = that forced XO
+#      B) else if row['PO Number'] != "" => aggregator_key = row['PO Number']
+#      C) else if row['Journal Description'] not blank => aggregator_key = "JD:" + that desc
+#      D) else aggregator_key = ""
 # -----------------------------------------------------------------------------
+def aggregator_key_priority(row):
+    jdesc = row["Journal Description"].strip()
+    po    = row["PO Number"].strip()
 
-def derive_aggregator_key(xo_num, jdesc):
-    """
-    1) If xo_num not blank, return xo_num
-    2) Else, fallback to jdesc (or a mapping from jdesc to a special code).
-    3) If jdesc also blank, return "" => unmapped
-    """
-    xo = xo_num.strip()
-    if xo:
-        return xo
-    # fallback is the entire Journal Description
-    # (or a user-defined dictionary if you want a special code).
-    j = jdesc.strip()
-    return j  # if blank, aggregator key is "" => won't get aggregated
+    # A) forced XO from JD map if we find a key
+    lower_jdesc = jdesc.lower()
+    if lower_jdesc in jd_to_xo:
+        return jd_to_xo[lower_jdesc]
 
-# Add a column "Aggregator Key"
-filtered_df["AggregatorKey"] = filtered_df.apply(
-    lambda row: derive_aggregator_key(row["XO Number"], row["Journal Description"]),
-    axis=1
-)
+    # B) if row has a non-blank PO, use that
+    if po:
+        return po
 
-# We'll also keep the "Nat Account" and "Voice" to group by
-# So effectively, we group by (NatAccount, AggregatorKey, Voice)
+    # C) else if jdesc not blank => aggregator_key = "JD: " + jdesc
+    if jdesc:
+        return f"JD:{jdesc}"
 
-groupable = filtered_df[filtered_df["AggregatorKey"] != ""].copy()
-if groupable.empty:
-    logging.info("All aggregator keys are blank. Nothing to aggregate. Exiting.")
-    exit()
+    # D) else blank => skip
+    return ""
+
+filtered_df["AggKey"] = filtered_df.apply(aggregator_key_priority, axis=1)
+
+# Keep rows that got an aggregator key
+groupable = filtered_df[filtered_df["AggKey"] != ""].copy()
 
 # -----------------------------------------------------------------------------
-# 6. Group by (NatAccount, AggregatorKey, Voice) -> sum "Amount"
+# 7. Sum (Voice + Amount) for each aggregator key
 # -----------------------------------------------------------------------------
+groupable["VoicePlusAmount"] = groupable["Voice"] + groupable["Amount"]
+
 agged = (
     groupable
-    .groupby(["Nat Account", "AggregatorKey", "Voice"], dropna=False)["Amount"]
+    .groupby("AggKey")["VoicePlusAmount"]
     .sum()
     .reset_index()
 )
 
-logging.info(f"Aggregated into {len(agged)} groups.")
+logging.info(f"Aggregated into {len(agged)} aggregator keys.")
 
-# We'll build a dictionary aggregator:
-# aggregator[(acc, aggregator_key, voice)] = total_amount
+# aggregator dict aggregator[key] = sum(voice+amount)
 aggregator = {}
 for _, row in agged.iterrows():
-    acc = row["Nat Account"]
-    aggk= row["AggregatorKey"]
-    v   = row["Voice"]
-    amt = row["Amount"]
-    aggregator[(acc, aggk, v)] = amt
+    k = row["AggKey"]
+    aggregator[k] = row["VoicePlusAmount"]
 
 # -----------------------------------------------------------------------------
-# 7. Create an "Aggregated_Copywrite.xlsx" file with columns:
-#    [Account, Aggregator Key, Voice, Sum Amount]
+# 8. Write aggregator to "Aggregated_Copywrite.xlsx"
 # -----------------------------------------------------------------------------
 logging.info(f"Creating aggregator file '{AGGREGATED_FILE}'...")
-out_df = agged.rename(columns={
-    "Nat Account": "Account",
-    "AggregatorKey": "XO or JDesc Key",
-    "Voice": "Voice",
-    "Amount": "Sum Amount"
+report_df = agged.rename(columns={
+    "AggKey": "Aggregator Key (JD first)",
+    "VoicePlusAmount": "Sum (Voice+Amount)"
 })
-out_df.sort_values(by=["Account", "XO or JDesc Key", "Voice"], inplace=True)
+report_df.sort_values(by="Aggregator Key (JD first)", inplace=True)
 
-out_df.to_excel(AGGREGATED_FILE, sheet_name="Aggregated", index=False)
+report_df.to_excel(AGGREGATED_FILE, sheet_name="Aggregated", index=False)
 logging.info("Aggregator file created successfully.")
 
 # -----------------------------------------------------------------------------
-# 8. Update the "Copywrite" sheet: For each data row, we form the same aggregator
-#    key (if XO number is blank, use Journal Description). Then we also need the
-#    row's Account, Voice. If found in aggregator, place sum in "Jun Actual".
+# 9. Update "Copywrite" sheet
+#    - We'll read each row from row 16 onward.
+#    - We'll apply the same aggregator_key_priority logic:
+#         * check if row's JournalDesc in jd_to_xo -> forced XO
+#         * else if PO not blank -> aggregator key = PO
+#         * else aggregator key = "JD:desc"
+#    - If aggregator has that key, place sum in "Jun Actual" (col S).
+#    - If that aggregator key came from JD, we also rewrite col D.
 # -----------------------------------------------------------------------------
 
 wb = load_workbook(BANI_FILE_PATH)
@@ -176,57 +197,77 @@ logging.info(f"Updating sheet '{COPYWRITE_SHEET}'...")
 max_row = ws_copy.max_row
 updated_count = 0
 
-def derive_sheet_aggkey(xo_num, jdesc):
-    xo = xo_num.strip()
-    if xo:
-        return xo
-    return jdesc.strip()
+def aggregator_key_priority_sheet(po_val, jdesc_val):
+    """
+    same logic: JD first
+    1) if jdesc matches a known forced XO => aggregator key
+    2) else if PO not blank => aggregator key
+    3) else "JD:" + desc
+    4) else ""
+    """
+    j = jdesc_val.strip()
+    p = po_val.strip().lower()
+
+    # Step A) see if j is in jd_to_xo
+    j_lower = j.lower()
+    if j_lower in jd_to_xo:
+        return jd_to_xo[j_lower]
+
+    # Step B) if PO not blank => aggregator key
+    # but note we stored p in lower, let's re-check original
+    # better to do p = po_val.strip() (not .lower()) for aggregator
+    # let's do that carefully
+    p_original = po_val.strip()
+    if p_original:
+        return p_original
+
+    # Step C) if jdesc => "JD:" + jdesc
+    if j:
+        return f"JD:{j}"
+
+    return ""
 
 for r in range(DATA_START_ROW, max_row + 1):
-    # Read the needed columns: Account, Voice, XO number, Journal Description
-    val_acc  = ws_copy.cell(row=r, column=COL_ACCOUNT).value
-    val_voice= ws_copy.cell(row=r, column=COL_VOICE).value
-    val_xo   = ws_copy.cell(row=r, column=COL_XO_NUMBER).value
-    val_jdesc= ws_copy.cell(row=r, column=COL_JOURNAL_DESC).value
+    val_po = ws_copy.cell(row=r, column=COL_PO_NUMBER).value
+    val_jd = ws_copy.cell(row=r, column=COL_PO_NUMBER+1).value  # careful if col E => 5
+    # Actually, user said col D is PO, col S is 19 => so col E might be 5, let's confirm we have it:
+    # Wait, the user said "PO number in D, Jun Actual in S", doesn't mention the column for Journal Description.
+    # If JD is in E => col 5. We'll guess that. We'll adapt carefully:
+    # Because the user said "we only use D to populate"? Let's assume the user wants to store
+    # Journal Description in col E => that's 5 => let's do that:
 
-    acc_str  = str(val_acc).strip()   if val_acc   else ""
-    v_str    = str(val_voice).strip() if val_voice else ""
-    xo_str   = str(val_xo).strip()    if val_xo    else ""
-    jd_str   = str(val_jdesc).strip() if val_jdesc else ""
+    val_jd = ws_copy.cell(row=r, column=5).value  # if E is 5
 
-    # skip blank row
-    if not (acc_str and v_str):
+    po_str = str(val_po).strip() if val_po else ""
+    jd_str = str(val_jd).strip() if val_jd else ""
+
+    key = aggregator_key_priority_sheet(po_str, jd_str)
+    if not key:
         continue
 
-    # aggregator key = XO number if present, else journal desc
-    final_key = derive_sheet_aggkey(xo_str, jd_str)
-    if not final_key:
-        # can't find aggregator key
-        continue
+    if key in aggregator:
+        total_val = aggregator[key]
+        cell_jun = ws_copy.cell(row=r, column=COL_JUN_ACTUAL)
+        cell_jun.value = total_val
 
-    # aggregator lookup
-    agg_key = (acc_str, final_key, v_str)
-    if agg_key in aggregator:
-        sum_val = aggregator[agg_key]
-        target_cell = ws_copy.cell(row=r, column=COL_JUN_ACTUAL)
-        target_cell.value = sum_val
-
-        # remove old comment
-        if target_cell.comment:
-            target_cell.comment = None
-
-        target_cell.comment = Comment("Updated by script", "Script")
+        if cell_jun.comment:
+            cell_jun.comment = None
+        cell_jun.comment = Comment("Updated by script", "Script")
         updated_count += 1
-    else:
-        # aggregator not found
-        pass
+
+        # If aggregator key is from JD, we rewrite col D
+        # meaning if row originally had no PO but JD forced it, or if forced XO from JD map
+        # we can detect that if row's col D was blank or we want to unify it
+        if (not po_str) or (jd_str.lower() in jd_to_xo):
+            # if aggregator came from JD in any sense
+            ws_copy.cell(row=r, column=COL_PO_NUMBER).value = key
 
 logging.info(f"Updated {updated_count} row(s) in sheet '{COPYWRITE_SHEET}'.")
 
 # -----------------------------------------------------------------------------
-# 9. Save changes to BANI
+# 10. Save
 # -----------------------------------------------------------------------------
-logging.info("Saving updates to BANI workbook...")
+logging.info("Saving updated BANI workbook...")
 wb.save(BANI_FILE_PATH)
 wb.close()
-logging.info("Done! All updates saved.")
+logging.info("Done. All updates saved.")

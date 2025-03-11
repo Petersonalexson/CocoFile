@@ -1,0 +1,163 @@
+import logging
+import pandas as pd
+import warnings
+from openpyxl import Workbook
+
+# -----------------------------------------------------------------------------
+# 1. Setup Logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+# -----------------------------------------------------------------------------
+# 2. File Paths (Adjust to your actual environment)
+# -----------------------------------------------------------------------------
+BANI_FILE_PATH = r"C:\Users\alexp\OneDrive\Desktop\BANI.xlsx"
+XRP_SHEET_NAME = "XRP"
+
+# We'll also produce an output aggregator Excel
+AGGREGATED_FILE = r"C:\Users\alexp\OneDrive\Desktop\Aggregated_Result.xlsx"
+
+# -----------------------------------------------------------------------------
+# 3. Load the “XRP” data from BANI.xlsx
+#    We focus on columns: XO Number, Voice, Amount, Journal Description
+# -----------------------------------------------------------------------------
+logging.info("Reading XRP data from BANI file...")
+xrp_df = pd.read_excel(BANI_FILE_PATH, sheet_name=XRP_SHEET_NAME)
+
+# Keep only the relevant columns (adapt if your real file differs)
+needed_cols = ["XO Number", "Voice", "Amount", "Journal Description"]
+xrp_df = xrp_df[needed_cols]
+
+# Convert columns to standard types
+xrp_df["XO Number"] = xrp_df["XO Number"].fillna("").astype(str).str.strip()
+xrp_df["Voice"]     = xrp_df["Voice"].fillna("").astype(str).str.strip()
+xrp_df["Amount"]    = xrp_df["Amount"].astype(float)
+xrp_df["Journal Description"] = xrp_df["Journal Description"].fillna("").astype(str).str.strip()
+
+# Drop rows missing Voice or Amount if that makes sense for your logic
+# If "Voice" can be blank and you want to skip them, do so here. Up to you.
+logging.info(f"Loaded {len(xrp_df)} rows of data from '{XRP_SHEET_NAME}'.")
+
+# -----------------------------------------------------------------------------
+# 4. Group by "Voice" and derive a single XO Number for each Voice group
+# -----------------------------------------------------------------------------
+
+# Optionally, you can define a dictionary if you want to map Journal Description
+# to some fallback XO. For example:
+desc_to_xo_map = {
+    "royalty": "9999",
+    "special": "8888",
+    # ... etc.
+}
+
+# We'll build a dictionary: voice_to_xo
+#  - We'll pick the first non-blank XO Number that appears in a group
+#  - If no row in that group has an XO Number, we can attempt a Journal Description approach
+#  - If still none, it's unmapped (e.g., an empty string).
+#
+# We'll also sum the total "Amount" for the group. At the end, we re-map each group to the final XO.
+#
+# Then aggregator[xo_number] = sum_of_amounts_for_all_rows_in_that_voice
+grouped = xrp_df.groupby("Voice")
+
+voice_to_xo = {}
+voice_to_amount_sum = {}
+
+for voice_val, group_df in grouped:
+    # voice_val: a single "Voice" name
+    # group_df: all rows that share that Voice
+    
+    # 4a. Find an XO Number
+    chosen_xo = ""
+    
+    # Step 1: See if any row in this voice group has a non-blank XO Number
+    non_blank_xo_series = group_df["XO Number"][group_df["XO Number"] != ""]
+    
+    if len(non_blank_xo_series) > 0:
+        # If multiple distinct, pick the first and log a warning if there's more than one
+        distinct_xos = non_blank_xo_series.unique()
+        chosen_xo = distinct_xos[0]
+        if len(distinct_xos) > 1:
+            logging.warning(
+                f"Voice='{voice_val}' has multiple distinct XO Numbers {distinct_xos}. "
+                f"Will pick the first: {chosen_xo}."
+            )
+    else:
+        # Step 2: No row had an explicit XO Number, so try Journal Description fallback
+        # e.g., if ANY row in that group has a Journal Description with a known keyword
+        # we choose that. If multiple rows have different keywords, pick first, etc.
+        fallback_xo = ""
+        for i, row in group_df.iterrows():
+            jdesc = row["Journal Description"].lower()
+            for kw, forced_xo in desc_to_xo_map.items():
+                if kw in jdesc:
+                    fallback_xo = forced_xo
+                    break
+            if fallback_xo:
+                break
+        if fallback_xo:
+            chosen_xo = fallback_xo
+        else:
+            # Step 3: If we still have nothing, remain unmapped
+            chosen_xo = ""
+    
+    # 4b. Sum the amounts for that group
+    total_amt = group_df["Amount"].sum()
+    
+    # Store our chosen XO and total for this voice group
+    voice_to_xo[voice_val] = chosen_xo
+    voice_to_amount_sum[voice_val] = total_amt
+
+# -----------------------------------------------------------------------------
+# 5. Now we transform this into an aggregator of XO Number -> total sum
+#    Because many different voices might share the same XO Number
+# -----------------------------------------------------------------------------
+aggregator = {}
+
+for voice_val, the_xo in voice_to_xo.items():
+    group_sum = voice_to_amount_sum[voice_val]
+    if not the_xo:
+        # Unmapped group, skip or store it under some placeholder
+        logging.info(f"Voice='{voice_val}' remains unmapped XO. Amount={group_sum}. Skipping aggregator.")
+        continue
+    
+    if the_xo not in aggregator:
+        aggregator[the_xo] = 0.0
+    aggregator[the_xo] += group_sum
+
+logging.info(f"Built aggregator with {len(aggregator)} XO Number(s).")
+
+# -----------------------------------------------------------------------------
+# 6. Create a final DataFrame showing: Voice, XO Number, Sum Amount
+#    Then a second summarizing XO Number -> total
+# -----------------------------------------------------------------------------
+rows = []
+for voice_val in sorted(voice_to_amount_sum.keys()):
+    chosen_xo = voice_to_xo[voice_val]
+    sum_amt   = voice_to_amount_sum[voice_val]
+    rows.append([voice_val, chosen_xo, sum_amt])
+
+detail_df = pd.DataFrame(rows, columns=["Voice", "XO Number", "Sum Amount"])
+
+# Also a summary by XO Number
+summary_rows = []
+for xo_num, total_amt in aggregator.items():
+    summary_rows.append([xo_num, total_amt])
+summary_df = pd.DataFrame(summary_rows, columns=["XO Number", "Total Amount"])
+
+# -----------------------------------------------------------------------------
+# 7. Write these to a new Excel file, "Aggregated_Result.xlsx"
+# -----------------------------------------------------------------------------
+logging.info(f"Writing aggregated data to '{AGGREGATED_FILE}'...")
+with pd.ExcelWriter(AGGREGATED_FILE, engine="openpyxl") as writer:
+    detail_df.to_excel(writer, sheet_name="ByVoice", index=False)
+    summary_df.to_excel(writer, sheet_name="ByXO", index=False)
+
+logging.info(f"Aggregation file '{AGGREGATED_FILE}' created successfully.")
+
+# Done
+logging.info("All steps complete.")

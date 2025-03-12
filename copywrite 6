@@ -158,4 +158,58 @@ logging.info("Aggregator file created successfully.")
 wb = load_workbook(BANI_FILE_PATH)
 if COPYWRITE_SHEET not in wb.sheetnames:
     logging.warning(f"Sheet '{COPYWRITE_SHEET}' not found in {BANI_FILE_PATH}. Exiting update.")
-    wb.c
+    wb.close()
+    exit()
+
+ws_copy = wb[COPYWRITE_SHEET]
+logging.info(f"Updating sheet '{COPYWRITE_SHEET}'...")
+
+max_row = ws_copy.max_row
+updated_count = 0
+
+def aggregator_key_for_sheet(xo_val, jd_val):
+    jd_val = jd_val.strip()
+    if jd_val:
+        return jd_val
+    return xo_val.strip()
+
+# We'll assume col E=5 for Journal Description
+COL_JOUR_DESC = COL_XO_NUMBER + 1  # if D=4 => E=5
+
+for r in range(DATA_START_ROW, max_row + 1):
+    val_xo = ws_copy.cell(row=r, column=COL_XO_NUMBER).value
+    val_jd = ws_copy.cell(row=r, column=COL_JOUR_DESC).value
+
+    xo_str = str(val_xo).strip() if val_xo else ""
+    jd_str = str(val_jd).strip() if val_jd else ""
+
+    final_key = aggregator_key_for_sheet(xo_str, jd_str)
+    if not final_key:
+        continue
+
+    if final_key in aggregator:
+        sum_val = aggregator[final_key]
+        cell_actual = ws_copy.cell(row=r, column=COL_JUN_ACTUAL)
+        cell_actual.value = sum_val
+
+        # remove old comment if any
+        if cell_actual.comment:
+            cell_actual.comment = None
+        cell_actual.comment = Comment("Updated by script", "Script")
+
+        updated_count += 1
+
+        # If aggregator key is from JD => rename col D
+        # means col E wasn't blank, but col D might have been blank
+        if jd_str and not xo_str:
+            ws_copy.cell(row=r, column=COL_XO_NUMBER).value = final_key
+
+logging.info(f"Updated {updated_count} row(s) in '{COPYWRITE_SHEET}'.")
+
+# -----------------------------------------------------------------------------
+# 10. Save
+# -----------------------------------------------------------------------------
+logging.info("Saving updated BANI workbook...")
+wb.save(BANI_FILE_PATH)
+wb.close()
+logging.info("Done! All updates saved.")

@@ -1,0 +1,291 @@
+import pandas as pd
+from datetime import datetime
+
+##########################################
+# 1) LOAD AND RENAME COLUMNS FOR FORM1
+##########################################
+
+# FORM1 has columns H to O (8 columns total).
+# Let’s assume 7 dimension columns + 1 value column.
+# That means columns H..N are dimensions, and O is the value.
+
+df_form1 = pd.read_excel(
+    "FORM1.xlsx",    # <--- change path if needed
+    sheet_name=0,
+    usecols="H:O"    # columns H through O
+)
+
+# Check what columns Pandas reads in:
+print("FORM1 columns read:", df_form1.columns.tolist())
+
+# Suppose we rename them: 
+#   H -> Dim1
+#   I -> Dim2
+#   J -> Dim3
+#   K -> Dim4
+#   L -> Dim5
+#   M -> Dim6
+#   N -> Dim7
+#   O -> Value
+df_form1.columns = [
+    "Dim1", "Dim2", "Dim3", "Dim4", "Dim5", "Dim6", "Dim7", "Value"
+]
+print("Renamed FORM1 columns:", df_form1.columns.tolist())
+
+
+##########################################
+# 2) LOAD AND RENAME COLUMNS FOR FORM2
+##########################################
+
+# FORM2 has columns H to W (16 columns total).
+# Let’s assume 14 dimension columns + 1 ID/event/account? 
+# But you said you want to treat them all as “dimensions” except maybe the last column as “Value.”
+# This is just an EXAMPLE. Adjust as needed!
+
+df_form2 = pd.read_excel(
+    "FORM2.xlsx",    # <--- change path if needed
+    sheet_name=0,
+    usecols="H:W"    # columns H through W
+)
+
+# Check the columns
+print("FORM2 columns read:", df_form2.columns.tolist())
+
+# Example: rename all columns H..V as dimensions + W as "Value".
+# If you actually have ID in U, event in V, account in W, then you must decide
+# if you want them as separate merges or treat them as dimension columns.
+# For now, we’ll say everything except the last column is a dimension, the last is Value.
+
+col_form2 = df_form2.columns.tolist()
+# The last column is W -> "Value"
+# The rest are dimension columns
+dim_cols_form2 = col_form2[:-1]  # all but last
+val_col_form2  = col_form2[-1]   # last
+
+# We can create dimension names like Dim1, Dim2, Dim3, ... etc.
+renamed_dims = {}
+for i, col in enumerate(dim_cols_form2, start=1):
+    renamed_dims[col] = f"Dim{i}"
+
+renamed_dims[val_col_form2] = "Value"
+
+df_form2.rename(columns=renamed_dims, inplace=True)
+print("Renamed FORM2 columns:", df_form2.columns.tolist())
+
+
+##########################################
+# 3) LOAD & RENAME COLUMNS FOR XRP
+##########################################
+
+# In XRP, you say each column is also a dimension plus one “Value” column.
+# Let's assume you have something like 7 dimension columns + 1 "Value" column,
+# plus a "date_col" to filter. Adapt as needed!
+
+df_xrp = pd.read_excel("XRP.xlsx", sheet_name=0)
+print("XRP columns read:", df_xrp.columns.tolist())
+
+# Suppose df_xrp has columns: [Xdim1, Xdim2, ..., Xdim7, Xvalue, date_col].
+# We rename them to match the same dimension naming scheme so merges line up.
+# (You must adapt the EXACT column names to your real ones.)
+
+# For example, let's define a dict if your real columns are named differently:
+rename_dict_xrp = {
+    "Xdim1": "Dim1",
+    "Xdim2": "Dim2",
+    "Xdim3": "Dim3",
+    "Xdim4": "Dim4",
+    "Xdim5": "Dim5",
+    "Xdim6": "Dim6",
+    "Xdim7": "Dim7",
+    "Xvalue": "Value",
+    "date_col": "date_col"  # we keep the date name for filtering
+}
+# If you have fewer or more dimension columns, adjust accordingly!
+
+df_xrp.rename(columns=rename_dict_xrp, inplace=True)
+
+# Convert date_col to datetime and filter by (isna or year>2200):
+df_xrp["date_col"] = pd.to_datetime(df_xrp["date_col"], errors="coerce")
+df_xrp_filtered = df_xrp[
+    df_xrp["date_col"].isna() | (df_xrp["date_col"].dt.year > 2200)
+].copy()
+
+print("XRP columns after rename:", df_xrp_filtered.columns.tolist())
+print("XRP rows after filter:", len(df_xrp_filtered))
+
+
+##########################################
+# 4) LOAD CASH
+##########################################
+
+# For CASH, you said: 
+#   “For CASH we only take values the header says which value it is.”
+#   Possibly you have columns that don't match the dimension approach?
+# Typically you might only compare “Value” columns or ID columns, etc.
+# We'll read it as is, and see how you want to merge.
+
+df_cash = pd.read_excel("CASH.xlsx", sheet_name=0)
+print("CASH columns read:", df_cash.columns.tolist())
+
+# If you want to rename some column in CASH to "Value" or keep them separate,
+# adapt here. For example, if there's a column named "CashValue" that we want
+# to compare to the "Value" in FORM, rename it to "Value" now:
+# df_cash.rename(columns={"CashValue": "Value"}, inplace=True)
+#
+# If you also have dimension columns in CASH that match the “Dim1…DimN,” rename them similarly.
+# Or if you only compare by ID, do that. This is up to your actual structure.
+
+
+##########################################
+# 5) HELPER FUNCTIONS FOR MERGING/STATUS
+##########################################
+
+def get_status(row, left_cols, right_cols):
+    """
+    Generic check:
+      - If left side columns are all NaN => "Not in LEFT"
+      - If right side columns are all NaN => "Not in RIGHT"
+      - If both sides are all NaN => "Empty in both"
+      - Else => "Present in both"
+    """
+    all_left_nan = row[left_cols].isna().all()
+    all_right_nan = row[right_cols].isna().all()
+    
+    if all_left_nan and not all_right_nan:
+        return "Not in LEFT"
+    elif all_right_nan and not all_left_nan:
+        return "Not in RIGHT"
+    elif all_left_nan and all_right_nan:
+        return "Empty in both"
+    else:
+        return "Present in both"
+
+def highlight_green(val):
+    return "background-color: lightgreen"
+
+def highlight_blue(val):
+    return "background-color: lightblue"
+
+def compare_dataframes(
+    df_left,
+    df_right,
+    merge_on_cols,
+    suffix_left="_FORM",
+    suffix_right="_OTHER",
+    how_merge="outer"
+):
+    """
+    Merges two dataframes on the given list of columns, adds a blank "Comment DXR",
+    a "Status" column, and returns a styled DataFrame.
+    """
+    # Merge
+    df_merged = pd.merge(
+        df_left,
+        df_right,
+        on=merge_on_cols,
+        how=how_merge,
+        suffixes=(suffix_left, suffix_right)
+    )
+    
+    # Add blank comment
+    df_merged["Comment DXR"] = ""
+
+    # Identify left vs right columns
+    # (Any column that doesn't end with suffix_right is presumably left, etc.)
+    # But since we used 'on=merge_on_cols' they won't get suffixes for the keys.
+    # We'll treat the merge keys as part of "left" for styling.
+    left_cols = (
+        [c for c in df_merged.columns if c.endswith(suffix_left)] 
+        + merge_on_cols
+    )
+    right_cols = [c for c in df_merged.columns if c.endswith(suffix_right)]
+
+    # Add status
+    df_merged["Status"] = df_merged.apply(
+        get_status,
+        axis=1,
+        left_cols=left_cols,
+        right_cols=right_cols
+    )
+
+    # Apply color styling
+    styler = df_merged.style
+    if left_cols:
+        styler = styler.applymap(highlight_green, subset=left_cols)
+    if right_cols:
+        styler = styler.applymap(highlight_blue, subset=right_cols)
+
+    return styler
+
+
+##########################################
+# 6) PERFORM THE COMPARISONS
+##########################################
+
+# Example merges:
+#   - FORM1 vs XRP:  Suppose we have 7 dimension columns + "Value" in both
+#                    so we do merges on the 7 dimension columns. 
+#                    We usually wouldn't merge on "Value" but on the dimension keys only.
+#                    If you need to match "Value" too, you can add it, but typically not.
+merge_keys_form1_xrp = ["Dim1", "Dim2", "Dim3", "Dim4", "Dim5", "Dim6", "Dim7"]
+styler_form1_xrp = compare_dataframes(
+    df_left=df_form1,
+    df_right=df_xrp_filtered,
+    merge_on_cols=merge_keys_form1_xrp,   # Only dimension columns
+    suffix_left="_FORM1",
+    suffix_right="_XRP"
+)
+
+#   - FORM1 vs CASH:
+#     If you only compare by the same dimension columns (Dim1..Dim7), or maybe by an ID column?
+#     Here’s a sample if you want to do the same dimension-based merge:
+merge_keys_form1_cash = ["Dim1", "Dim2", "Dim3", "Dim4", "Dim5", "Dim6", "Dim7"]
+styler_form1_cash = compare_dataframes(
+    df_left=df_form1,
+    df_right=df_cash,
+    merge_on_cols=merge_keys_form1_cash,  # or "ID"? or some other columns?
+    suffix_left="_FORM1",
+    suffix_right="_CASH"
+)
+
+#   - FORM2 vs XRP:
+#     If FORM2 also has the same dimension columns (Dim1..Dim14 or so) plus "Value,"
+#     you might only merge on the dimension columns (not Value). Adjust as needed.
+
+# Let’s say we ended up with Dim1..Dim14 in FORM2 after renaming, ignoring the last for "Value".
+# If we only had 7 dims in XRP, obviously we must decide how many match. 
+# This is *HIGHLY* dependent on your real data. For example:
+dim_cols_form2 = [c for c in df_form2.columns if c.startswith("Dim")]
+styler_form2_xrp = compare_dataframes(
+    df_left=df_form2,
+    df_right=df_xrp_filtered,
+    merge_on_cols=dim_cols_form2,    # e.g. 14 dimension columns?
+    suffix_left="_FORM2",
+    suffix_right="_XRP"
+)
+
+#   - FORM2 vs CASH
+styler_form2_cash = compare_dataframes(
+    df_left=df_form2,
+    df_right=df_cash,
+    merge_on_cols=dim_cols_form2,    # or ID/event/account, up to you
+    suffix_left="_FORM2",
+    suffix_right="_CASH"
+)
+
+##########################################
+# 7) WRITE ALL RESULTS TO ONE EXCEL FILE
+##########################################
+
+output_file = "Comparison_Output.xlsx"
+with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+    styler_form1_xrp.to_excel(writer, sheet_name="FORM1_vs_XRP", index=False)
+    styler_form1_cash.to_excel(writer, sheet_name="FORM1_vs_CASH", index=False)
+    styler_form2_xrp.to_excel(writer, sheet_name="FORM2_vs_XRP", index=False)
+    styler_form2_cash.to_excel(writer, sheet_name="FORM2_vs_CASH", index=False)
+
+print("Done! Created", output_file, "with 4 sheets:")
+print("  - FORM1_vs_XRP")
+print("  - FORM1_vs_CASH")
+print("  - FORM2_vs_XRP")
+print("  - FORM2_vs_CASH")

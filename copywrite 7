@@ -1,0 +1,262 @@
+import logging
+import pandas as pd
+import warnings
+from openpyxl import load_workbook
+from openpyxl.comments import Comment
+
+# -----------------------------------------------------------------------------
+# 1. Logging Setup
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+# -----------------------------------------------------------------------------
+# 2. File Paths & Sheet Names
+# -----------------------------------------------------------------------------
+MAP_FILE_PATH    = r"C:\Users\alexp\OneDrive\Desktop\MAP.xlsx"
+BANI_FILE_PATH   = r"C:\Users\alexp\OneDrive\Desktop\BANI.xlsx"
+
+MAPPING_SHEET    = "Mapping Main"
+XRP_SHEET        = "XRP"
+COPYWRITE_SHEET  = "Copywrite"
+
+AGGREGATED_FILE  = r"C:\Users\alexp\OneDrive\Desktop\Aggregated_Copywrite.xlsx"
+
+# We'll keep only rows where 'Description 2' == 'Copywrite'
+TARGET_DESC2_VALUE = "Copywrite"
+
+# Copywrite sheet layout
+#   row 15 = header
+#   row 16+ => data
+DATA_START_ROW  = 16
+ROW_HEADER      = 15
+
+# Column definitions (1-based):
+#   D=4 => "XO Number"
+#   E=5 => "Journal Description" (if used)
+#   S=19 => "Jun Actual"
+COL_XO_NUMBER  = 4
+COL_JUN_ACTUAL = 19
+
+# -----------------------------------------------------------------------------
+# 3. Two rename dictionaries:
+#    - rename_xo_dict: if we see a certain XO #, we rename it for aggregator
+#    - rename_jd_dict: if we see a certain JD, rename it
+#    If an entry isn't found, we keep original as is.
+# -----------------------------------------------------------------------------
+rename_xo_dict = {
+    # "10A": "XO_10A_new_label",
+    # "20B": "XO_20B_new_label",
+    # ...
+}
+rename_jd_dict = {
+    # "B30": "Renamed_B30",
+    # "Total Amounts in Canada".lower(): "Total AM Canada"
+    # ...
+}
+
+# -----------------------------------------------------------------------------
+# 4. Load Mapping & Filter for Copywrite
+# -----------------------------------------------------------------------------
+logging.info("Loading mapping data from MAP.xlsx...")
+map_df = pd.read_excel(MAP_FILE_PATH, sheet_name=MAPPING_SHEET)
+
+map_df = map_df.dropna(subset=["Account"])
+map_df["Account"]       = map_df["Account"].astype(str).str.strip()
+map_df["Description 2"] = map_df["Description 2"].astype(str).str.strip()
+
+copy_map = map_df[map_df["Description 2"] == TARGET_DESC2_VALUE]
+if copy_map.empty:
+    logging.warning(f"No rows found where 'Description 2' == '{TARGET_DESC2_VALUE}'. Exiting.")
+    exit()
+
+copywrite_accounts = set(copy_map["Account"].unique())
+logging.info(f"Found {len(copywrite_accounts)} 'Copywrite' account(s).")
+
+# -----------------------------------------------------------------------------
+# 5. Load the "XRP" sheet from BANI, treat everything but "Amount" as string
+# -----------------------------------------------------------------------------
+logging.info(f"Loading '{XRP_SHEET}' from {BANI_FILE_PATH}...")
+
+all_xrp = pd.read_excel(BANI_FILE_PATH, sheet_name=XRP_SHEET, dtype=str)
+needed_cols = ["Nat Account", "XO Number", "Journal Description", "Voice", "Amount"]
+xrp_df = all_xrp[needed_cols].copy()
+
+# Fix "Amount" to numeric
+xrp_df["Amount"] = pd.to_numeric(xrp_df["Amount"], errors="coerce").fillna(0.0)
+
+# Convert the rest to string
+for col in ["Nat Account", "XO Number", "Journal Description", "Voice"]:
+    xrp_df[col] = xrp_df[col].fillna("").astype(str).str.strip()
+
+logging.info(f"Loaded {len(xrp_df)} rows from XRP. First few:\n{xrp_df.head()}")
+
+# -----------------------------------------------------------------------------
+# 6. Filter to Only Copywrite Accounts
+# -----------------------------------------------------------------------------
+xrp_df["Nat Account"] = xrp_df["Nat Account"].astype(str).str.strip()
+filtered_df = xrp_df[xrp_df["Nat Account"].isin(copywrite_accounts)].copy()
+if filtered_df.empty:
+    logging.info("No rows in XRP match copywrite accounts. Exiting.")
+    exit()
+
+logging.info(f"Filtered to {len(filtered_df)} row(s) for Copywrite accounts.")
+
+# -----------------------------------------------------------------------------
+# 7. Rename XO & JD from the dictionaries
+# -----------------------------------------------------------------------------
+def rename_xo(original_xo):
+    original_xo_lower = original_xo.lower()
+    if original_xo_lower in rename_xo_dict:
+        return rename_xo_dict[original_xo_lower]
+    return original_xo
+
+def rename_jd(original_jd):
+    original_jd_lower = original_jd.lower()
+    if original_jd_lower in rename_jd_dict:
+        return rename_jd_dict[original_jd_lower]
+    return original_jd
+
+filtered_df["RenamedXO"] = filtered_df["XO Number"].apply(rename_xo)
+filtered_df["RenamedJD"] = filtered_df["Journal Description"].apply(rename_jd)
+
+# -----------------------------------------------------------------------------
+# 8. Aggregator Key: 
+#    if RenamedXO is not blank => aggregator_key = RenamedXO
+#    else if RenamedJD is not blank => aggregator_key = RenamedJD
+#    else skip
+#
+#  (You said "Aggregate by XO first then Journal Description". 
+#   So XO is the priority if not blank. If XO blank, use JD.)
+# -----------------------------------------------------------------------------
+def aggregator_key_priority(rxo, rjd):
+    rx = rxo.strip()
+    if rx:
+        return rx
+    rj = rjd.strip()
+    if rj:
+        return rj
+    return ""
+
+filtered_df["AggregatorKey"] = filtered_df.apply(
+    lambda row: aggregator_key_priority(row["RenamedXO"], row["RenamedJD"]),
+    axis=1
+)
+groupable = filtered_df[filtered_df["AggregatorKey"] != ""].copy()
+
+# -----------------------------------------------------------------------------
+# 9. Sum "Amount" for each aggregator key
+# -----------------------------------------------------------------------------
+agg_df = (
+    groupable
+    .groupby("AggregatorKey")["Amount"]
+    .sum()
+    .reset_index()
+)
+
+logging.info(f"Aggregated into {len(agg_df)} aggregator keys.")
+
+# aggregator dict
+aggregator = {}
+for _, row in agg_df.iterrows():
+    key = row["AggregatorKey"]
+    aggregator[key] = row["Amount"]
+
+# -----------------------------------------------------------------------------
+# 10. Write aggregator to "Aggregated_Copywrite.xlsx"
+# -----------------------------------------------------------------------------
+logging.info(f"Creating aggregator file '{AGGREGATED_FILE}'...")
+report_df = agg_df.rename(columns={
+    "AggregatorKey": "Aggregator Key (XO first, else JD)",
+    "Amount": "Sum Amount"
+})
+report_df.sort_values(by="Aggregator Key (XO first, else JD)", inplace=True)
+report_df.to_excel(AGGREGATED_FILE, sheet_name="Aggregated", index=False)
+logging.info("Aggregator file created successfully.")
+
+# -----------------------------------------------------------------------------
+# 11. Update "Copywrite" sheet
+#     For each row from row 16 onward:
+#      a) read XO = col D, JD = col E if present
+#      b) rename XO & JD from dictionaries
+#      c) aggregator key = renamed XO if not blank, else renamed JD
+#      d) if aggregator has that key => place sum in col S
+#      e) if aggregator key came from JD => rename col D with that aggregator key
+# -----------------------------------------------------------------------------
+wb = load_workbook(BANI_FILE_PATH)
+if COPYWRITE_SHEET not in wb.sheetnames:
+    logging.warning(f"Sheet '{COPYWRITE_SHEET}' not found in {BANI_FILE_PATH}. Exiting update.")
+    wb.close()
+    exit()
+
+ws_copy = wb[COPYWRITE_SHEET]
+logging.info(f"Updating sheet '{COPYWRITE_SHEET}'...")
+
+max_row = ws_copy.max_row
+updated_count = 0
+
+# We'll define local rename functions that match the aggregator rename
+def rename_xo_local(x):
+    lx = x.lower()
+    return rename_xo_dict[lx] if lx in rename_xo_dict else x
+
+def rename_jd_local(j):
+    lj = j.lower()
+    return rename_jd_dict[lj] if lj in rename_jd_dict else j
+
+def aggregator_key_sheet(xo_val, jd_val):
+    # Priority: XO first, else JD, after rename
+    rxo = rename_xo_local(xo_val)
+    rjd = rename_jd_local(jd_val)
+    rxo = rxo.strip()
+    rjd = rjd.strip()
+    if rxo:
+        return rxo
+    if rjd:
+        return rjd
+    return ""
+
+# We'll guess col E=5 is JD
+COL_JOUR_DESC = COL_XO_NUMBER + 1  # if D=4 => E=5
+
+for r in range(DATA_START_ROW, max_row + 1):
+    val_xo = ws_copy.cell(row=r, column=COL_XO_NUMBER).value
+    val_jd = ws_copy.cell(row=r, column=COL_JOUR_DESC).value
+
+    xo_str = str(val_xo).strip() if val_xo else ""
+    jd_str = str(val_jd).strip() if val_jd else ""
+
+    final_key = aggregator_key_sheet(xo_str, jd_str)
+    if not final_key:
+        continue
+
+    if final_key in aggregator:
+        sum_val = aggregator[final_key]
+        cell_s = ws_copy.cell(row=r, column=COL_JUN_ACTUAL)
+        cell_s.value = sum_val
+
+        # remove old comment if any
+        if cell_s.comment:
+            cell_s.comment = None
+        cell_s.comment = Comment("Updated by script", "Script")
+
+        updated_count += 1
+
+        # If aggregator key came from JD => means XO was blank
+        # or aggregator key differs from original XO
+        # We'll check if the aggregator key != the original XO
+        if final_key != xo_str:
+            ws_copy.cell(row=r, column=COL_XO_NUMBER).value = final_key
+
+logging.info(f"Updated {updated_count} row(s) in '{COPYWRITE_SHEET}'.")
+
+# -----------------------------------------------------------------------------
+# 12. Save changes to BANI
+# -----------------------------------------------------------------------------
+logging.info("Saving updated BANI workbook...")
+wb.save(BANI_FILE_PATH)
+wb.close()
+logging.info("Done! All updates saved.")

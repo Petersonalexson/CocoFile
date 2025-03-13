@@ -1,86 +1,35 @@
-Sub RefreshSmartViewHierarchies()
+Sub RefreshSmartViewTree
     Dim arrSheets As Variant
-    Dim ws As Worksheet
+    Dim ws As Worksheet 
     Dim ConnectionName As String
-    Dim Ret As Long, HeaderRow As Long, LastRow As Long, i As Long
+    Dim Ret As Long, HeaderRow As Long, LastRow As Long, I As Long
     Dim ConnStatus As Integer
     
-    ' Reference to your list worksheet containing the mapping data
-    With ThisWorkbook.Worksheets("Lists")  ' Assuming "Lists" is the sheet name with mappings
-        ConnectionName = .Range("nmConnectionName").Value
-        arrSheets = .Range("Hierarchy_Matrix").Value
+    With wsLists
+        ConnectionName = .Range("nmConnectionName")
+        arrSheets = .Range("Hierarchy_Matrix")
     End With
     
-    HeaderRow = 7  ' As mentioned in your description, header is in row 7
+    HeaderRow = 4
     
-    For i = LBound(arrSheets) To UBound(arrSheets)
-        ' Check if sheet name is not empty
-        If Len(Trim(arrSheets(i, 1))) > 0 Then
-            Set ws = ThisWorkbook.Worksheets(arrSheets(i, 1))
+    For I = LBound(arrSheets) To UBound(arrSheets)
+        Set ws = ThisWorkbook.Worksheets(arrSheets(I, 1))
+        With ws
+            Ret = HypUIConnect(.Name, "", "", ConnectionName)
+            ConnStatus = HypConnected(.Name)
+            If ConnStatus <> -1 Then Stop
+            'Calculate last row
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            'Delete hierarchy rows except hierarchy name
+            If LastRow > HeaderRow Then
+                .Rows(HeaderRow & ":" & LastRow - 1).Delete Shift:=xlUp
+            End If
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            Ret = HypSetSheetOption(.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
+            Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
             
-            With ws
-                ' Connect to Smart View with proper parameters
-                Ret = HypUIConnect(.Name, "", ConnectionName)
-                ConnStatus = HypConnected(.Name)
-                
-                ' Check if connection is successful
-                If ConnStatus <> -1 Then
-                    MsgBox "Failed to connect to " & ConnectionName & " on sheet " & .Name, vbExclamation
-                    Exit Sub
-                End If
-                
-                ' Calculate last row
-                LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
-                
-                ' Delete hierarchy rows except hierarchy name
-                If LastRow > HeaderRow Then
-                    .Rows((HeaderRow + 1) & ":" & LastRow).Delete Shift:=xlUp
-                End If
-                
-                ' Get the row with the hierarchy name
-                LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
-                
-                ' Set member display option
-                Ret = HypSetSheetOption(.Name, HSV_MEMBER_DISPLAY, 1)
-                
-                ' Zoom in (drill down) on the hierarchy
-                Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
-                
-                ' Find the last row after zoom in
-                LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
-                
-                ' Simply create or update the named range after zoom in
-                On Error Resume Next
-                ' If range exists, delete it first
-                If NamedRangeExists(arrSheets(i, 2)) Then
-                    ThisWorkbook.Names(arrSheets(i, 2)).Delete
-                End If
-                
-                ' Create new named range for the data
-                ThisWorkbook.Names.Add _
-                    Name:=arrSheets(i, 2), _
-                    RefersTo:="=" & ws.Name & "!A" & (HeaderRow + 1) & ":A" & LastRow
-                
-                If Err.Number <> 0 Then
-                    Debug.Print "Error creating named range: " & arrSheets(i, 2) & " - " & Err.Description
-                End If
-                On Error GoTo 0
-            End With
-            
-            Set ws = Nothing
-        End If
-    Next i
-    
-    MsgBox "Smart View hierarchies have been refreshed successfully!", vbInformation
+            ThisWorkbook.Names.Add Name:=arrSheets(I, 2), RefersTo:=.Range("A" & HeaderRow & ":A" & LastRow)
+        End With
+    Next I
 End Sub
-
-' Helper function to check if a named range exists
-Function NamedRangeExists(rangeName As String) As Boolean
-    Dim nm As Name
-    
-    On Error Resume Next
-    Set nm = ThisWorkbook.Names(rangeName)
-    On Error GoTo 0
-    
-    NamedRangeExists = Not nm Is Nothing
-End Function

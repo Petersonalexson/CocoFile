@@ -1,0 +1,210 @@
+Option Explicit
+
+' Main procedure to refresh Smart View hierarchies and create query tables
+Sub RefreshSmartViewHierarchiesAndCreateTables()
+    ' First refresh all the Smart View hierarchies
+    RefreshSmartViewHierarchies
+    
+    ' Then create query tables using Power Query
+    CreateQueryTablesFromHierarchies
+End Sub
+
+' Procedure to refresh Smart View hierarchies
+Sub RefreshSmartViewHierarchies()
+    Dim arrSheets As Variant
+    Dim ws As Worksheet
+    Dim ConnectionName As String
+    Dim Ret As Long, HeaderRow As Long, LastRow As Long, i As Long
+    Dim ConnStatus As Integer
+    
+    With wsLists
+        ConnectionName = .Range("nmConnectionName")
+        arrSheets = .Range("Hierarchy_Matrix")
+    End With
+    
+    HeaderRow = 4
+    
+    ' Turn off screen updating for better performance
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    
+    For i = LBound(arrSheets) To UBound(arrSheets)
+        Set ws = ThisWorkbook.Worksheets(arrSheets(i, 1))
+        
+        With ws
+            Ret = HypUIConnect(.Name, "", "", ConnectionName)
+            ConnStatus = HypConnected(.Name)
+            
+            If ConnStatus <> -1 Then
+                MsgBox "Connection failed for sheet: " & .Name, vbExclamation
+                GoTo NextSheet
+            End If
+            
+            ' Calculate last row
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            
+            ' Delete hierarchy rows except hierarchy name
+            If LastRow > HeaderRow Then
+                .Rows(HeaderRow & ":" & LastRow - 1).Delete Shift:=xlUp
+            End If
+            
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            Ret = HypSetSheetOption(.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
+            Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False) ' Drilldown on node
+            
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            
+            ' Create named range with trimmed name (no spaces)
+            Dim rangeName As String
+            rangeName = Trim(arrSheets(i, 2))
+            
+            ' Check if range name exists and delete it if needed
+            On Error Resume Next
+            ThisWorkbook.Names(rangeName).Delete
+            On Error GoTo 0
+            
+            ' Create the named range
+            ThisWorkbook.Names.Add Name:=rangeName, RefersTo:=ws.Range("A" & HeaderRow & ":A" & LastRow)
+        End With
+        
+NextSheet:
+        Set ws = Nothing
+    Next i
+    
+    ' Turn screen updating back on
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+End Sub
+
+' Procedure to create query tables using Power Query
+Sub CreateQueryTablesFromHierarchies()
+    Dim arrSheets As Variant
+    Dim i As Long
+    Dim rangeName As String
+    Dim queryName As String
+    Dim sheetName As String
+    Dim querySheet As Worksheet
+    Dim connection As WorkbookConnection
+    
+    ' Get the hierarchy matrix
+    With wsLists
+        arrSheets = .Range("Hierarchy_Matrix")
+    End With
+    
+    ' Turn off screen updating for better performance
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    
+    ' Loop through each hierarchy
+    For i = LBound(arrSheets) To UBound(arrSheets)
+        rangeName = Trim(arrSheets(i, 2))  ' This is the array/named range created after zoom in
+        sheetName = Trim(arrSheets(i, 1))
+        queryName = sheetName & "_Table"
+        
+        ' Check if the array exists
+        Dim rangeExists As Boolean
+        rangeExists = False
+        
+        On Error Resume Next
+        If Not ThisWorkbook.Names(rangeName) Is Nothing Then
+            rangeExists = True
+        End If
+        On Error GoTo 0
+        
+        If Not rangeExists Then
+            MsgBox "Named range '" & rangeName & "' does not exist. Did you run the RefreshSmartViewHierarchies first?", vbExclamation
+            GoTo NextHierarchy
+        End If
+        
+        ' Check if the query sheet exists
+        On Error Resume Next
+        Set querySheet = ThisWorkbook.Worksheets(queryName)
+        On Error GoTo 0
+        
+        If querySheet Is Nothing Then
+            ' Create a new sheet for the query table
+            Set querySheet = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+            querySheet.Name = queryName
+        Else
+            ' Clear existing content
+            querySheet.UsedRange.Clear
+        End If
+        
+        ' Remove any existing query with this name
+        On Error Resume Next
+        For Each connection In ThisWorkbook.Connections
+            If connection.Name = queryName Then
+                connection.Delete
+                Exit For
+            End If
+        Next connection
+        On Error GoTo 0
+        
+        ' Create the Power Query
+        Dim queryText As String
+        queryText = "let" & vbCrLf & _
+                   "    Source = Excel.CurrentWorkbook(){[Name=""" & rangeName & """]}[Content]," & vbCrLf & _
+                   "    #""Changed Type"" = Table.TransformColumnTypes(Source,{{""Column1"", type text}})," & vbCrLf & _
+                   "    #""Unflatten"" = fnGetERPHierarchySmartViewParent(#""Changed Type"")" & vbCrLf & _
+                   "in" & vbCrLf & _
+                   "    #""Unflatten"""
+        
+        ' Create the workbook query
+        Dim wbQuery As WorkbookQuery
+        On Error Resume Next
+        Set wbQuery = ThisWorkbook.Queries.Add(queryName, queryText, True)
+        
+        If Err.Number <> 0 Then
+            MsgBox "Error creating query: " & Err.Description, vbExclamation
+            GoTo NextHierarchy
+        End If
+        On Error GoTo 0
+        
+        ' Create the query table
+        Dim qryTable As QueryTable
+        Set qryTable = querySheet.QueryTables.Add( _
+            Connection:="OLEDB;Provider=Microsoft.Mashup.OleDb.1;Data Source=$Workbook$;Location=" & queryName, _
+            Destination:=querySheet.Range("A1"))
+        
+        ' Set up the query table properties
+        With qryTable
+            .CommandType = xlCmdSql
+            .CommandText = Array(queryName)
+            .BackgroundQuery = False
+            .RefreshStyle = xlOverwriteCells
+            .SaveData = True
+            .RefreshOnFileOpen = False
+            .AdjustColumnWidth = True
+            
+            ' Refresh the query
+            On Error Resume Next
+            .Refresh BackgroundQuery:=False
+            If Err.Number <> 0 Then
+                MsgBox "Error refreshing query: " & Err.Description, vbExclamation
+            End If
+            On Error GoTo 0
+        End With
+        
+        ' Auto-fit columns
+        querySheet.Columns("A:Z").AutoFit
+        
+NextHierarchy:
+    Next i
+    
+    ' Turn screen updating back on
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    
+    MsgBox "Query tables created/updated successfully using the arrays!", vbInformation, "Process Complete"
+End Sub
+
+' Helper function to check if a worksheet exists
+Function SheetExists(sheetName As String) As Boolean
+    Dim ws As Worksheet
+    
+    On Error Resume Next
+    Set ws = ThisWorkbook.Sheets(sheetName)
+    On Error GoTo 0
+    
+    SheetExists = Not ws Is Nothing
+End Function

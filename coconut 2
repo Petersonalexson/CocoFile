@@ -1,62 +1,103 @@
 Sub RefreshSmartViewTree()
 
-    Dim arrSheets As Variant
     Dim wsLists As Worksheet
     Dim ws As Worksheet
+    Dim arrSheets As Variant
     Dim ConnectionName As String
-    Dim Ret As Long, HeaderRow As Long, LastRow As Long, i As Long
-    Dim ConnStatus As Integer
     
-    ' Change "wsLists" to the sheet that contains nmConnectionName & Hierarchy_Matrix
-    Set wsLists = ThisWorkbook.Worksheets("Lists")  
+    Dim Ret As Long
+    Dim HeaderRow As Long
+    Dim LastRow As Long
+    Dim LastCol As Long
+    Dim i As Long
+    Dim ConnStatus As Long
+    
+    ' 1) Identify the sheet that has nmConnectionName & Hierarchy_Matrix
+    Set wsLists = ThisWorkbook.Worksheets("Lists")
     
     With wsLists
         ConnectionName = .Range("nmConnectionName").Value
         arrSheets = .Range("Hierarchy_Matrix").Value
     End With
-
+    
+    ' 2) Set your header row
     HeaderRow = 4
     
+    ' 3) Loop through each row in Hierarchy_Matrix
     For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
         
-        ' 1) Grab the worksheet
+        '   A) Get the target worksheet (col A) and the named range to reset (col B)
         Set ws = ThisWorkbook.Worksheets(arrSheets(i, 1))
         
         With ws
-            ' 2) Connect to Smart View
+            
+            ' --- CONNECT to Smart View ---
             Ret = HypUIConnect(.Name, "", "", ConnectionName)
             ConnStatus = HypConnected(.Name)
-            If ConnStatus <> -1 Then Stop  ' Debug check if not connected
+            If ConnStatus <> -1 Then Stop  ' Debug: Stop if not connected
             
-            ' 3) Calculate the last row in Column A
-            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            ' --- FIND LAST ROW & LAST COL BEFORE DELETING ---
+            '     We'll assume your data is in column A downward,
+            '     but you also want the maximum used columns.
             
-            ' 4) Delete hierarchy rows except the "hierarchy name" in the last row
-            If LastRow > HeaderRow Then
-                .Rows(HeaderRow & ":" & (LastRow - 1)).Delete Shift:=xlUp
+            LastRow = .Cells(.Rows.Count, 1).End(xlUp).Row  ' Last used row in Column A
+            ' Use FIND to get the truly last used column in the sheet (safer than row-based):
+            If Application.WorksheetFunction.CountA(.Cells) = 0 Then
+                ' If the sheet is empty, skip
+                LastCol = 1
+            Else
+                LastCol = .Cells.Find("*", , xlFormulas, xlWhole, xlByColumns, xlPrevious).Column
             End If
             
-            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            ' --- DELETE old hierarchy rows EXCEPT the last row ---
+            '     We keep row "LastRow" because it might have the final "hierarchy name."
+            If LastRow > HeaderRow Then
+                If (LastRow - 1) >= (HeaderRow + 1) Then
+                    .Range(.Cells(HeaderRow + 1, 1), .Cells(LastRow - 1, LastCol)).Delete Shift:=xlUp
+                End If
+            End If
             
-            ' 5) Set the member display option
+            ' Recalculate last row after delete
+            LastRow = .Cells(.Rows.Count, 1).End(xlUp).Row
+            If Application.WorksheetFunction.CountA(.Cells) = 0 Then
+                LastCol = 1
+            Else
+                LastCol = .Cells.Find("*", , xlFormulas, xlWhole, xlByColumns, xlPrevious).Column
+            End If
+            
+            ' --- SET SHEET OPTION (member display) ---
             Ret = HypSetSheetOption(.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
             
-            ' 6) Drill (Zoom In) on the bottom cell
-            Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
+            ' --- ZOOM IN on the final row's Column A ---
+            Ret = HypZoomIn(.Name, .Cells(LastRow, 1), 1, False)
             
-            ' 7) Recalculate last row after zoom
-            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            ' Recalc last row/col after Zoom
+            LastRow = .Cells(.Rows.Count, 1).End(xlUp).Row
+            If Application.WorksheetFunction.CountA(.Cells) = 0 Then
+                LastCol = 1
+            Else
+                LastCol = .Cells.Find("*", , xlFormulas, xlWhole, xlByColumns, xlPrevious).Column
+            End If
             
-            ' ------------------------------------------------------------
-            ' 8) RESET the named range so it covers the new data
-            '    arrSheets(i, 2) = Name of the range (e.g. "MyHierarchyRange")
-            ' ------------------------------------------------------------
-            ThisWorkbook.Names(arrSheets(i, 2)).RefersTo = _
-                "='" & .Name & "'!A" & (HeaderRow + 1) & ":A" & LastRow
+            ' --- RESET THE NAMED RANGE (arrSheets(i,2)) ---
+            '     Range covers everything from row (HeaderRow+1) to LastRow,
+            '     across columns 1..LastCol. This ensures we pick up all columns.
+            
+            ' If there's truly no data below the header, avoid an invalid reference
+            If LastRow < (HeaderRow + 1) Then
+                ' No data
+                ThisWorkbook.Names(arrSheets(i, 2)).RefersTo = "='" & .Name & "'!A" & (HeaderRow + 1)
+            Else
+                Dim rngNew As Range
+                Set rngNew = .Range(.Cells(HeaderRow + 1, 1), .Cells(LastRow, LastCol))
+                
+                ThisWorkbook.Names(arrSheets(i, 2)).RefersTo = "='" & .Name & "'!" & rngNew.Address
+            End If
+            
         End With
         
         Set ws = Nothing
     Next i
     
-    MsgBox "Smart View tree refresh complete!", vbInformation
+    MsgBox "Smart View Tree refresh complete!", vbInformation
 End Sub

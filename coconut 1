@@ -1,0 +1,56 @@
+Option Explicit
+
+Sub RefreshSmartViewTree()
+    Dim wsLists As Worksheet
+    Dim arrSheets As Variant
+    Dim ws As Worksheet
+    Dim ConnectionName As String
+    Dim Ret As Long, ConnStatus As Long
+    Dim HeaderRow As Long, LastRow As Long
+    Dim i As Long
+    
+    Set wsLists = ThisWorkbook.Worksheets("wsLists")
+    ConnectionName = wsLists.Range("nmConnectionName").Value
+    arrSheets = wsLists.Range("Hierarchy_Matrix").Value
+    HeaderRow = 4
+    
+    For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
+        Set ws = ThisWorkbook.Worksheets(arrSheets(i, 1))
+        Ret = HypUIConnect(ws.Name, "", "", ConnectionName)
+        ConnStatus = HypConnected(ws.Name)
+        If ConnStatus <> -1 Then
+            MsgBox "Connection to [" & ConnectionName & "] failed on " & ws.Name, vbExclamation
+            GoTo NextSheet
+        End If
+        
+        LastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+        If LastRow > HeaderRow Then
+            ws.Rows(HeaderRow + 1 & ":" & LastRow).Delete Shift:=xlUp
+        End If
+        
+        Ret = HypSetSheetOption(ws.Name, HSV_MEMBER_DISPLAY, 1)
+        LastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+        Ret = HypZoomIn(ws.Name, ws.Range("A" & LastRow), 1, False)
+        LastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+        
+        If LastRow >= (HeaderRow + 1) Then
+            Dim rngFormula As String
+            rngFormula = "='" & ws.Name & "'!A" & (HeaderRow + 1) & ":A" & LastRow
+            On Error Resume Next
+            ThisWorkbook.Names(arrSheets(i, 2)).RefersTo = rngFormula
+            If Err.Number <> 0 Then
+                Err.Clear
+                ThisWorkbook.Names.Add Name:=arrSheets(i, 2), RefersTo:=rngFormula
+            End If
+            On Error GoTo 0
+        Else
+            On Error Resume Next
+            ThisWorkbook.Names(arrSheets(i, 2)).Delete
+            On Error GoTo 0
+        End If
+        
+NextSheet:
+    Next i
+    
+    MsgBox "All Smart View sheets have been refreshed and named ranges updated!", vbInformation
+End Sub

@@ -1,0 +1,144 @@
+Function BuildQueryText(rangeName As String) As String
+    Dim mCode As String
+    
+    ' Start building the query text
+    mCode = "let" & vbCrLf
+    mCode = mCode & "    Source = Excel.CurrentWorkbook(){[Name=""" & rangeName & """]}[Content]," & vbCrLf
+    mCode = mCode & "    remove_nulls = Table.SelectRows(Source, each [Column1] <> null and [Column1] <> """")," & vbCrLf
+    mCode = mCode & "    #""Duplicated Column"" = Table.DuplicateColumn(remove_nulls, ""Column1"", ""Value"")," & vbCrLf
+    mCode = mCode & "    #""Added Custom"" = Table.AddColumn(#""Duplicated Column"", ""Nb Levels"", each List.Count(Text.PositionOfAny([Value], {"" ""}, Occurrence.All))/4, Int64.Type)," & vbCrLf
+    mCode = mCode & "    #""Trimmed Text"" = Table.TransformColumns(#""Added Custom"", {{""Value"", Text.Trim, type text}})," & vbCrLf
+    mCode = mCode & "    #""Changed Type"" = Table.TransformColumnTypes(#""Trimmed Text"", {{""Column1"", type text}})," & vbCrLf
+    mCode = mCode & "    #""Added Index"" = Table.AddIndexColumn(#""Changed Type"", ""Index"", 1, 1, Int64.Type)," & vbCrLf
+    mCode = mCode & "    #""Sorted Rows"" = Table.Sort(#""Added Index"", {{""Index"", Order.Descending}})," & vbCrLf
+    mCode = mCode & "    max_levels = List.Max(#""Sorted Rows""[Nb Levels])," & vbCrLf
+    
+    ' Add list_of_code_levels
+    mCode = mCode & "    list_of_code_levels = List.Generate(" & vbCrLf
+    mCode = mCode & "        () => 1," & vbCrLf
+    mCode = mCode & "        each _ <= max_levels," & vbCrLf
+    mCode = mCode & "        each _ + 1," & vbCrLf
+    mCode = mCode & "        each ""Level"" & Text.From(_)" & vbCrLf
+    mCode = mCode & "    )," & vbCrLf
+    
+    ' Continue with more steps
+    mCode = mCode & "    #""Split Column by Delimiter"" = Table.SplitColumn(#""Sorted Rows"", ""Column1"", Splitter.SplitTextByDelimiter("" "", QuoteStyle.Csv), list_of_code_levels)," & vbCrLf
+    mCode = mCode & "    #""Removed Columns1"" = Table.RemoveColumns(#""Split Column by Delimiter"", {""Index"", ""Nb Levels""})," & vbCrLf
+    mCode = mCode & "    #""Removed Top Rows"" = Table.Skip(#""Removed Columns1"", 1)," & vbCrLf
+
+    ' Add the unflatten_hierarchy function
+    mCode = mCode & "    fnUnflattenHierarchy = let" & vbCrLf
+    mCode = mCode & "        unflatten_hierarchy = (data_table as table, value_column_name as text) as table =>" & vbCrLf
+    mCode = mCode & "            let" & vbCrLf
+    mCode = mCode & "                Source = data_table," & vbCrLf
+    mCode = mCode & "                added_index_from_0 = Table.AddIndexColumn(Source, ""GP_Idx"", 0, 1, Int64.Type)," & vbCrLf
+    mCode = mCode & "                demote_headers = Table.DemoteHeaders(added_index_from_0)," & vbCrLf
+    mCode = mCode & "                transpose_table = Table.Transpose(demote_headers)," & vbCrLf
+    mCode = mCode & "                column_names = Table.ColumnNames(transpose_table)," & vbCrLf
+    mCode = mCode & "                replace_empty_by_null = Table.ReplaceValue(transpose_table, """", null, Replacer.ReplaceValue, column_names)," & vbCrLf
+    mCode = mCode & "                first_fill_down = Table.FillDown(replace_empty_by_null, column_names)," & vbCrLf
+    mCode = mCode & "                transpose_table_back = Table.Transpose(first_fill_down)," & vbCrLf
+    mCode = mCode & "                promote_headers = Table.PromoteHeaders(transpose_table_back, [PromoteAllScalars=true])," & vbCrLf
+
+    ' Add the helper functions
+    mCode = mCode & AddHelperFunctions()
+    
+    ' Finish the unflatten_hierarchy function and the query
+    mCode = mCode & AddUnflattenHierarchyEnd()
+    
+    BuildQueryText = mCode
+End Function
+
+' Helper function to add the helper functions text
+Function AddHelperFunctions() As String
+    Dim text As String
+    
+    text = "                fnGetListOfLevelsColumns = (data_table as table) as list =>" & vbCrLf
+    text = text & "                    let" & vbCrLf
+    text = text & "                        Source = data_table," & vbCrLf
+    text = text & "                        columns_names = List.Buffer(Table.ColumnNames(Source))," & vbCrLf
+    text = text & "                        convert_to_table = Table.FromList(Table.ColumnNames(Source), Splitter.SplitByNothing(), null, null, ExtraValues.Ignore)," & vbCrLf
+    text = text & "                        filter_level_rows = Table.SelectRows(convert_to_table, each Text.StartsWith(Text.Lower([Column1]), ""level ""))," & vbCrLf
+    text = text & "                        convert_to_list = filter_level_rows[Column1]" & vbCrLf
+    text = text & "                    in" & vbCrLf
+    text = text & "                        convert_to_list," & vbCrLf
+    
+    ' Add fnGetMinLevel
+    text = text & "                fnGetMinLevel = (data_table as table) as number =>" & vbCrLf
+    text = text & "                    let" & vbCrLf
+    text = text & "                        Source = data_table," & vbCrLf
+    text = text & "                        get_list_of_columns = Table.ColumnNames(Source)," & vbCrLf
+    text = text & "                        convert_list_to_table = Table.FromList(get_list_of_columns, Splitter.SplitByNothing(), null, null, ExtraValues.Ignore)," & vbCrLf
+    text = text & "                        filtered_levels_to_fill_down = Table.SelectRows(convert_list_to_table, each Text.StartsWith(Text.Lower([Column1]), ""level""))," & vbCrLf
+    text = text & "                        split_by_space = Table.SplitColumn(filtered_levels_to_fill_down, ""Column1"", Splitter.SplitTextByEachDelimiter({"" ""}, QuoteStyle.None, true), {""Column1.1"", ""Column1.2""})," & vbCrLf
+    text = text & "                        convert_to_number = Table.TransformColumnTypes(split_by_space, {{""Column1.2"", type number}})," & vbCrLf
+    text = text & "                        min_level = List.Min(convert_to_number[Column1.2])" & vbCrLf
+    text = text & "                    in" & vbCrLf
+    text = text & "                        min_level," & vbCrLf
+    
+    ' Add fnGetMaxLevel
+    text = text & "                fnGetMaxLevel = (data_table as table) as number =>" & vbCrLf
+    text = text & "                    let" & vbCrLf
+    text = text & "                        Source = data_table," & vbCrLf
+    text = text & "                        get_list_of_columns = Table.ColumnNames(Source)," & vbCrLf
+    text = text & "                        convert_list_to_table = Table.FromList(get_list_of_columns, Splitter.SplitByNothing(), null, null, ExtraValues.Ignore)," & vbCrLf
+    text = text & "                        filtered_levels_to_fill_down = Table.SelectRows(convert_list_to_table, each Text.StartsWith(Text.Lower([Column1]), ""level""))," & vbCrLf
+    text = text & "                        split_by_space = Table.SplitColumn(filtered_levels_to_fill_down, ""Column1"", Splitter.SplitTextByEachDelimiter({"" ""}, QuoteStyle.None, true), {""Column1.1"", ""Column1.2""})," & vbCrLf
+    text = text & "                        convert_to_number = Table.TransformColumnTypes(split_by_space, {{""Column1.2"", type number}})," & vbCrLf
+    text = text & "                        max_level = List.Max(convert_to_number[Column1.2])" & vbCrLf
+    text = text & "                    in" & vbCrLf
+    text = text & "                        max_level," & vbCrLf
+    
+    ' Add fnGetListOfNonLevelsColumns
+    text = text & "                fnGetListOfNonLevelsColumns = (data_table as table) as list =>" & vbCrLf
+    text = text & "                    let" & vbCrLf
+    text = text & "                        Source = data_table," & vbCrLf
+    text = text & "                        get_list_of_columns = List.Buffer(Table.ColumnNames(Source))," & vbCrLf
+    text = text & "                        convert_list_to_table = Table.FromList(get_list_of_columns, Splitter.SplitByNothing(), null, null, ExtraValues.Ignore)," & vbCrLf
+    text = text & "                        filtered_columns_other_than_levels = Table.SelectRows(convert_list_to_table, each not Text.StartsWith(Text.Lower([Column1]), ""level""))," & vbCrLf
+    text = text & "                        convert_to_list = filtered_columns_other_than_levels[Column1]" & vbCrLf
+    text = text & "                    in" & vbCrLf
+    text = text & "                        convert_to_list," & vbCrLf
+    
+    AddHelperFunctions = text
+End Function
+
+' Helper function to add the end of the unflatten_hierarchy function
+Function AddUnflattenHierarchyEnd() As String
+    Dim text As String
+    
+    text = "                list_of_levels = fnGetListOfLevelsColumns(Source)," & vbCrLf
+    text = text & "                second_fill_down = Table.FillDown(promote_headers, list_of_levels)," & vbCrLf
+    text = text & "                min_level = fnGetMinLevel(Source)," & vbCrLf
+    text = text & "                max_level = fnGetMaxLevel(Source)," & vbCrLf
+    text = text & "                Min_Level_Column_Name = ""Level "" & Number.ToText(min_level)," & vbCrLf
+    text = text & "                Max_Level_Column_Name = ""Level "" & Number.ToText(max_level)," & vbCrLf
+    text = text & "                Columns_Not_To_Unpivot = fnGetListOfNonLevelsColumns(Source)," & vbCrLf
+    text = text & "                unpivoted_levels_columns = Table.UnpivotOtherColumns(second_fill_down, List.Combine({{Max_Level_Column_Name, ""GP_Idx""}, Columns_Not_To_Unpivot}), ""Attribute"", ""NameID"")," & vbCrLf
+    text = text & "                check_if_direct_parent = Table.AddColumn(unpivoted_levels_columns, ""Direct Parent"", each if Record.Field(_, Max_Level_Column_Name) = [NameID] then ""no"" else ""yes"")," & vbCrLf
+    text = text & "                filter_first_level_rows_without_parents = Table.SelectRows(check_if_direct_parent, each ([Direct Parent] = ""no"") and ([Attribute] = Min_Level_Column_Name))," & vbCrLf
+    text = text & "                replace_parent_by_null = Table.ReplaceValue(filter_first_level_rows_without_parents, each [NameID], null, Replacer.ReplaceValue, {""NameID""})," & vbCrLf
+    text = text & "                filter_rows_with_parents = Table.SelectRows(check_if_direct_parent, each [Direct Parent] = ""yes"")," & vbCrLf
+    text = text & "                append_level_0_with_others = Table.Combine({replace_parent_by_null, filter_rows_with_parents})," & vbCrLf
+    text = text & "                duplicate_attribute_column = Table.DuplicateColumn(append_level_0_with_others, ""Attribute"", ""Attribute2"")," & vbCrLf
+    text = text & "                split_to_remove_labels = Table.SplitColumn(duplicate_attribute_column, ""Attribute2"", Splitter.SplitTextByEachDelimiter({"" ""}, QuoteStyle.None, true), {""Attribute2.1"", ""Attribute2.2""})," & vbCrLf
+    text = text & "                convert_to_a_number = Table.TransformColumnTypes(split_to_remove_labels, {{""Attribute2.2"", Int64.Type}})," & vbCrLf
+    text = text & "                get_max_level_for_each_value = Table.Group(convert_to_a_number, {Max_Level_Column_Name}, {(""Max"", each List.Max([Attribute2.2]), type nullable number)})," & vbCrLf
+    text = text & "                convert_max_level_to_text = Table.TransformColumnTypes(get_max_level_for_each_value, {""Max"", type text})," & vbCrLf
+    text = text & "                merge_queries_to_filter = Table.NestedJoin(append_level_0_with_others, {Max_Level_Column_Name}, convert_max_level_to_text, {Max_Level_Column_Name}, ""TableToExpand"", JoinKind.LeftOuter)," & vbCrLf
+    text = text & "                max_level_expanded_column_name = Max_Level_Column_Name & ""_expanded""," & vbCrLf
+    text = text & "                expand_the_merged_result = Table.ExpandTableColumn(merge_queries_to_filter, ""TableToExpand"", {""Max""}, {max_level_expanded_column_name})," & vbCrLf
+    text = text & "                sorted_rows = Table.Sort(expand_the_merged_result, {{""GP_Idx"", Order.Ascending}})," & vbCrLf
+    text = text & "                remove_nulls = Table.SelectRows(sorted_rows, each Record.Field(_, max_level_expanded_column_name) <> null)," & vbCrLf
+    text = text & "                removed_columns = Table.RemoveColumns(remove_nulls, {max_level_expanded_column_name, ""Attribute"", ""Direct Parent"", ""GP_Idx"", value_column_name})," & vbCrLf
+    text = text & "                renamed_columns = Table.RenameColumns(removed_columns, {{Max_Level_Column_Name, value_column_name}, {""NameID"", ""Parent""}})" & vbCrLf
+    text = text & "            in" & vbCrLf
+    text = text & "                renamed_columns" & vbCrLf
+    text = text & "    in" & vbCrLf
+    text = text & "        unflatten_hierarchy," & vbCrLf
+    text = text & "    Result = fnUnflattenHierarchy(#""Removed Top Rows"", ""Value"")" & vbCrLf
+    text = text & "in" & vbCrLf
+    text = text & "    Result"
+    
+    AddUnflattenHierarchyEnd = text
+End Function

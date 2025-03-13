@@ -1,0 +1,28 @@
+Sub TestCreateQuery()
+    Dim rangeName As String
+    Dim queryName As String
+    
+    rangeName = "YourNamedRange"  ' Change to one of your actual named ranges
+    queryName = "Test_Query"
+    
+    ' Remove any existing query with this name
+    On Error Resume Next
+    If Not ThisWorkbook.Queries(queryName) Is Nothing Then
+        ThisWorkbook.Queries(queryName).Delete
+    End If
+    On Error GoTo 0
+    
+    ' Very simple M code
+    Dim simpleQuery As String
+    simpleQuery = "let Source = Excel.CurrentWorkbook(){[Name=""" & rangeName & """]}[Content] in Source"
+    
+    ' Try to create the query
+    On Error Resume Next
+    ThisWorkbook.Queries.Add Name:=queryName, Formula:=simpleQuery
+    
+    If Err.Number <> 0 Then
+        MsgBox "Error creating query: " & Err.Description & " (Error " & Err.Number & ")", vbCritical
+    Else
+        MsgBox "Query created successfully!", vbInformation
+    End If
+End Sub

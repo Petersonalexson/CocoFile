@@ -5,7 +5,6 @@ Sub CreateQueryTablesFromHierarchies()
     Dim queryName As String
     Dim sheetName As String
     Dim querySheet As Worksheet
-    Dim queryText As String
     
     ' Get the hierarchy matrix
     With wsLists
@@ -18,11 +17,26 @@ Sub CreateQueryTablesFromHierarchies()
     
     ' Loop through each hierarchy
     For i = LBound(arrSheets) To UBound(arrSheets)
-        rangeName = Trim(arrSheets(i, 2))
+        rangeName = Trim(arrSheets(i, 2))  ' This is the array/named range created after zoom in
         sheetName = Trim(arrSheets(i, 1))
         queryName = sheetName & "_Table"
         
-        ' Check if the worksheet exists
+        ' Check if the array exists
+        Dim rangeExists As Boolean
+        rangeExists = False
+        
+        On Error Resume Next
+        If Not ThisWorkbook.Names(rangeName) Is Nothing Then
+            rangeExists = True
+        End If
+        On Error GoTo 0
+        
+        If Not rangeExists Then
+            MsgBox "Named range '" & rangeName & "' does not exist. Did you run the RefreshSmartViewHierarchies first?", vbExclamation
+            GoTo NextHierarchy
+        End If
+        
+        ' Check if the query sheet exists
         On Error Resume Next
         Set querySheet = ThisWorkbook.Worksheets(queryName)
         On Error GoTo 0
@@ -36,14 +50,9 @@ Sub CreateQueryTablesFromHierarchies()
             querySheet.UsedRange.Clear
         End If
         
-        ' Build the Power Query M code
-        queryText = BuildQueryText(rangeName)
-        
-        ' Use a more direct approach to create the query
-        Dim queryDef As Object
-        
-        ' First, remove any existing connection with this name
+        ' Create a Power Query using the named range (array) as source
         On Error Resume Next
+        ' Remove any existing query with this name
         For Each Connection In ThisWorkbook.Connections
             If Connection.Name = queryName Then
                 Connection.Delete
@@ -52,39 +61,61 @@ Sub CreateQueryTablesFromHierarchies()
         Next Connection
         On Error GoTo 0
         
-        ' Create the Power Query using the Excel Object Model
+        ' Create the Power Query
+        Dim queryText As String
+        queryText = "let" & vbCrLf & _
+                   "    Source = Excel.CurrentWorkbook(){[Name=""" & rangeName & """]}[Content]," & vbCrLf & _
+                   "    #""Changed Type"" = Table.TransformColumnTypes(Source,{{""Column1"", type text}})," & vbCrLf & _
+                   "    #""Removed Top Rows"" = Table.Skip(#""Changed Type"", 0)," & vbCrLf & _
+                   "    #""Unflatten"" = fnGetERPHierarchySmartViewParent(#""Removed Top Rows"")" & vbCrLf & _
+                   "in" & vbCrLf & _
+                   "    #""Unflatten"""
+        
+        ' Create the workbook query
+        Dim wbQuery As WorkbookQuery
         On Error Resume Next
-        
-        ' Create a connection to the workbook data
-        Dim wb As Workbook
-        Set wb = ThisWorkbook
-        
-        ' Create a new Power Query connection
-        Dim scriptConnection As WorkbookConnection
-        Set scriptConnection = wb.Queries.Add(queryName, queryText)
-        
-        ' Create a query table on the worksheet
-        Set queryDef = querySheet.ListObjects.Add(SourceType:=xlSrcExternal, _
-                                                Source:=Array("OLEDB;Provider=Microsoft.Mashup.OleDb.1;Data Source=$Workbook$;Location=" & queryName), _
-                                                Destination:=querySheet.Range("A1"))
-        
-        ' Link the query to the table
-        queryDef.QueryTable.CommandType = xlCmdSql
-        queryDef.QueryTable.CommandText = Array(queryName)
-        queryDef.QueryTable.Refresh BackgroundQuery:=False
+        Set wbQuery = ThisWorkbook.Queries.Add(queryName, queryText, True)
         
         If Err.Number <> 0 Then
-            MsgBox "Error creating query for " & sheetName & ": " & Err.Description, vbExclamation
+            MsgBox "Error creating query: " & Err.Description, vbExclamation
+            GoTo NextHierarchy
         End If
         On Error GoTo 0
         
+        ' Create the query table
+        Dim qryTable As QueryTable
+        Set qryTable = querySheet.QueryTables.Add( _
+            Connection:="OLEDB;Provider=Microsoft.Mashup.OleDb.1;Data Source=$Workbook$;Location=" & queryName, _
+            Destination:=querySheet.Range("A1"))
+        
+        ' Set up the query table properties
+        With qryTable
+            .CommandType = xlCmdSql
+            .CommandText = Array(queryName)
+            .BackgroundQuery = False
+            .RefreshStyle = xlOverwriteCells
+            .SaveData = True
+            .RefreshOnFileOpen = False
+            .AdjustColumnWidth = True
+            
+            ' Refresh the query
+            On Error Resume Next
+            .Refresh BackgroundQuery:=False
+            If Err.Number <> 0 Then
+                MsgBox "Error refreshing query: " & Err.Description, vbExclamation
+            End If
+            On Error GoTo 0
+        End With
+        
         ' Auto-fit columns
         querySheet.Columns("A:Z").AutoFit
+        
+NextHierarchy:
     Next i
     
     ' Turn screen updating back on
     Application.ScreenUpdating = True
     Application.DisplayAlerts = True
     
-    MsgBox "Query tables created/updated successfully for all hierarchies!", vbInformation, "Process Complete"
+    MsgBox "Query tables created/updated successfully using the arrays!", vbInformation, "Process Complete"
 End Sub

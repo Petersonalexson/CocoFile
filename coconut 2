@@ -1,4 +1,4 @@
-Sub RefreshSmartViewHierarchies5()
+Sub RefreshSmartViewHierarchies()
     Dim arrSheets As Variant
     Dim ws As Worksheet
     Dim ConnectionName As String
@@ -37,7 +37,7 @@ Sub RefreshSmartViewHierarchies5()
                     .Rows((HeaderRow + 1) & ":" & LastRow).Delete Shift:=xlUp
                 End If
                 
-                ' Get the row with the hierarchy name (last row after deletion)
+                ' Get the row with the hierarchy name
                 LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
                 
                 ' Set member display option
@@ -46,41 +46,25 @@ Sub RefreshSmartViewHierarchies5()
                 ' Zoom in (drill down) on the hierarchy
                 Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
                 
-                ' Get the new last row after drill down
+                ' Find the last row after zoom in
                 LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
                 
-                ' After drill-down, find first and last row with actual data
-                Dim FirstDataRow As Long, LastDataRow As Long
-                
-                ' First row with data is right after the header
-                FirstDataRow = HeaderRow + 1
-                
-                ' Find the last row with data
-                LastDataRow = .Range("A" & .Rows.Count).End(xlUp).Row
-                
-                ' Make sure we have data
-                If LastDataRow >= FirstDataRow Then
-                    ' Reset and create named range for each sheet
-                    On Error Resume Next
-                    ' Delete the named range if it already exists
-                    If NamedRangeExists(arrSheets(i, 2)) Then
-                        ThisWorkbook.Names(arrSheets(i, 2)).Delete
-                    End If
-                    
-                    ' Create a new named range pointing to the exact data range needed for Power Query
-                    ThisWorkbook.Names.Add _
-                        Name:=arrSheets(i, 2), _
-                        RefersTo:="=" & ws.Name & "!A" & FirstDataRow & ":A" & LastDataRow
-                    
-                    If Err.Number <> 0 Then
-                        Debug.Print "Error creating named range: " & arrSheets(i, 2) & " - " & Err.Description
-                    Else
-                        Debug.Print "Successfully created named range: " & arrSheets(i, 2) & " = " & "=" & ws.Name & "!A" & FirstDataRow & ":A" & LastDataRow
-                    End If
-                    On Error GoTo 0
-                Else
-                    Debug.Print "No data found in sheet " & ws.Name & " after header row " & HeaderRow
+                ' Simply create or update the named range after zoom in
+                On Error Resume Next
+                ' If range exists, delete it first
+                If NamedRangeExists(arrSheets(i, 2)) Then
+                    ThisWorkbook.Names(arrSheets(i, 2)).Delete
                 End If
+                
+                ' Create new named range for the data
+                ThisWorkbook.Names.Add _
+                    Name:=arrSheets(i, 2), _
+                    RefersTo:="=" & ws.Name & "!A" & (HeaderRow + 1) & ":A" & LastRow
+                
+                If Err.Number <> 0 Then
+                    Debug.Print "Error creating named range: " & arrSheets(i, 2) & " - " & Err.Description
+                End If
+                On Error GoTo 0
             End With
             
             Set ws = Nothing

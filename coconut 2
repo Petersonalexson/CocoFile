@@ -1,103 +1,102 @@
-Sub RefreshSmartViewTree()
-
-    Dim wsLists As Worksheet
-    Dim ws As Worksheet
+Sub RefreshSmartViewHierarchies5()
     Dim arrSheets As Variant
+    Dim ws As Worksheet
     Dim ConnectionName As String
+    Dim Ret As Long, HeaderRow As Long, LastRow As Long, i As Long
+    Dim ConnStatus As Integer
     
-    Dim Ret As Long
-    Dim HeaderRow As Long
-    Dim LastRow As Long
-    Dim LastCol As Long
-    Dim i As Long
-    Dim ConnStatus As Long
-    
-    ' 1) Identify the sheet that has nmConnectionName & Hierarchy_Matrix
-    Set wsLists = ThisWorkbook.Worksheets("Lists")
-    
-    With wsLists
+    ' Reference to your list worksheet containing the mapping data
+    With ThisWorkbook.Worksheets("Lists")  ' Assuming "Lists" is the sheet name with mappings
         ConnectionName = .Range("nmConnectionName").Value
         arrSheets = .Range("Hierarchy_Matrix").Value
     End With
     
-    ' 2) Set your header row
-    HeaderRow = 4
+    HeaderRow = 7  ' As mentioned in your description, header is in row 7
     
-    ' 3) Loop through each row in Hierarchy_Matrix
-    For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
-        
-        '   A) Get the target worksheet (col A) and the named range to reset (col B)
-        Set ws = ThisWorkbook.Worksheets(arrSheets(i, 1))
-        
-        With ws
+    For i = LBound(arrSheets) To UBound(arrSheets)
+        ' Check if sheet name is not empty
+        If Len(Trim(arrSheets(i, 1))) > 0 Then
+            Set ws = ThisWorkbook.Worksheets(arrSheets(i, 1))
             
-            ' --- CONNECT to Smart View ---
-            Ret = HypUIConnect(.Name, "", "", ConnectionName)
-            ConnStatus = HypConnected(.Name)
-            If ConnStatus <> -1 Then Stop  ' Debug: Stop if not connected
-            
-            ' --- FIND LAST ROW & LAST COL BEFORE DELETING ---
-            '     We'll assume your data is in column A downward,
-            '     but you also want the maximum used columns.
-            
-            LastRow = .Cells(.Rows.Count, 1).End(xlUp).Row  ' Last used row in Column A
-            ' Use FIND to get the truly last used column in the sheet (safer than row-based):
-            If Application.WorksheetFunction.CountA(.Cells) = 0 Then
-                ' If the sheet is empty, skip
-                LastCol = 1
-            Else
-                LastCol = .Cells.Find("*", , xlFormulas, xlWhole, xlByColumns, xlPrevious).Column
-            End If
-            
-            ' --- DELETE old hierarchy rows EXCEPT the last row ---
-            '     We keep row "LastRow" because it might have the final "hierarchy name."
-            If LastRow > HeaderRow Then
-                If (LastRow - 1) >= (HeaderRow + 1) Then
-                    .Range(.Cells(HeaderRow + 1, 1), .Cells(LastRow - 1, LastCol)).Delete Shift:=xlUp
-                End If
-            End If
-            
-            ' Recalculate last row after delete
-            LastRow = .Cells(.Rows.Count, 1).End(xlUp).Row
-            If Application.WorksheetFunction.CountA(.Cells) = 0 Then
-                LastCol = 1
-            Else
-                LastCol = .Cells.Find("*", , xlFormulas, xlWhole, xlByColumns, xlPrevious).Column
-            End If
-            
-            ' --- SET SHEET OPTION (member display) ---
-            Ret = HypSetSheetOption(.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
-            
-            ' --- ZOOM IN on the final row's Column A ---
-            Ret = HypZoomIn(.Name, .Cells(LastRow, 1), 1, False)
-            
-            ' Recalc last row/col after Zoom
-            LastRow = .Cells(.Rows.Count, 1).End(xlUp).Row
-            If Application.WorksheetFunction.CountA(.Cells) = 0 Then
-                LastCol = 1
-            Else
-                LastCol = .Cells.Find("*", , xlFormulas, xlWhole, xlByColumns, xlPrevious).Column
-            End If
-            
-            ' --- RESET THE NAMED RANGE (arrSheets(i,2)) ---
-            '     Range covers everything from row (HeaderRow+1) to LastRow,
-            '     across columns 1..LastCol. This ensures we pick up all columns.
-            
-            ' If there's truly no data below the header, avoid an invalid reference
-            If LastRow < (HeaderRow + 1) Then
-                ' No data
-                ThisWorkbook.Names(arrSheets(i, 2)).RefersTo = "='" & .Name & "'!A" & (HeaderRow + 1)
-            Else
-                Dim rngNew As Range
-                Set rngNew = .Range(.Cells(HeaderRow + 1, 1), .Cells(LastRow, LastCol))
+            With ws
+                ' Connect to Smart View with proper parameters
+                Ret = HypUIConnect(.Name, "", ConnectionName)
+                ConnStatus = HypConnected(.Name)
                 
-                ThisWorkbook.Names(arrSheets(i, 2)).RefersTo = "='" & .Name & "'!" & rngNew.Address
-            End If
+                ' Check if connection is successful
+                If ConnStatus <> -1 Then
+                    MsgBox "Failed to connect to " & ConnectionName & " on sheet " & .Name, vbExclamation
+                    Exit Sub
+                End If
+                
+                ' Calculate last row
+                LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+                
+                ' Delete hierarchy rows except hierarchy name
+                If LastRow > HeaderRow Then
+                    .Rows((HeaderRow + 1) & ":" & LastRow).Delete Shift:=xlUp
+                End If
+                
+                ' Get the row with the hierarchy name (last row after deletion)
+                LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+                
+                ' Set member display option
+                Ret = HypSetSheetOption(.Name, HSV_MEMBER_DISPLAY, 1)
+                
+                ' Zoom in (drill down) on the hierarchy
+                Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
+                
+                ' Get the new last row after drill down
+                LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+                
+                ' After drill-down, find first and last row with actual data
+                Dim FirstDataRow As Long, LastDataRow As Long
+                
+                ' First row with data is right after the header
+                FirstDataRow = HeaderRow + 1
+                
+                ' Find the last row with data
+                LastDataRow = .Range("A" & .Rows.Count).End(xlUp).Row
+                
+                ' Make sure we have data
+                If LastDataRow >= FirstDataRow Then
+                    ' Reset and create named range for each sheet
+                    On Error Resume Next
+                    ' Delete the named range if it already exists
+                    If NamedRangeExists(arrSheets(i, 2)) Then
+                        ThisWorkbook.Names(arrSheets(i, 2)).Delete
+                    End If
+                    
+                    ' Create a new named range pointing to the exact data range needed for Power Query
+                    ThisWorkbook.Names.Add _
+                        Name:=arrSheets(i, 2), _
+                        RefersTo:="=" & ws.Name & "!A" & FirstDataRow & ":A" & LastDataRow
+                    
+                    If Err.Number <> 0 Then
+                        Debug.Print "Error creating named range: " & arrSheets(i, 2) & " - " & Err.Description
+                    Else
+                        Debug.Print "Successfully created named range: " & arrSheets(i, 2) & " = " & "=" & ws.Name & "!A" & FirstDataRow & ":A" & LastDataRow
+                    End If
+                    On Error GoTo 0
+                Else
+                    Debug.Print "No data found in sheet " & ws.Name & " after header row " & HeaderRow
+                End If
+            End With
             
-        End With
-        
-        Set ws = Nothing
+            Set ws = Nothing
+        End If
     Next i
     
-    MsgBox "Smart View Tree refresh complete!", vbInformation
+    MsgBox "Smart View hierarchies have been refreshed successfully!", vbInformation
 End Sub
+
+' Helper function to check if a named range exists
+Function NamedRangeExists(rangeName As String) As Boolean
+    Dim nm As Name
+    
+    On Error Resume Next
+    Set nm = ThisWorkbook.Names(rangeName)
+    On Error GoTo 0
+    
+    NamedRangeExists = Not nm Is Nothing
+End Function

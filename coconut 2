@@ -1,183 +1,62 @@
-Option Explicit
+Sub RefreshSmartViewTree()
 
-Public Sub RefreshSmartViewHierarchies_FullDebug()
+    Dim arrSheets As Variant
+    Dim wsLists As Worksheet
+    Dim ws As Worksheet
+    Dim ConnectionName As String
+    Dim Ret As Long, HeaderRow As Long, LastRow As Long, i As Long
+    Dim ConnStatus As Integer
+    
+    ' Change "wsLists" to the sheet that contains nmConnectionName & Hierarchy_Matrix
+    Set wsLists = ThisWorkbook.Worksheets("Lists")  
+    
+    With wsLists
+        ConnectionName = .Range("nmConnectionName").Value
+        arrSheets = .Range("Hierarchy_Matrix").Value
+    End With
 
-    Dim wsLists            As Worksheet
-    Dim ws                 As Worksheet
-    Dim arrSheets          As Variant
-    Dim ConnectionName     As String
-    
-    Dim Ret                As Long
-    Dim HeaderRow          As Long
-    Dim LastRow            As Long
-    Dim i                  As Long
-    Dim ConnStatus         As Long
-    
-    On Error Resume Next
-    Set wsLists = ThisWorkbook.Worksheets("Lists")
-    On Error GoTo 0
-    
-    If wsLists Is Nothing Then
-        MsgBox "ERROR: The worksheet 'Lists' does not exist. " & vbCrLf & _
-               "Please update the code to reference the correct sheet.", vbCritical
-        Exit Sub
-    End If
-    
-    On Error Resume Next
-    ConnectionName = wsLists.Range("nmConnectionName").Value
-    If Err.Number <> 0 Then
-        MsgBox "ERROR: Named range 'nmConnectionName' not found. " & vbCrLf & _
-               "Check Name Manager to confirm it exists.", vbCritical
-        Err.Clear
-        Exit Sub
-    End If
-    On Error GoTo 0
-    
-    If Trim(ConnectionName) = "" Then
-        MsgBox "ERROR: The named range 'nmConnectionName' is empty or invalid.", vbCritical
-        Exit Sub
-    End If
-    
-    On Error Resume Next
-    arrSheets = wsLists.Range("Hierarchy_Matrix").Value
-    If Err.Number <> 0 Then
-        MsgBox "ERROR: Named range 'Hierarchy_Matrix' not found. " & vbCrLf & _
-               "Check Name Manager to confirm it exists.", vbCritical
-        Err.Clear
-        Exit Sub
-    End If
-    On Error GoTo 0
-    
-    If IsEmpty(arrSheets) Then
-        MsgBox "ERROR: 'Hierarchy_Matrix' has no valid data. " & vbCrLf & _
-               "It should be at least 1 row × 2 columns (sheet name, named range).", vbCritical
-        Exit Sub
-    End If
-    
     HeaderRow = 4
-    
-    Dim rowCount As Long
-    rowCount = UBound(arrSheets, 1) - LBound(arrSheets, 1) + 1
-    Debug.Print "INFO: Found " & rowCount & " row(s) in Hierarchy_Matrix to process."
     
     For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
         
-        Dim targetSheetName   As String
-        Dim targetNamedRange  As String
-        
-        targetSheetName = Trim(arrSheets(i, 1))
-        targetNamedRange = Trim(arrSheets(i, 2))
-        
-        Debug.Print "------------------------------------------------------------"
-        Debug.Print "Processing row " & i & " of matrix:"
-        Debug.Print "   Sheet Name   = " & targetSheetName
-        Debug.Print "   Range Name   = " & targetNamedRange
-        
-        If targetSheetName = "" Then
-            MsgBox "ERROR: The sheet name in row " & i & " of 'Hierarchy_Matrix' is blank.", vbCritical
-            GoTo NextSheet
-        End If
-        
-        If targetNamedRange = "" Then
-            MsgBox "ERROR: The named range in row " & i & " of 'Hierarchy_Matrix' is blank.", vbCritical
-            GoTo NextSheet
-        End If
-        
-        Set ws = Nothing
-        On Error Resume Next
-        Set ws = ThisWorkbook.Worksheets(targetSheetName)
-        On Error GoTo 0
-        
-        If ws Is Nothing Then
-            MsgBox "ERROR: The sheet '" & targetSheetName & "' does not exist in this workbook.", vbCritical
-            GoTo NextSheet
-        End If
-        
-        Ret = HypUIConnect(ws.Name, vbNullString, ConnectionName)
-        If Ret <> 0 Then
-            MsgBox "ERROR: HypUIConnect call returned " & Ret & " on sheet '" & ws.Name & "'. " & vbCrLf & _
-                   "Connection Name: " & ConnectionName, vbCritical
-            GoTo NextSheet
-        End If
-        
-        ConnStatus = HypConnected(ws.Name)
-        If ConnStatus <> -1 Then
-            MsgBox "ERROR: Sheet '" & ws.Name & "' is not connected (" & ConnStatus & "). " & vbCrLf & _
-                   "Check your Smart View connection or credentials.", vbCritical
-            GoTo NextSheet
-        End If
-        
-        Debug.Print "   Connected to Smart View successfully on '" & ws.Name & "'."
-        
-        Ret = HypSetSheetOption(ws.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
-        If Ret <> 0 Then
-            MsgBox "ERROR: HypSetSheetOption (HSV_MEMBER_DISPLAY) returned code " & Ret & " on sheet '" & ws.Name & "'.", vbCritical
-            GoTo NextSheet
-        Else
-            Debug.Print "   Successfully set HSV_MEMBER_DISPLAY = 1 on '" & ws.Name & "'."
-        End If
+        ' 1) Grab the worksheet
+        Set ws = ThisWorkbook.Worksheets(arrSheets(i, 1))
         
         With ws
-            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
-            Debug.Print "   Current LastRow in " & .Name & " is " & LastRow
+            ' 2) Connect to Smart View
+            Ret = HypUIConnect(.Name, "", "", ConnectionName)
+            ConnStatus = HypConnected(.Name)
+            If ConnStatus <> -1 Then Stop  ' Debug check if not connected
             
+            ' 3) Calculate the last row in Column A
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            
+            ' 4) Delete hierarchy rows except the "hierarchy name" in the last row
             If LastRow > HeaderRow Then
-                If (HeaderRow + 1) <= LastRow Then
-                    Debug.Print "   Deleting rows " & (HeaderRow + 1) & ":" & LastRow & "..."
-                    .Rows((HeaderRow + 1) & ":" & LastRow).Delete Shift:=xlUp
-                Else
-                    Debug.Print "   Skipped delete because (HeaderRow + 1)=" & (HeaderRow + 1) & " is NOT <= " & LastRow
-                End If
-            Else
-                Debug.Print "   No rows to delete because LastRow <= HeaderRow."
+                .Rows(HeaderRow & ":" & (LastRow - 1)).Delete Shift:=xlUp
             End If
             
-            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
-            Debug.Print "   LastRow after delete = " & LastRow
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
             
-            If LastRow >= HeaderRow Then
-                Debug.Print "   Zooming in on cell A" & LastRow & "..."
-                Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
-                If Ret <> 0 Then
-                    MsgBox "ERROR: HypZoomIn returned code " & Ret & " on sheet '" & .Name & "'.", vbCritical
-                    GoTo NextSheet
-                End If
-            Else
-                Debug.Print "   Skipped ZoomIn because LastRow < HeaderRow. No data to expand."
-            End If
+            ' 5) Set the member display option
+            Ret = HypSetSheetOption(.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
             
-            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
-            Debug.Print "   LastRow after zoom = " & LastRow
+            ' 6) Drill (Zoom In) on the bottom cell
+            Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
             
-            Dim n As Name
-            Set n = Nothing
-            On Error Resume Next
-            Set n = ThisWorkbook.Names(targetNamedRange)
-            On Error GoTo 0
+            ' 7) Recalculate last row after zoom
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
             
-            If n Is Nothing Then
-                MsgBox "ERROR: Named range '" & targetNamedRange & "' does not exist in the workbook." & vbCrLf & _
-                       "Check Name Manager or fix your Hierarchy_Matrix.", vbCritical
-                GoTo NextSheet
-            End If
-            
-            If LastRow < (HeaderRow + 1) Then
-                Debug.Print "   No hierarchy data found. Setting named range to a single cell."
-                n.RefersTo = "='" & .Name & "'!A" & (HeaderRow + 1)
-            Else
-                n.RefersTo = "='" & .Name & "'!A" & (HeaderRow + 1) & ":A" & LastRow
-                Debug.Print "   Named range '" & targetNamedRange & "' updated to: " & n.RefersTo
-            End If
-            
+            ' ------------------------------------------------------------
+            ' 8) RESET the named range so it covers the new data
+            '    arrSheets(i, 2) = Name of the range (e.g. "MyHierarchyRange")
+            ' ------------------------------------------------------------
+            ThisWorkbook.Names(arrSheets(i, 2)).RefersTo = _
+                "='" & .Name & "'!A" & (HeaderRow + 1) & ":A" & LastRow
         End With
         
-NextSheet:
         Set ws = Nothing
-        
     Next i
     
-    Debug.Print "------------------------------------------------------------"
-    MsgBox "Smart View hierarchy refresh complete!" & vbCrLf & _
-           "Check the Immediate Window (Ctrl+G in VBA) for debug details.", vbInformation
-
+    MsgBox "Smart View tree refresh complete!", vbInformation
 End Sub

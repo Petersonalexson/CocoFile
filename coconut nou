@@ -1,0 +1,402 @@
+Option Explicit
+
+'==========================================================
+' MAIN: Refresh Smart View hierarchies, then build queries
+'==========================================================
+Public Sub RefreshSmartViewHierarchiesAndCreateTables()
+    ' Refresh the Smart View hierarchies
+    RefreshSmartViewHierarchies
+    
+    ' Create or update query tables from the hierarchies
+    CreateQueryTablesFromHierarchies
+End Sub
+
+
+'==========================================================
+' REFRESH SMART VIEW HIERARCHIES
+' Deletes old rows, zooms in, and recreates named ranges
+'==========================================================
+Public Sub RefreshSmartViewHierarchies()
+    Dim wsLists           As Worksheet
+    Dim arrSheets         As Variant
+    Dim ws                As Worksheet
+    Dim ConnectionName    As String
+    Dim Ret               As Long
+    Dim HeaderRow         As Long
+    Dim LastRow           As Long
+    Dim i                 As Long
+    Dim ConnStatus        As Long
+    
+    ' Identify the sheet containing named ranges (e.g., "Lists")
+    On Error Resume Next
+    Set wsLists = ThisWorkbook.Worksheets("Lists")
+    On Error GoTo 0
+    If wsLists Is Nothing Then
+        MsgBox "ERROR: Cannot find a sheet named 'Lists'. Check the sheet name.", vbCritical
+        Exit Sub
+    End If
+    
+    ' Load connection name and hierarchy matrix
+    On Error Resume Next
+    ConnectionName = wsLists.Range("nmConnectionName").Value
+    arrSheets = wsLists.Range("Hierarchy_Matrix").Value
+    On Error GoTo 0
+    
+    If Trim(ConnectionName) = "" Then
+        MsgBox "ERROR: 'nmConnectionName' is empty or missing.", vbCritical
+        Exit Sub
+    End If
+    
+    If IsEmpty(arrSheets) Then
+        MsgBox "ERROR: 'Hierarchy_Matrix' is empty or missing.", vbCritical
+        Exit Sub
+    End If
+    
+    ' Assume table headers are on row 4
+    HeaderRow = 4
+    
+    ' Improve performance by disabling screen updates and alerts
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    
+    ' Loop through each definition in the Hierarchy_Matrix
+    Dim rowCount As Long
+    rowCount = UBound(arrSheets, 1) - LBound(arrSheets, 1) + 1
+    
+    For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
+        Dim targetSheetName As String
+        Dim rangeName As String
+        
+        targetSheetName = Trim(arrSheets(i, 1))  ' e.g., "Finance LOB"
+        rangeName = Trim(arrSheets(i, 2))          ' e.g., "FinRange"
+        
+        ' Skip if sheet or range name is empty
+        If Len(targetSheetName) = 0 Then GoTo NextSheet
+        If Len(rangeName) = 0 Then GoTo NextSheet
+        
+        ' Get the worksheet
+        Set ws = Nothing
+        On Error Resume Next
+        Set ws = ThisWorkbook.Worksheets(targetSheetName)
+        On Error GoTo 0
+        
+        If ws Is Nothing Then
+            GoTo NextSheet
+        End If
+        
+        ' Connect to Smart View
+        Ret = HypUIConnect(ws.Name, "", "", ConnectionName)
+        ConnStatus = HypConnected(ws.Name)
+        If ConnStatus <> -1 Then
+            MsgBox "ERROR: Could not connect Smart View on sheet '" & ws.Name & "'.", vbExclamation
+            GoTo NextSheet
+        End If
+        
+        ' Delete existing hierarchy rows, preserving the header row
+        With ws
+            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
+            If LastRow > HeaderRow Then
+                .Rows(HeaderRow & ":" & (LastRow - 1)).Delete Shift:=xlUp
+            End If
+            
+            ' Recalculate the last row after deletion
+            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
+            
+            ' Optionally set member display
+            Ret = HypSetSheetOption(.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
+            
+            ' Zoom in starting from the bottom cell
+            Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
+            
+            ' Recalculate the last row after zoom
+            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
+            
+            ' Recreate the named range after deleting the old one, if it exists
+            On Error Resume Next
+            ThisWorkbook.Names(rangeName).Delete
+            On Error GoTo 0
+            
+            ThisWorkbook.Names.Add _
+                Name:=rangeName, _
+                RefersTo:="='" & .Name & "'!A" & HeaderRow & ":A" & LastRow
+        End With
+        
+NextSheet:
+        Set ws = Nothing
+    Next i
+    
+    ' Restore Excel settings
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+End Sub
+
+
+'==========================================================
+' CREATE/UPDATE QUERY TABLES
+' Each sheet gets a table named <SheetName>_Table
+'==========================================================
+Public Sub CreateQueryTablesFromHierarchies()
+    Dim wsLists          As Worksheet
+    Dim arrSheets        As Variant
+    Dim i                As Long
+    Dim rangeName        As String
+    Dim queryName        As String
+    Dim conn             As WorkbookConnection
+    Dim queryText        As String
+    Dim sheetName        As String
+    Dim ws               As Worksheet
+    Dim querySheet       As Worksheet
+    Dim existingConn     As Boolean
+    
+    ' Identify the "Lists" sheet
+    On Error Resume Next
+    Set wsLists = ThisWorkbook.Worksheets("Lists")
+    On Error GoTo 0
+    
+    If wsLists Is Nothing Then
+        MsgBox "ERROR: 'Lists' sheet not found.", vbCritical
+        Exit Sub
+    End If
+    
+    ' Retrieve the hierarchy matrix
+    On Error Resume Next
+    arrSheets = wsLists.Range("Hierarchy_Matrix").Value
+    On Error GoTo 0
+    
+    If IsEmpty(arrSheets) Then
+        MsgBox "ERROR: 'Hierarchy_Matrix' is empty or missing.", vbCritical
+        Exit Sub
+    End If
+    
+    ' Disable screen updates and alerts for performance
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    
+    ' Build queries for each hierarchy
+    For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
+        rangeName = Trim(arrSheets(i, 2))   ' Named range from column 2
+        sheetName = Trim(arrSheets(i, 1))     ' Original sheet name from column 1
+        queryName = sheetName & "_Table"      ' The Power Query will be named <SheetName>_Table
+        
+        ' Attempt to locate the source sheet
+        Set ws = Nothing
+        On Error Resume Next
+        Set ws = ThisWorkbook.Worksheets(sheetName)
+        On Error GoTo 0
+        
+        If ws Is Nothing Then
+            GoTo NextQuery
+        End If
+        
+        ' Check if the named range exists
+        Dim namedRangeExists As Boolean
+        namedRangeExists = False
+        On Error Resume Next
+        If Not ThisWorkbook.Names(rangeName) Is Nothing Then
+            namedRangeExists = True
+        End If
+        On Error GoTo 0
+        
+        If Not namedRangeExists Then
+            MsgBox "Named range '" & rangeName & "' not found. Please run RefreshSmartViewHierarchies first.", vbExclamation
+            GoTo NextQuery
+        End If
+        
+        ' Determine or create a sheet for the query output (named <SheetName>_Table)
+        Set querySheet = Nothing
+        On Error Resume Next
+        Set querySheet = ThisWorkbook.Worksheets(queryName)
+        On Error GoTo 0
+        
+        If querySheet Is Nothing Then
+            ' Create new output sheet
+            Set querySheet = ThisWorkbook.Sheets.Add( _
+                After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+            ' Rename the sheet to queryName
+            On Error Resume Next
+            querySheet.Name = queryName
+            On Error GoTo 0
+        Else
+            ' Clear existing content on the query output sheet
+            querySheet.UsedRange.Clear
+        End If
+        
+        ' Build the Power Query M code
+        queryText = BuildQueryText(rangeName)
+        
+        ' Check for an existing connection with the same name
+        existingConn = False
+        On Error Resume Next
+        For Each conn In ThisWorkbook.Connections
+            If conn.Name = queryName Then
+                existingConn = True
+                Exit For
+            End If
+        Next conn
+        On Error GoTo 0
+        
+        ' If the connection exists, try updating the M formula
+        If existingConn Then
+            On Error Resume Next
+            ThisWorkbook.Queries(queryName).Formula = queryText
+            If Err.Number <> 0 Then
+                ' If updating fails, remove the connection and recreate it
+                ThisWorkbook.Connections(queryName).Delete
+                existingConn = False
+            End If
+            Err.Clear
+            On Error GoTo 0
+        End If
+        
+        ' Create a new query if one does not exist
+        If Not existingConn Then
+            On Error Resume Next
+            ThisWorkbook.Queries.Add Name:=queryName, Formula:=queryText
+            If Err.Number <> 0 Then
+                MsgBox "ERROR creating query '" & queryName & "': " & Err.Description, vbExclamation
+                GoTo NextQuery
+            End If
+            Err.Clear
+            On Error GoTo 0
+        End If
+        
+        ' Remove any existing QueryTables in the target sheet
+        Dim queryDef As QueryTable
+        On Error Resume Next
+        For Each queryDef In querySheet.QueryTables
+            queryDef.Delete
+        Next queryDef
+        On Error GoTo 0
+        
+        ' Add a new QueryTable that references the Power Query
+        Set queryDef = querySheet.QueryTables.Add( _
+            Connection:="OLEDB;Provider=Microsoft.Mashup.OleDb.1;Data Source=$Workbook$;Location=""" & queryName & """", _
+            Destination:=querySheet.Range("A1"))
+        
+        ' Configure the query settings
+        queryDef.CommandType = xlCmdSql
+        queryDef.CommandText = Array("'" & queryName & "'")
+        queryDef.BackgroundQuery = False
+        queryDef.RefreshStyle = xlOverwriteCells
+        queryDef.SaveData = True
+        queryDef.PreserveFormatting = True
+        queryDef.AdjustColumnWidth = True
+        
+        ' Refresh the query to load data
+        On Error Resume Next
+        queryDef.Refresh BackgroundQuery:=False
+        If Err.Number <> 0 Then
+            MsgBox "Error refreshing query '" & queryName & "': " & Err.Description, vbExclamation
+        End If
+        On Error GoTo 0
+        
+        ' Autofit columns A to Z in the query output sheet
+        querySheet.Columns("A:Z").AutoFit
+        
+NextQuery:
+        Set ws = Nothing
+        Set querySheet = Nothing
+    Next i
+    
+    ' Restore Excel settings
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    
+    MsgBox "Query tables created or updated successfully!", vbInformation, "Process Complete"
+End Sub
+
+
+'==========================================================
+' FUNCTION: Builds the Power Query M formula
+'==========================================================
+Public Function BuildQueryText(rangeName As String) As String
+    Dim mCode As String
+    
+    ' Construct the M code for transforming the hierarchy data.
+    mCode = ""
+    mCode = mCode & "let" & vbCrLf
+    mCode = mCode & "    Source = Excel.CurrentWorkbook(){[Name=""" & rangeName & """]}[Content]," & vbCrLf
+    mCode = mCode & "    remove_nulls = Table.SelectRows(Source, each [Column1] <> null and [Column1] <> """")," & vbCrLf
+    mCode = mCode & "    #""Duplicated Column"" = Table.DuplicateColumn(remove_nulls, ""Column1"", ""Value"")," & vbCrLf
+    mCode = mCode & "    #""Added Custom"" = Table.AddColumn(#""Duplicated Column"", ""Nb Levels"", each List.Count(Text.PositionOfAny([Value], {"" ""}, Occurrence.All))/4, Int64.Type)," & vbCrLf
+    mCode = mCode & "    #""Trimmed Text"" = Table.TransformColumns(#""Added Custom"", {{""Value"", Text.Trim, type text}})," & vbCrLf
+    mCode = mCode & "    #""Changed Type"" = Table.TransformColumnTypes(#""Trimmed Text"", {{""Column1"", type text}})," & vbCrLf
+    mCode = mCode & "    #""Added Index"" = Table.AddIndexColumn(#""Changed Type"", ""Index"", 1, 1, Int64.Type)," & vbCrLf
+    mCode = mCode & "    #""Sorted Rows"" = Table.Sort(#""Added Index"", {{""Index"", Order.Descending}})," & vbCrLf
+    mCode = mCode & "    max_levels = List.Max(#""Sorted Rows""[Nb Levels])," & vbCrLf
+    mCode = mCode & "    list_of_code_levels = List.Generate(" & vbCrLf
+    mCode = mCode & "        () => 1," & vbCrLf
+    mCode = mCode & "        each _ <= max_levels," & vbCrLf
+    mCode = mCode & "        each _ + 1," & vbCrLf
+    mCode = mCode & "        each ""Level"" & Text.From(_)" & vbCrLf
+    mCode = mCode & "    )," & vbCrLf
+    mCode = mCode & "    #""Split Column by Delimiter"" = Table.SplitColumn(#""Sorted Rows"", ""Column1"", Splitter.SplitTextByDelimiter("" "", QuoteStyle.Csv), list_of_code_levels)," & vbCrLf
+    mCode = mCode & "    #""Removed Columns1"" = Table.RemoveColumns(#""Split Column by Delimiter"", {""Index"", ""Nb Levels""})," & vbCrLf
+    
+    ' Insert unflattening logic for the hierarchy
+    mCode = mCode & "    fnUnflattenHierarchy = let" & vbCrLf
+    mCode = mCode & "        unflatten_hierarchy = (data_table as table, value_column_name as text) as table =>" & vbCrLf
+    mCode = mCode & "            let" & vbCrLf
+    mCode = mCode & "                Source = data_table," & vbCrLf
+    mCode = mCode & "                added_index_from_0 = Table.AddIndexColumn(Source, ""GP_Idx"", 0, 1, Int64.Type)," & vbCrLf
+    mCode = mCode & "                demote_headers = Table.DemoteHeaders(added_index_from_0)," & vbCrLf
+    mCode = mCode & "                transpose_table = Table.Transpose(demote_headers)," & vbCrLf
+    mCode = mCode & "                column_names = Table.ColumnNames(transpose_table)," & vbCrLf
+    mCode = mCode & "                replace_empty_by_null = Table.ReplaceValue(transpose_table, """", null, Replacer.ReplaceValue, column_names)," & vbCrLf
+    mCode = mCode & "                first_fill_down = Table.FillDown(replace_empty_by_null, column_names)," & vbCrLf
+    mCode = mCode & "                transpose_table_back = Table.Transpose(first_fill_down)," & vbCrLf
+    mCode = mCode & "                promote_headers = Table.PromoteHeaders(transpose_table_back, [PromoteAllScalars=true])," & vbCrLf
+    mCode = mCode & "                fnGetListOfLevelsColumns = (data_table as table) as list =>" & vbCrLf
+    mCode = mCode & "                    let" & vbCrLf
+    mCode = mCode & "                        columns_names = List.Buffer(Table.ColumnNames(data_table))," & vbCrLf
+    mCode = mCode & "                        filter_level_rows = List.Select(columns_names, each Text.StartsWith(Text.Lower(_), ""level""))" & vbCrLf
+    mCode = mCode & "                    in" & vbCrLf
+    mCode = mCode & "                        filter_level_rows," & vbCrLf
+    mCode = mCode & "                fnGetMinLevel = (data_table as table) as number =>" & vbCrLf
+    mCode = mCode & "                    let" & vbCrLf
+    mCode = mCode & "                        allCols = Table.ColumnNames(data_table)," & vbCrLf
+    mCode = mCode & "                        levels = List.Select(allCols, each Text.StartsWith(Text.Lower(_), ""level""))," & vbCrLf
+    mCode = mCode & "                        nums = List.Transform(levels, each Number.From(Text.Remove(_, {""l"",""e"",""v"","" ""})))," & vbCrLf
+    mCode = mCode & "                        min_level = List.Min(nums)" & vbCrLf
+    mCode = mCode & "                    in min_level," & vbCrLf
+    mCode = mCode & "                fnGetMaxLevel = (data_table as table) as number =>" & vbCrLf
+    mCode = mCode & "                    let" & vbCrLf
+    mCode = mCode & "                        allCols = Table.ColumnNames(data_table)," & vbCrLf
+    mCode = mCode & "                        levels = List.Select(allCols, each Text.StartsWith(Text.Lower(_), ""level""))," & vbCrLf
+    mCode = mCode & "                        nums = List.Transform(levels, each Number.From(Text.Remove(_, {""l"",""e"",""v"","" ""})))," & vbCrLf
+    mCode = mCode & "                        max_level = List.Max(nums)" & vbCrLf
+    mCode = mCode & "                    in max_level," & vbCrLf
+    mCode = mCode & "                second_fill_down = Table.FillDown(promote_headers, fnGetListOfLevelsColumns(promote_headers))," & vbCrLf
+    mCode = mCode & "                min_level = fnGetMinLevel(promote_headers)," & vbCrLf
+    mCode = mCode & "                max_level = fnGetMaxLevel(promote_headers)," & vbCrLf
+    mCode = mCode & "                Min_Level_Column_Name = ""Level "" & Number.ToText(min_level)," & vbCrLf
+    mCode = mCode & "                Max_Level_Column_Name = ""Level "" & Number.ToText(max_level)," & vbCrLf
+    mCode = mCode & "                nonLevelColumns = List.Select(Table.ColumnNames(promote_headers), each not Text.StartsWith(Text.Lower(_), ""level""))," & vbCrLf
+    mCode = mCode & "                unpivoted_levels = Table.UnpivotOtherColumns(second_fill_down, List.Combine({{Max_Level_Column_Name, ""GP_Idx""}, nonLevelColumns}), ""Attribute"", ""NameID"")," & vbCrLf
+    mCode = mCode & "                check_direct_parent = Table.AddColumn(unpivoted_levels, ""Direct Parent"", each if Record.Field(_, Max_Level_Column_Name) = [NameID] then ""no"" else ""yes"")," & vbCrLf
+    mCode = mCode & "                filter_first_level = Table.SelectRows(check_direct_parent, each ([Direct Parent] = ""no"") and ([Attribute] = Min_Level_Column_Name))," & vbCrLf
+    mCode = mCode & "                replace_parent_by_null = Table.ReplaceValue(filter_first_level, each [NameID], null, Replacer.ReplaceValue, {""NameID""})," & vbCrLf
+    mCode = mCode & "                filter_rows_with_parents = Table.SelectRows(check_direct_parent, each ([Direct Parent] = ""yes""))," & vbCrLf
+    mCode = mCode & "                appended_data = Table.Combine({replace_parent_by_null, filter_rows_with_parents})," & vbCrLf
+    mCode = mCode & "                dup_attr = Table.DuplicateColumn(appended_data, ""Attribute"", ""Attribute2"")," & vbCrLf
+    mCode = mCode & "                split_removed = Table.SplitColumn(dup_attr, ""Attribute2"", Splitter.SplitTextByDelimiter("" "", QuoteStyle.None, true), {""Attribute2.1"", ""Attribute2.2""})," & vbCrLf
+    mCode = mCode & "                to_number = Table.TransformColumnTypes(split_removed, {{""Attribute2.2"", Int64.Type}})," & vbCrLf
+    mCode = mCode & "                grouped = Table.Group(to_number, {Max_Level_Column_Name}, {{""Max"", each List.Max([Attribute2.2]), type nullable number}})," & vbCrLf
+    mCode = mCode & "                conv_text = Table.TransformColumnTypes(grouped, {{""Max"", type text}})," & vbCrLf
+    mCode = mCode & "                merged = Table.NestedJoin(appended_data, {Max_Level_Column_Name}, conv_text, {Max_Level_Column_Name}, ""TableToExpand"", JoinKind.LeftOuter)," & vbCrLf
+    mCode = mCode & "                max_level_expanded_column_name = Max_Level_Column_Name & ""_expanded""," & vbCrLf
+    mCode = mCode & "                expanded_data = Table.ExpandTableColumn(merged, ""TableToExpand"", {""Max""}, {max_level_expanded_column_name})," & vbCrLf
+    mCode = mCode & "                sorted = Table.Sort(expanded_data, {{""GP_Idx"", Order.Ascending}})," & vbCrLf
+    mCode = mCode & "                remove_nulls = Table.SelectRows(sorted, each Record.Field(_, max_level_expanded_column_name) <> null)," & vbCrLf
+    mCode = mCode & "                removed_cols = Table.RemoveColumns(remove_nulls, {max_level_expanded_column_name, ""Attribute"", ""Direct Parent"", ""GP_Idx"", value_column_name})," & vbCrLf
+    mCode = mCode & "                renamed_cols = Table.RenameColumns(removed_cols, {{Max_Level_Column_Name, value_column_name}, {""NameID"", ""Parent""}})" & vbCrLf
+    mCode = mCode & "            in" & vbCrLf
+    mCode = mCode & "                renamed_cols" & vbCrLf
+    mCode = mCode & "    in" & vbCrLf
+    mCode = mCode & "        unflatten_hierarchy," & vbCrLf
+    mCode = mCode & "    Result = fnUnflattenHierarchy(#""Removed Columns1"", ""Value"")" & vbCrLf
+    mCode = mCode & "in" & vbCrLf
+    mCode = mCode & "    Result"
+    
+    BuildQueryText = mCode
+End Function

@@ -90,8 +90,8 @@ Public Sub CreateHierarchyQueries()
         ' Find the worksheet
         Set ws = ThisWorkbook.Worksheets(sheetName)
         
-        ' Get Tree/List designation
-        treeOrList = UCase(Trim(ws.Range("D7").Value))
+        ' Get Tree/List designation from column 4 of Hierarchy_Matrix
+        treeOrList = UCase(Trim(arrSheets(i, 4)))
         
         ' Build M code
         queryText = BuildBottomUpParentQuery(rangeName, treeOrList)

@@ -1,0 +1,54 @@
+import pandas as pd
+
+# 1) Read your Excel file from the "XAV File" sheet
+file_path = "your_file.xlsx"
+df = pd.read_excel(file_path, sheet_name="XAV File")
+
+# ----------------------------------------------------------------------------
+# If your columns are literally named "Date", "CC", "PO", "Voice", "Amount",
+# you can skip renaming. Otherwise, rename them by matching the real headers:
+# df.rename(columns={
+#     "A": "Date",
+#     "E": "CC",
+#     "J": "PO",
+#     "L": "Voice",
+#     "M": "Amount"   # or "N" if that's your actual amount column
+# }, inplace=True)
+# ----------------------------------------------------------------------------
+
+# 2) Convert 'Voice' to string (helps to avoid NaN issues)
+df['Voice'] = df['Voice'].astype(str)
+
+# 3) Group by (Date, CC, PO). For each group, decide whether it's "Without Tax" or "With Tax"
+def tax_split(subframe):
+    # All non-empty voices in this group
+    voices = {v.strip() for v in subframe['Voice'] if v.strip() != ""}
+    total_amt = subframe['Amount'].sum()
+
+    if len(voices) == 1:
+        # Exactly 1 distinct Voice => entire group is Without Tax
+        return pd.Series({
+            "WithoutTax": total_amt,
+            "WithTax": 0
+        })
+    else:
+        # Either 0 distinct voices or more than 1 => entire group is With Tax
+        return pd.Series({
+            "WithoutTax": 0,
+            "WithTax": total_amt
+        })
+
+grouped_result = (
+    df
+    .groupby(["Date", "CC", "PO"], dropna=False)
+    .apply(tax_split)
+    .reset_index()
+)
+
+# grouped_result now has columns: ["Date", "CC", "PO", "WithoutTax", "WithTax"]
+
+# 4) Write the result to a new sheet "Check" (or overwrite if exists)
+with pd.ExcelWriter(file_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+    grouped_result.to_excel(writer, sheet_name="Check", index=False)
+
+print("Done! Created (or replaced) the 'Check' sheet with the final grouped amounts.")

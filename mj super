@@ -317,30 +317,47 @@ Private Sub CompareHierarchy(svSheetName As String, svRangeName As String, hiera
     Set conn = ThisWorkbook.Connections(queryName)
     
     If Not conn Is Nothing Then
-        ' Try to find the query table
-        For Each svQuery In ThisWorkbook.QueryTables
-            If svQuery.Connection = conn Then
-                For i = 1 To svQuery.ResultRange.Rows.Count
-                    svDict.Add svQuery.ResultRange.Cells(i, 1).Value, svQuery.ResultRange.Cells(i, 2).Value
-                Next i
-                queryLoaded = True
-                Exit For
-            End If
-        Next svQuery
+        ' Try to find the connection in worksheets
+        Dim ws As Worksheet
+        Dim qt As QueryTable
+        For Each ws In ThisWorkbook.Worksheets
+            For Each qt In ws.QueryTables
+                If qt.Connection = conn Then
+                    For i = 1 To qt.ResultRange.Rows.Count
+                        If Not svDict.Exists(qt.ResultRange.Cells(i, 1).Value) Then
+                            svDict.Add qt.ResultRange.Cells(i, 1).Value, qt.ResultRange.Cells(i, 2).Value
+                        End If
+                    Next i
+                    queryLoaded = True
+                    Exit For
+                End If
+            Next qt
+            If queryLoaded Then Exit For
+        Next ws
         
         ' If not found as QueryTable, try as ListObject
         If Not queryLoaded Then
-            For Each svTable In ThisWorkbook.ListObjects
-                If svTable.SourceType = xlSrcQuery Then
-                    If svTable.QueryTable.Connection = conn Then
-                        For i = 1 To svTable.DataBodyRange.Rows.Count
-                            svDict.Add svTable.DataBodyRange.Cells(i, 1).Value, svTable.DataBodyRange.Cells(i, 2).Value
-                        Next i
-                        queryLoaded = True
-                        Exit For
+            Dim tbl As ListObject
+            For Each ws In ThisWorkbook.Worksheets
+                For Each tbl In ws.ListObjects
+                    If tbl.SourceType = xlSrcQuery Then
+                        On Error Resume Next
+                        If tbl.QueryTable.Connection = conn Then
+                            If Not tbl.DataBodyRange Is Nothing Then
+                                For i = 1 To tbl.DataBodyRange.Rows.Count
+                                    If Not svDict.Exists(tbl.DataBodyRange.Cells(i, 1).Value) Then
+                                        svDict.Add tbl.DataBodyRange.Cells(i, 1).Value, tbl.DataBodyRange.Cells(i, 2).Value
+                                    End If
+                                Next i
+                            End If
+                            queryLoaded = True
+                            Exit For
+                        End If
+                        On Error GoTo 0
                     End If
-                End If
-            Next svTable
+                Next tbl
+                If queryLoaded Then Exit For
+            Next ws
         End If
     End If
     On Error GoTo 0

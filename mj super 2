@@ -1,0 +1,549 @@
+Option Explicit
+
+'==========================================================
+' MAIN: Refresh Smart View hierarchies, then build queries
+'==========================================================
+Public Sub RefreshHierarchiesAndCreateQueries()
+    Dim wsLists As Worksheet
+    Set wsLists = ThisWorkbook.Worksheets("Lists")
+    
+    RefreshSmartViewTree
+    CreateHierarchyQueries
+End Sub
+
+'==========================================================
+' REFRESH SMART VIEW HIERARCHIES - ORIGINAL WORKING VERSION
+'==========================================================
+Public Sub RefreshSmartViewTree()
+    Dim arrSheets As Variant
+    Dim ws As Worksheet
+    Dim wsLists As Worksheet
+    Dim ConnectionName As String
+    Dim Ret As Long, HeaderRow As Long, LastRow As Long, I As Long
+    Dim ConnStatus As Integer
+    
+    Set wsLists = ThisWorkbook.Worksheets("Lists")
+    
+    With wsLists
+        ConnectionName = .Range("nmConnectionName").Value
+        arrSheets = .Range("Hierarchy_Matrix").Value
+    End With
+    
+    HeaderRow = 4
+    
+    For I = LBound(arrSheets) To UBound(arrSheets)
+        Set ws = ThisWorkbook.Worksheets(arrSheets(I, 1))
+        With ws
+            Ret = HypUIConnect(.Name, "", "", ConnectionName)
+            ConnStatus = HypConnected(.Name)
+            If ConnStatus <> -1 Then Stop
+            'Calculate last row
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            'Delete hierarchy rows except hierarchy name
+            If LastRow > HeaderRow Then
+                .Rows(HeaderRow & ":" & LastRow - 1).Delete Shift:=xlUp
+            End If
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            Ret = HypSetSheetOption(.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
+            Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            
+            ' Delete the named range if it exists
+            On Error Resume Next
+            ThisWorkbook.Names(arrSheets(I, 2)).Delete
+            On Error GoTo 0
+            
+            ThisWorkbook.Names.Add Name:=arrSheets(I, 2), RefersTo:=.Range("A" & HeaderRow & ":A" & LastRow)
+        End With
+    Next I
+End Sub
+
+'==========================================================
+' CREATE HIERARCHY QUERIES
+' Create M queries with bottom-up parent finding
+'==========================================================
+Public Sub CreateHierarchyQueries()
+    Dim wsLists As Worksheet
+    Dim arrSheets As Variant
+    Dim i As Long
+    Dim rangeName As String
+    Dim queryName As String
+    Dim queryText As String
+    Dim sheetName As String
+    Dim ws As Worksheet
+    Dim treeOrList As String
+    
+    Set wsLists = ThisWorkbook.Worksheets("Lists")
+    arrSheets = wsLists.Range("Hierarchy_Matrix").Value
+    
+    For i = LBound(arrSheets) To UBound(arrSheets)
+        sheetName = Trim(arrSheets(i, 1))
+        rangeName = Trim(arrSheets(i, 2))
+        
+        ' Skip if empty
+        If sheetName = "" Or rangeName = "" Then
+            GoTo NextQuery
+        End If
+        
+        queryName = sheetName & "_FlatTable"
+        
+        ' Find the worksheet
+        Set ws = ThisWorkbook.Worksheets(sheetName)
+        
+        ' Get Tree/List designation from column 4
+        treeOrList = UCase(Trim(arrSheets(i, 4)))
+        
+        ' Build M code
+        queryText = BuildBottomUpParentQuery(rangeName, treeOrList)
+        
+        ' Update or create query
+        On Error Resume Next
+        ' Try to update existing query
+        ThisWorkbook.Queries(queryName).Formula = queryText
+        
+        ' If error, the query doesn't exist or another issue occurred
+        If Err.Number <> 0 Then
+            ' Try to delete if it exists
+            On Error Resume Next
+            ThisWorkbook.Connections(queryName).Delete
+            On Error Resume Next
+            ' Create new query
+            ThisWorkbook.Queries.Add Name:=queryName, Formula:=queryText
+        End If
+        On Error GoTo 0
+        
+NextQuery:
+    Next i
+End Sub
+
+'==========================================================
+' BUILD BOTTOM-UP INDENT PARENT QUERY
+'==========================================================
+Public Function BuildBottomUpParentQuery(rangeName As String, treeOrList As String) As String
+    Dim skipRows As String
+    
+    If treeOrList = "TREE" Then
+        skipRows = "1"
+    ElseIf treeOrList = "LIST" Then
+        skipRows = "2"
+    Else
+        skipRows = "0"
+    End If
+    
+    Dim mCode As String
+    
+    mCode = "let" & vbCrLf
+    mCode = mCode & "    Source = Excel.CurrentWorkbook(){[Name=""" & rangeName & """]}[Content]," & vbCrLf
+    
+    If skipRows <> "0" Then
+        mCode = mCode & "    row_count = Table.RowCount(Source)," & vbCrLf
+        mCode = mCode & "    data_rows = if row_count > " & skipRows & " then Table.RemoveLastN(Source, " & skipRows & ") else Source," & vbCrLf
+    Else
+        mCode = mCode & "    data_rows = Source," & vbCrLf
+    End If
+    
+    mCode = mCode & "    filtered_rows = Table.SelectRows(data_rows, each [Column1] <> null and [Column1] <> """")," & vbCrLf
+    mCode = mCode & "    indexed_rows = Table.AddIndexColumn(filtered_rows, ""RowIndex"", 0, 1, Int64.Type)," & vbCrLf
+    mCode = mCode & "    with_indent = Table.AddColumn(indexed_rows, ""Indentation"", each Text.Length([Column1]) - Text.Length(Text.TrimStart([Column1])), Int64.Type)," & vbCrLf
+    mCode = mCode & "    with_value = Table.AddColumn(with_indent, ""Value"", each Text.Trim([Column1]), type text)," & vbCrLf
+    mCode = mCode & "    clean_table = Table.SelectColumns(with_value, {""RowIndex"", ""Indentation"", ""Value""})," & vbCrLf
+    mCode = mCode & "    buffered_table = Table.Buffer(clean_table)," & vbCrLf
+    mCode = mCode & "    with_parent = Table.AddColumn(buffered_table, ""Parent"", (current_row) => let" & vbCrLf
+    mCode = mCode & "        current_indent = current_row[Indentation]," & vbCrLf
+    mCode = mCode & "        current_index = current_row[RowIndex]," & vbCrLf
+    mCode = mCode & "        potential_parents = Table.SelectRows(buffered_table, each [RowIndex] > current_index and [Indentation] < current_indent)," & vbCrLf
+    mCode = mCode & "        sorted_parents = Table.Sort(potential_parents, {{""Indentation"", Order.Descending}, {""RowIndex"", Order.Ascending}})," & vbCrLf
+    mCode = mCode & "        parent_value = if Table.IsEmpty(sorted_parents) then """" else sorted_parents{0}[Value]" & vbCrLf
+    mCode = mCode & "    in" & vbCrLf
+    mCode = mCode & "        parent_value)," & vbCrLf
+    mCode = mCode & "    final_table = Table.SelectColumns(with_parent, {""Value"", ""Parent""})" & vbCrLf
+    mCode = mCode & "in" & vbCrLf
+    mCode = mCode & "    final_table"
+    
+    BuildBottomUpParentQuery = mCode
+End Function
+
+'==========================================================
+' MAIN: Compare ERP File with Smart View hierarchies
+'==========================================================
+Public Sub CompareERPWithSmartView()
+    Dim wsLists As Worksheet
+    Dim wsResults As Worksheet
+    Dim hierarchyRange As Range
+    Dim i As Long
+    Dim erpPath As String
+    Dim erpWorkbook As Workbook
+    Dim resultRow As Long
+    
+    ' Set up worksheets
+    Set wsLists = ThisWorkbook.Worksheets("Lists")
+    
+    ' Create or get Results worksheet
+    On Error Resume Next
+    Set wsResults = ThisWorkbook.Worksheets("ComparisonResults")
+    If wsResults Is Nothing Then
+        Set wsResults = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        wsResults.Name = "ComparisonResults"
+    End If
+    On Error GoTo 0
+    
+    ' Clear previous results
+    wsResults.Cells.Clear
+    
+    ' Set up results header
+    With wsResults
+        .Range("A1").Value = "Comparison Results - " & Format(Now(), "yyyy-mm-dd hh:mm")
+        .Range("A3").Value = "Hierarchy Name"
+        .Range("B3").Value = "Dimension"
+        .Range("C3").Value = "Value"
+        .Range("D3").Value = "Smart View Parent"
+        .Range("E3").Value = "ERP Parent"
+        .Range("F3").Value = "Status"
+        .Range("A3:F3").Font.Bold = True
+    End With
+    
+    ' Specify the ERP file path directly here
+    erpPath = "C:\Path\To\Your\ERPFile.xlsx" ' <--- MODIFY THIS LINE WITH YOUR FILE PATH
+    
+    ' If you prefer SharePoint links, use a format like this:
+    ' erpPath = "https://your-tenant.sharepoint.com/:x:/r/sites/your-site/Shared%20Documents/Your%20Folder/ERPFile.xlsx"
+    
+    ' Open ERP file
+    On Error Resume Next
+    Set erpWorkbook = Workbooks.Open(erpPath, ReadOnly:=True)
+    If Err.Number <> 0 Then
+        MsgBox "Could not open ERP file: " & erpPath & vbCrLf & vbCrLf & _
+               "Error: " & Err.Description & vbCrLf & vbCrLf & _
+               "Please update the file path in the code.", vbExclamation
+        Exit Sub
+    End If
+    On Error GoTo 0
+    
+    ' Get hierarchy matrix
+    Set hierarchyRange = wsLists.Range("Hierarchy_Matrix")
+    
+    ' Loop through each row in the hierarchy matrix
+    For i = 1 To hierarchyRange.Rows.Count
+        Dim svSheetName As String
+        Dim svRangeName As String
+        Dim hierarchyName As String
+        Dim dimensionName As String
+        Dim erpSheetName As String
+        Dim treeOrList As String
+        
+        svSheetName = Trim(hierarchyRange.Cells(i, 1).Value)
+        svRangeName = Trim(hierarchyRange.Cells(i, 2).Value)
+        hierarchyName = Trim(hierarchyRange.Cells(i, 3).Value)
+        treeOrList = UCase(Trim(hierarchyRange.Cells(i, 4).Value))
+        dimensionName = Trim(hierarchyRange.Cells(i, 5).Value)
+        erpSheetName = Trim(hierarchyRange.Cells(i, 6).Value)
+        
+        ' Check if this is a row to process (must have sheet name, range name, and ERP sheet name)
+        If svSheetName <> "" And svRangeName <> "" And erpSheetName <> "" Then
+            CompareHierarchy svSheetName, svRangeName, hierarchyName, dimensionName, erpSheetName, treeOrList, erpWorkbook, wsResults
+        End If
+    Next i
+    
+    ' Close ERP workbook
+    erpWorkbook.Close SaveChanges:=False
+    
+    ' Format results
+    With wsResults
+        .Columns.AutoFit
+        .Range("A1").Font.Bold = True
+        .Range("A1").Font.Size = 14
+    End With
+    
+    ' Apply conditional formatting to Status column
+    With wsResults.Range("F4:F" & wsResults.Cells(wsResults.Rows.Count, "F").End(xlUp).Row)
+        If .Rows.Count > 0 Then
+            .FormatConditions.Delete
+            .FormatConditions.Add Type:=xlCellValue, Operator:=xlEqual, Formula1:="=""Missing in ERP"""
+            .FormatConditions(1).Interior.Color = RGB(255, 200, 200)
+            .FormatConditions.Add Type:=xlCellValue, Operator:=xlEqual, Formula1:="=""Missing in Smart View"""
+            .FormatConditions(2).Interior.Color = RGB(255, 255, 200)
+            .FormatConditions.Add Type:=xlCellValue, Operator:=xlEqual, Formula1:="=""Different Parent"""
+            .FormatConditions(3).Interior.Color = RGB(200, 200, 255)
+        End If
+    End With
+    
+    ' Activate results sheet
+    wsResults.Activate
+    wsResults.Range("A1").Select
+    
+    MsgBox "Comparison completed!", vbInformation
+End Sub
+
+'==========================================================
+' COMPARE HIERARCHY
+'==========================================================
+Private Sub CompareHierarchy(svSheetName As String, svRangeName As String, hierarchyName As String, _
+                             dimensionName As String, erpSheetName As String, treeOrList As String, _
+                             erpWorkbook As Workbook, wsResults As Worksheet)
+    Dim svDict As Object
+    Dim erpDict As Object
+    Dim svMember As Variant
+    Dim erpMember As Variant
+    Dim svParent As String
+    Dim erpParent As String
+    Dim erpSheet As Worksheet
+    Dim valueCol As Long
+    Dim parentCol As Long
+    Dim foundERPSheet As Boolean
+    Dim lastRow As Long
+    Dim resultRow As Long
+    Dim headerRow As Long
+    
+    ' Create dictionaries
+    Set svDict = CreateObject("Scripting.Dictionary")
+    Set erpDict = CreateObject("Scripting.Dictionary")
+    
+    ' Load Smart View dictionary from Power Query result if available
+    Dim queryName As String
+    Dim conn As WorkbookConnection
+    Dim i As Long
+    Dim queryLoaded As Boolean
+    
+    queryLoaded = False
+    queryName = svSheetName & "_FlatTable"
+    
+    On Error Resume Next
+    Set conn = ThisWorkbook.Connections(queryName)
+    
+    If Not conn Is Nothing Then
+        ' Try to find the connection in worksheets
+        Dim ws As Worksheet
+        Dim qt As QueryTable
+        For Each ws In ThisWorkbook.Worksheets
+            For Each qt In ws.QueryTables
+                If qt.Connection = conn Then
+                    For i = 1 To qt.ResultRange.Rows.Count
+                        If Not svDict.Exists(qt.ResultRange.Cells(i, 1).Value) Then
+                            svDict.Add qt.ResultRange.Cells(i, 1).Value, qt.ResultRange.Cells(i, 2).Value
+                        End If
+                    Next i
+                    queryLoaded = True
+                    Exit For
+                End If
+            Next qt
+            If queryLoaded Then Exit For
+        Next ws
+        
+        ' If not found as QueryTable, try as ListObject
+        If Not queryLoaded Then
+            Dim tbl As ListObject
+            For Each ws In ThisWorkbook.Worksheets
+                For Each tbl In ws.ListObjects
+                    If tbl.SourceType = xlSrcQuery Then
+                        On Error Resume Next
+                        If tbl.QueryTable.Connection = conn Then
+                            If Not tbl.DataBodyRange Is Nothing Then
+                                For i = 1 To tbl.DataBodyRange.Rows.Count
+                                    If Not svDict.Exists(tbl.DataBodyRange.Cells(i, 1).Value) Then
+                                        svDict.Add tbl.DataBodyRange.Cells(i, 1).Value, tbl.DataBodyRange.Cells(i, 2).Value
+                                    End If
+                                Next i
+                            End If
+                            queryLoaded = True
+                            Exit For
+                        End If
+                        On Error GoTo 0
+                    End If
+                Next tbl
+                If queryLoaded Then Exit For
+            Next ws
+        End If
+    End If
+    On Error GoTo 0
+    
+    ' If Smart View data not loaded from Power Query, use manual approach with the named range
+    If Not queryLoaded Then
+        On Error Resume Next
+        If ThisWorkbook.Names(svRangeName) Is Nothing Then
+            resultRow = wsResults.Cells(wsResults.Rows.Count, "A").End(xlUp).Row + 1
+            wsResults.Cells(resultRow, 1).Value = hierarchyName
+            wsResults.Cells(resultRow, 2).Value = dimensionName
+            wsResults.Cells(resultRow, 3).Value = ""
+            wsResults.Cells(resultRow, 4).Value = ""
+            wsResults.Cells(resultRow, 5).Value = ""
+            wsResults.Cells(resultRow, 6).Value = "Smart View Range Not Found"
+            Exit Sub
+        End If
+        On Error GoTo 0
+        
+        Dim rng As Range
+        Set rng = ThisWorkbook.Names(svRangeName).RefersToRange
+        
+        ' Process the range directly to find parent-child relationships
+        Dim memberDict As Object
+        Set memberDict = CreateObject("Scripting.Dictionary")
+        
+        ' Determine if we need to skip rows based on Tree/List designation
+        Dim skipRows As Long
+        If treeOrList = "TREE" Then
+            skipRows = 1
+        ElseIf treeOrList = "LIST" Then
+            skipRows = 2
+        Else
+            skipRows = 0
+        End If
+        
+        ' Adjust row count to skip last row(s) if needed
+        Dim rowCount As Long
+        rowCount = rng.Rows.Count
+        If skipRows > 0 And rowCount > skipRows Then
+            rowCount = rowCount - skipRows
+        End If
+        
+        For i = 1 To rowCount
+            Dim member As String
+            Dim parentIndent As Long
+            Dim j As Long
+            Dim parent As String
+            
+            member = Trim(rng.Cells(i, 1).Value)
+            If member <> "" Then
+                ' Skip if already processed
+                If Not memberDict.Exists(member) Then
+                    ' Determine indentation level
+                    Dim indentLevel As Long
+                    indentLevel = Len(rng.Cells(i, 1).Value) - Len(LTrim(rng.Cells(i, 1).Value))
+                    
+                    ' Find parent (item with lower indentation)
+                    parent = ""
+                    For j = i + 1 To rowCount
+                        parentIndent = Len(rng.Cells(j, 1).Value) - Len(LTrim(rng.Cells(j, 1).Value))
+                        If parentIndent < indentLevel Then
+                            parent = Trim(rng.Cells(j, 1).Value)
+                            Exit For
+                        End If
+                    Next j
+                    
+                    ' Add to dictionaries
+                    memberDict.Add member, True
+                    svDict.Add member, parent
+                End If
+            End If
+        Next i
+    End If
+    
+    ' Find corresponding sheet in ERP workbook
+    foundERPSheet = False
+    For Each erpSheet In erpWorkbook.Worksheets
+        If UCase(Trim(erpSheet.Name)) = UCase(Trim(erpSheetName)) Then
+            foundERPSheet = True
+            Exit For
+        End If
+    Next erpSheet
+    
+    If Not foundERPSheet Then
+        ' Add result that sheet not found
+        resultRow = wsResults.Cells(wsResults.Rows.Count, "A").End(xlUp).Row + 1
+        wsResults.Cells(resultRow, 1).Value = hierarchyName
+        wsResults.Cells(resultRow, 2).Value = dimensionName
+        wsResults.Cells(resultRow, 3).Value = ""
+        wsResults.Cells(resultRow, 4).Value = ""
+        wsResults.Cells(resultRow, 5).Value = ""
+        wsResults.Cells(resultRow, 6).Value = "ERP Sheet Not Found"
+        Exit Sub
+    End If
+    
+    ' Find header row (default is 5)
+    headerRow = 5
+    
+    ' Find Value and Parent columns
+    valueCol = FindColumnWithHeader(erpSheet, headerRow, "Value")
+    parentCol = FindColumnWithHeader(erpSheet, headerRow, "Parent")
+    
+    If valueCol = 0 Or parentCol = 0 Then
+        ' Add result that column headers not found
+        resultRow = wsResults.Cells(wsResults.Rows.Count, "A").End(xlUp).Row + 1
+        wsResults.Cells(resultRow, 1).Value = hierarchyName
+        wsResults.Cells(resultRow, 2).Value = dimensionName
+        wsResults.Cells(resultRow, 3).Value = ""
+        wsResults.Cells(resultRow, 4).Value = ""
+        wsResults.Cells(resultRow, 5).Value = ""
+        wsResults.Cells(resultRow, 6).Value = "ERP Headers Not Found"
+        Exit Sub
+    End If
+    
+    ' Load ERP dictionary
+    lastRow = erpSheet.Cells(erpSheet.Rows.Count, valueCol).End(xlUp).Row
+    For i = headerRow + 1 To lastRow
+        Dim erpValue As String
+        Dim erpParentValue As String
+        
+        erpValue = Trim(erpSheet.Cells(i, valueCol).Value)
+        erpParentValue = Trim(erpSheet.Cells(i, parentCol).Value)
+        
+        If erpValue <> "" And Not erpDict.Exists(erpValue) Then
+            erpDict.Add erpValue, erpParentValue
+        End If
+    Next i
+    
+    ' Compare dictionaries
+    ' 1. Check members in Smart View not in ERP
+    For Each svMember In svDict.Keys
+        resultRow = wsResults.Cells(wsResults.Rows.Count, "A").End(xlUp).Row + 1
+        
+        If Not erpDict.Exists(svMember) Then
+            ' Member in Smart View but not in ERP
+            wsResults.Cells(resultRow, 1).Value = hierarchyName
+            wsResults.Cells(resultRow, 2).Value = dimensionName
+            wsResults.Cells(resultRow, 3).Value = svMember
+            wsResults.Cells(resultRow, 4).Value = svDict(svMember)
+            wsResults.Cells(resultRow, 5).Value = ""
+            wsResults.Cells(resultRow, 6).Value = "Missing in ERP"
+        Else
+            ' Member exists in both - check if parents match
+            svParent = svDict(svMember)
+            erpParent = erpDict(svMember)
+            
+            ' Only add row if parents are different
+            If Trim(svParent) <> Trim(erpParent) Then
+                ' Parents don't match
+                wsResults.Cells(resultRow, 1).Value = hierarchyName
+                wsResults.Cells(resultRow, 2).Value = dimensionName
+                wsResults.Cells(resultRow, 3).Value = svMember
+                wsResults.Cells(resultRow, 4).Value = svParent
+                wsResults.Cells(resultRow, 5).Value = erpParent
+                wsResults.Cells(resultRow, 6).Value = "Different Parent"
+            Else
+                ' If parents match, decrement the result row counter since we didn't use this row
+                resultRow = resultRow - 1
+            End If
+        End If
+    Next svMember
+    
+    ' 2. Check members in ERP not in Smart View
+    For Each erpMember In erpDict.Keys
+        If Not svDict.Exists(erpMember) Then
+            resultRow = wsResults.Cells(wsResults.Rows.Count, "A").End(xlUp).Row + 1
+            wsResults.Cells(resultRow, 1).Value = hierarchyName
+            wsResults.Cells(resultRow, 2).Value = dimensionName
+            wsResults.Cells(resultRow, 3).Value = erpMember
+            wsResults.Cells(resultRow, 4).Value = ""
+            wsResults.Cells(resultRow, 5).Value = erpDict(erpMember)
+            wsResults.Cells(resultRow, 6).Value = "Missing in Smart View"
+        End If
+    Next erpMember
+End Sub
+
+'==========================================================
+' FIND COLUMN WITH HEADER
+'==========================================================
+Private Function FindColumnWithHeader(ws As Worksheet, headerRow As Long, headerText As String) As Long
+    Dim lastCol As Long
+    Dim i As Long
+    
+    lastCol = ws.Cells(headerRow, ws.Columns.Count).End(xlToLeft).Column
+    
+    For i = 1 To lastCol
+        If UCase(Trim(ws.Cells(headerRow, i).Value)) = UCase(Trim(headerText)) Then
+            FindColumnWithHeader = i
+            Exit Function
+        End If
+    Next i
+    
+    FindColumnWithHeader = 0 ' Not found
+End Function

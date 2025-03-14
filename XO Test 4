@@ -1,0 +1,66 @@
+import pandas as pd
+import numpy as np
+
+# 1) Read your Excel file from the "XAV File" sheet
+file_path = "your_file.xlsx"
+df = pd.read_excel(file_path, sheet_name="XAV File")
+
+# 2) Convert 'Voice' and 'PO' to strings to handle possible NaN => ""
+df['Voice'] = df['Voice'].fillna('').astype(str)
+df['PO'] = df['PO'].fillna('').astype(str)
+
+# 3) Define the logic: TaxType = 'WithoutTax' or 'WithTax' for each row
+def determine_tax_type(row):
+    voice_str = row['Voice'].strip()
+    po_str = row['PO'].strip()
+    if voice_str == '':
+        # No voice => Without Tax
+        return 'WithoutTax'
+    else:
+        # We do have a Voice
+        if po_str != '':
+            # If PO is not empty => WithoutTax
+            return 'WithoutTax'
+        else:
+            # Voice is non-empty, PO is empty => WithTax
+            return 'WithTax'
+
+df['TaxType'] = df.apply(determine_tax_type, axis=1)
+
+# 4) Group by (Date, CC, PO, Voice, TaxType) and sum the 'Amount'
+grouped = (
+    df
+    .groupby(['Date', 'CC', 'PO', 'Voice', 'TaxType'], dropna=False)['Amount']
+    .sum()
+    .reset_index()
+)
+
+# 5) Pivot so each (Date, CC, PO, Voice) has columns for WithoutTaxAmount & WithTaxAmount
+pivoted = grouped.pivot_table(
+    index=['Date', 'CC', 'PO', 'Voice'],
+    columns='TaxType',
+    values='Amount',
+    fill_value=0
+).reset_index()
+
+# 6) Clean up column names
+pivoted.columns.name = None
+
+# If the pivot doesn't create one or both columns (e.g., no WithTax in data),
+# we ensure they exist:
+if 'WithoutTax' not in pivoted.columns:
+    pivoted['WithoutTax'] = 0
+if 'WithTax' not in pivoted.columns:
+    pivoted['WithTax'] = 0
+
+pivoted.rename(columns={
+    'WithoutTax': 'WithoutTaxAmount',
+    'WithTax': 'WithTaxAmount'
+}, inplace=True)
+
+# 7) Write to a new sheet "Check"
+with pd.ExcelWriter(file_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+    pivoted.to_excel(writer, sheet_name="Check", index=False)
+
+print("Done! Created/updated sheet 'Check' with columns:")
+print(pivoted.columns.tolist())

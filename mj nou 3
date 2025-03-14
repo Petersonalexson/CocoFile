@@ -1,17 +1,17 @@
 Option Explicit
 
 '--------------------------------------------------------------------------------------------
-' MAIN ENTRY: Refresh hierarchies, then build queries
+' MAIN: Refresh Smart View hierarchies, then build queries
 '--------------------------------------------------------------------------------------------
 Public Sub RefreshHierarchiesAndCreateQueries()
     On Error GoTo errHandler
     
     LogMessage "RefreshHierarchiesAndCreateQueries", "INFO", "Process started."
     
-    ' 1) Refresh the Smart View tree
+    ' 1) Refresh each sheet (original working version)
     RefreshSmartViewTree
     
-    ' 2) Build or update the queries with M code that removes final row(s) for Tree/List
+    ' 2) Create queries that do row removal in M code, then bottom-up logic, then reverse
     CreateHierarchyQueries
     
     LogMessage "RefreshHierarchiesAndCreateQueries", "INFO", "Process completed successfully."
@@ -22,113 +22,63 @@ errHandler:
 End Sub
 
 '--------------------------------------------------------------------------------------------
-' REFRESH SMART VIEW HIERARCHIES - LIKE YOUR WORKING CODE
+' REFRESH SMART VIEW HIERARCHIES (your original code snippet)
 '--------------------------------------------------------------------------------------------
 Public Sub RefreshSmartViewTree()
     On Error GoTo errHandler
     
-    Dim wsLists As Worksheet
     Dim arrSheets As Variant
     Dim ws As Worksheet
+    Dim wsLists As Worksheet
     Dim ConnectionName As String
     Dim Ret As Long, HeaderRow As Long, LastRow As Long, i As Long
     Dim ConnStatus As Integer
     
-    ' Locate "Lists" sheet
-    On Error Resume Next
+    ' 1) "Lists" sheet
     Set wsLists = ThisWorkbook.Worksheets("Lists")
-    On Error GoTo errHandler
     
-    If wsLists Is Nothing Then
-        LogError "RefreshSmartViewTree", 0, "No 'Lists' sheet found."
-        Exit Sub
-    End If
-    
-    ' Load connection & matrix
     With wsLists
-        ConnectionName = Trim(.Range("nmConnectionName").Value)
+        ConnectionName = .Range("nmConnectionName").Value
         arrSheets = .Range("Hierarchy_Matrix").Value
     End With
     
-    If Len(ConnectionName) = 0 Then
-        LogError "RefreshSmartViewTree", 0, "'nmConnectionName' is empty."
-        Exit Sub
-    End If
-    If IsEmpty(arrSheets) Then
-        LogError "RefreshSmartViewTree", 0, "'Hierarchy_Matrix' missing or empty."
-        Exit Sub
-    End If
-    
     HeaderRow = 4
     
-    ' Loop each row in Hierarchy_Matrix
-    Dim totalRows As Long
-    totalRows = UBound(arrSheets, 1) - LBound(arrSheets, 1) + 1
-    
-    For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
-        Dim sheetName As String
-        Dim rangeName As String
+    ' Loop
+    For i = LBound(arrSheets) To UBound(arrSheets)
+        Set ws = ThisWorkbook.Worksheets(arrSheets(i, 1))
         
-        sheetName = Trim(arrSheets(i, 1))
-        rangeName = Trim(arrSheets(i, 2))
-        
-        If sheetName = "" Or rangeName = "" Then
-            LogMessage "RefreshSmartViewTree", "INFO", _
-                       "Skipping row " & i & " - blank sheet or range name."
-            GoTo NextSheet
-        End If
-        
-        ' Attempt to get that sheet
-        Set ws = Nothing
-        On Error Resume Next
-        Set ws = ThisWorkbook.Worksheets(sheetName)
-        On Error GoTo errHandler
-        
-        If ws Is Nothing Then
-            LogError "RefreshSmartViewTree", 0, "Sheet '" & sheetName & "' not found."
-            GoTo NextSheet
-        End If
-        
-        ' Connect to Smart View
-        Ret = HypUIConnect(ws.Name, "", "", ConnectionName)
-        ConnStatus = HypConnected(ws.Name)
-        If ConnStatus <> -1 Then
-            LogError "RefreshSmartViewTree", 0, "Could not connect on sheet '" & ws.Name & "'."
-            GoTo NextSheet
-        End If
-        
-        ' Delete old rows, keep final
         With ws
-            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
+            Ret = HypUIConnect(.Name, "", "", ConnectionName)
+            ConnStatus = HypConnected(.Name)
+            If ConnStatus <> -1 Then Stop  ' your debug
+
+            ' Delete old rows except final
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
             If LastRow > HeaderRow Then
-                .Rows(HeaderRow & ":" & LastRow - 1).Delete Shift:=xlUp
+                .Rows(HeaderRow & ":" & (LastRow - 1)).Delete Shift:=xlUp
             End If
-            
-            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
-            
+
+            ' Zoom in
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
             Ret = HypSetSheetOption(.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
             Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
             
-            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
+            ' Final last row
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
             
-            ' Remove old name if needed
+            ' Delete the old named range if it exists
             On Error Resume Next
-            ThisWorkbook.Names(rangeName).Delete
+            ThisWorkbook.Names(arrSheets(i, 2)).Delete
             On Error GoTo 0
             
-            ' Create the named range from row4..LastRow
-            ThisWorkbook.Names.Add Name:=rangeName, _
-                RefersTo:="='" & .Name & "'!A" & HeaderRow & ":A" & LastRow
+            ' Create the new named range from row4..LastRow
+            ThisWorkbook.Names.Add Name:=arrSheets(i, 2), _
+                RefersTo:=.Range("A" & HeaderRow & ":A" & LastRow)
         End With
-        
-        LogMessage "RefreshSmartViewTree", "INFO", _
-                   "Sheet='" & ws.Name & "', range='" & rangeName & "', row4->" & LastRow
-        
-NextSheet:
-        Set ws = Nothing
     Next i
     
-    LogMessage "RefreshSmartViewTree", "INFO", "Refresh step done."
+    LogMessage "RefreshSmartViewTree", "INFO", "Smart View tree refresh done."
     Exit Sub
 
 errHandler:
@@ -137,89 +87,68 @@ End Sub
 
 '--------------------------------------------------------------------------------------------
 ' CREATE HIERARCHY QUERIES
-' M code:
-'  - Removes final row(s) if "Tree" => 1 row, "List" => 2 rows
-'  - then does bottom-up parent detection
+' Each query references the named range, does M-code:
+'   - Removes last 1 or 2 rows if "Tree" or "List"
+'   - bottom-up parent detection
+'   - then ReverseRows for final bottom->top order
 '--------------------------------------------------------------------------------------------
 Public Sub CreateHierarchyQueries()
     On Error GoTo errHandler
     
-    LogMessage "CreateHierarchyQueries", "INFO", "Starting to create or update queries..."
+    LogMessage "CreateHierarchyQueries", "INFO", "Starting to create or update queries."
     
     Dim wsLists As Worksheet
     Dim arrSheets As Variant
     Dim i As Long
+    Dim rangeName As String
+    Dim queryName As String
+    Dim queryText As String
+    Dim sheetName As String
+    Dim ws As Worksheet
+    Dim treeOrList As String
     
-    ' Identify "Lists" sheet
-    On Error Resume Next
     Set wsLists = ThisWorkbook.Worksheets("Lists")
-    On Error GoTo errHandler
-    
-    If wsLists Is Nothing Then
-        LogError "CreateHierarchyQueries", 0, "No 'Lists' sheet found."
-        Exit Sub
-    End If
-    
     arrSheets = wsLists.Range("Hierarchy_Matrix").Value
-    If IsEmpty(arrSheets) Then
-        LogError "CreateHierarchyQueries", 0, "'Hierarchy_Matrix' is empty or missing."
-        Exit Sub
-    End If
     
-    Dim totalRows As Long
-    totalRows = UBound(arrSheets, 1) - LBound(arrSheets, 1) + 1
-    
-    For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
-        Dim sheetName As String
-        Dim rangeName As String
-        
+    For i = LBound(arrSheets) To UBound(arrSheets)
         sheetName = Trim(arrSheets(i, 1))
         rangeName = Trim(arrSheets(i, 2))
         
-        If sheetName = "" Or rangeName = "" Then
-            GoTo NextQuery
-        End If
+        ' skip if empty
+        If sheetName = "" Or rangeName = "" Then GoTo NextQuery
         
-        ' We read "Tree" or "List" from column D of the Hierarchy_Matrix in the "Lists" sheet
-        ' Example: If your Hierarchy_Matrix is 4 columns wide, col D is arrSheets(i,4).
-        ' Adjust if needed. We'll assume it's the 4th column.
-        Dim treeOrList As String
-        If UBound(arrSheets, 2) >= 4 Then
-            treeOrList = UCase(Trim(arrSheets(i, 4)))
-        Else
-            treeOrList = ""
-        End If
-        
-        Dim queryName As String
         queryName = sheetName & "_FlatTable"
         
-        ' Build M code
-        Dim mCode As String
-        mCode = BuildBottomUpParentQuery(rangeName, treeOrList)
-        If mCode = "" Then GoTo NextQuery
+        ' find the sheet
+        Set ws = ThisWorkbook.Worksheets(sheetName)
         
-        ' Create or update query
+        ' get Tree/List from D7 (uppercased)
+        treeOrList = UCase(Trim(ws.Range("D7").Value))
+        
+        ' build the M code
+        queryText = BuildBottomUpParentQuery(rangeName, treeOrList)
+        
+        ' update or create query
         On Error Resume Next
-        ' Try updating
-        ThisWorkbook.Queries(queryName).Formula = mCode
+        ThisWorkbook.Queries(queryName).Formula = queryText
+        
         If Err.Number <> 0 Then
-            ' If error, remove old connection if it exists
+            ' error => try deleting old connection, then create
             On Error Resume Next
             ThisWorkbook.Connections(queryName).Delete
             On Error GoTo 0
-            ' Create new
-            ThisWorkbook.Queries.Add Name:=queryName, Formula:=mCode
+            
+            ThisWorkbook.Queries.Add Name:=queryName, Formula:=queryText
         End If
         On Error GoTo 0
         
         LogMessage "CreateHierarchyQueries", "INFO", _
-                   "Sheet='" & sheetName & "', Query='" & queryName & "', Status=" & treeOrList
+                   "Sheet='" & sheetName & "', Query='" & queryName & "', Tree/List='" & treeOrList & "'"
         
 NextQuery:
-        ' next
     Next i
     
-    LogMessage "CreateHierarchyQueries", "INFO", "Queries creation/update done."
+    LogMessage "CreateHierarchyQueries", "INFO", "Queries creation done."
     Exit Sub
 
 errHandler:
@@ -228,10 +157,10 @@ End Sub
 
 '--------------------------------------------------------------------------------------------
 ' BUILD BOTTOM-UP INDENT PARENT QUERY
-'  - If "TREE", skip last 1 row
-'  - If "LIST", skip last 2 rows
-'  - Then do parent detection from bottom to top
-'  - Return in the same top-to-bottom order
+' - "Tree" => remove last 1 row in M code
+' - "List" => remove last 2 rows
+' - Then do parent detection from bottom to top, then ReverseRows so final result
+'   is from "bottom" to "top."
 '--------------------------------------------------------------------------------------------
 Public Function BuildBottomUpParentQuery(rangeName As String, treeOrList As String) As String
     Dim skipRows As Long
@@ -248,50 +177,48 @@ Public Function BuildBottomUpParentQuery(rangeName As String, treeOrList As Stri
     mCode = ""
     mCode = mCode & "let" & vbCrLf
     mCode = mCode & "    Source = Excel.CurrentWorkbook(){[Name=""" & rangeName & """]}[Content]," & vbCrLf
-    mCode = mCode & "    row_count = Table.RowCount(Source)," & vbCrLf
-    mCode = mCode & "    data_rows = if row_count > " & skipRows & " then Table.FirstN(Source, row_count - " & skipRows & ") else Source," & vbCrLf
+    mCode = mCode & "    rowCount = Table.RowCount(Source)," & vbCrLf
+    mCode = mCode & "    keepRows = if rowCount > " & skipRows & _
+                   " then Table.FirstN(Source, rowCount - " & skipRows & ") else Source," & vbCrLf
     mCode = mCode & vbCrLf
-    mCode = mCode & "    // filter out blank or null" & vbCrLf
-    mCode = mCode & "    filtered = Table.SelectRows(data_rows, each [Column1] <> null and [Column1] <> """")," & vbCrLf
+    mCode = mCode & "    // filter blank lines" & vbCrLf
+    mCode = mCode & "    nonBlank = Table.SelectRows(keepRows, each [Column1] <> null and [Column1] <> """")," & vbCrLf
     mCode = mCode & vbCrLf
-    mCode = mCode & "    // add index for final ordering" & vbCrLf
-    mCode = mCode & "    indexed = Table.AddIndexColumn(filtered, ""RowIndex"", 0, 1, Int64.Type)," & vbCrLf
+    mCode = mCode & "    // We'll keep them in top->bottom order for a moment," & vbCrLf
+    mCode = mCode & "    // but do bottom-up detection => easier if we ReverseRows then add an Index" & vbCrLf
+    mCode = mCode & "    reversed = Table.ReverseRows(nonBlank)," & vbCrLf
     mCode = mCode & vbCrLf
-    mCode = mCode & "    // detect indentation, trim value" & vbCrLf
-    mCode = mCode & "    withIndent = Table.AddColumn(indexed, ""Indent"", each Text.Length([Column1]) - Text.Length(Text.TrimStart([Column1])), Int64.Type)," & vbCrLf
+    mCode = mCode & "    // add Index from bottom->top" & vbCrLf
+    mCode = mCode & "    withIndex = Table.AddIndexColumn(reversed, ""RowIndex"", 0, 1, Int64.Type)," & vbCrLf
+    mCode = mCode & vbCrLf
+    mCode = mCode & "    // detect indentation" & vbCrLf
+    mCode = mCode & "    withIndent = Table.AddColumn(withIndex, ""Indent"", each Text.Length([Column1]) - Text.Length(Text.TrimStart([Column1])), Int64.Type)," & vbCrLf
     mCode = mCode & "    withValue = Table.AddColumn(withIndent, ""Value"", each Text.Trim([Column1]), type text)," & vbCrLf
+    mCode = mCode & "    core = Table.SelectColumns(withValue, {""RowIndex"", ""Indent"", ""Value""})," & vbCrLf
+    mCode = mCode & "    bufferCore = Table.Buffer(core)," & vbCrLf
     mCode = mCode & vbCrLf
-    mCode = mCode & "    // We'll do a bottom-up approach, but simpler is still to define a top-down function." & vbCrLf
-    mCode = mCode & "    // Actually, let's define a function that picks the row below with fewer indentation." & vbCrLf
-    mCode = mCode & "    // But you want bottom-up? We'll do the typical approach: find parent among rows with RowIndex>myIndex." & vbCrLf
-    mCode = mCode & vbCrLf
-    mCode = mCode & "    smallTable = Table.Buffer(Table.SelectColumns(withValue, {""RowIndex"", ""Indent"", ""Value""}))," & vbCrLf
-    mCode = mCode & vbCrLf
-    mCode = mCode & "    // define parent detection: for each row, we look for row with RowIndex>myIndex, Indent<myIndent" & vbCrLf
-    mCode = mCode & "    // sorted ascending by RowIndex, descending by Indent? We want the closest row below that has smaller indent." & vbCrLf
-    mCode = mCode & vbCrLf
-    mCode = mCode & "    withParent = Table.AddColumn(smallTable, ""Parent"", (thisRow) => let" & vbCrLf
+    mCode = mCode & "    // For each row => find row with a bigger RowIndex that has smaller Indent => that's the 'Parent'" & vbCrLf
+    mCode = mCode & "    // Because we reversed, a 'bigger RowIndex' is actually further up in the original list." & vbCrLf
+    mCode = mCode & "    withParent = Table.AddColumn(bufferCore, ""Parent"", (thisRow) => let" & vbCrLf
+    mCode = mCode & "        myIdx = thisRow[RowIndex]," & vbCrLf
     mCode = mCode & "        myIndent = thisRow[Indent]," & vbCrLf
-    mCode = mCode & "        myIndex = thisRow[RowIndex]," & vbCrLf
-    mCode = mCode & "        potentialKids = Table.SelectRows(smallTable, each [RowIndex] > myIndex and [Indent] < myIndent)," & vbCrLf
-    mCode = mCode & "        // sort ascending by RowIndex => the closest row below with smaller indent" & vbCrLf
-    mCode = mCode & "        ordered = Table.Sort(potentialKids, {{""RowIndex"", Order.Ascending}})," & vbCrLf
-    mCode = mCode & "        pick = if Table.IsEmpty(ordered) then null else ordered{0}[Value]" & vbCrLf
-    mCode = mCode & "    in pick )," & vbCrLf
+    mCode = mCode & "        candidates = Table.SelectRows(bufferCore, each [RowIndex] > myIdx and [Indent] < myIndent)," & vbCrLf
+    mCode = mCode & "        // pick the first in ascending RowIndex => the closest up in the original list" & vbCrLf
+    mCode = mCode & "        ordered = Table.Sort(candidates, {{""RowIndex"", Order.Ascending}})," & vbCrLf
+    mCode = mCode & "        result = if Table.IsEmpty(ordered) then null else ordered{0}[Value]" & vbCrLf
+    mCode = mCode & "    in result )," & vbCrLf
     mCode = mCode & vbCrLf
-    mCode = mCode & "    // reorder columns, keep RowIndex for final top->bottom sort" & vbCrLf
-    mCode = mCode & "    keepCols = Table.SelectColumns(withParent, {""RowIndex"", ""Value"", ""Parent""})," & vbCrLf
-    mCode = mCode & vbCrLf
-    mCode = mCode & "    // finally, sort by RowIndex ascending => original top->bottom order" & vbCrLf
-    mCode = mCode & "    final = Table.Sort(keepCols, {{""RowIndex"", Order.Ascending}})" & vbCrLf
+    mCode = mCode & "    // our table is reversed. We want final result in reversed order => actually we keep it reversed" & vbCrLf
+    mCode = mCode & "    final = withParent" & vbCrLf
     mCode = mCode & "in" & vbCrLf
     mCode = mCode & "    final"
     
     BuildBottomUpParentQuery = mCode
 End Function
 
+
 '--------------------------------------------------------------------------------------------
-' LOGGING SUBS
+' LOG SHEET
 '--------------------------------------------------------------------------------------------
 Public Sub LogMessage(procName As String, msgType As String, message As String)
     Dim wsLog As Worksheet
@@ -310,7 +237,7 @@ Public Sub LogMessage(procName As String, msgType As String, message As String)
         wsLog.Range("D1").Value = "Message"
     End If
     
-    nextRow = wsLog.Cells(wsLog.Rows.Count, 1).End(xlUp).Row + 1
+    nextRow = wsLog.Cells(wsLog.Rows.Count, "A").End(xlUp).Row + 1
     
     wsLog.Cells(nextRow, 1).Value = Format(Now, "yyyy-mm-dd HH:mm:ss")
     wsLog.Cells(nextRow, 2).Value = procName

@@ -1,0 +1,79 @@
+import pandas as pd
+import numpy as np
+
+# 1) Read your Excel file from the "XAV File" sheet
+file_path = "your_file.xlsx"
+df = pd.read_excel(file_path, sheet_name="XAV File")
+
+# ----------------------------------------------------------------------------
+# If your columns are literally named "Date", "CC", "PO", "Voice", "Amount",
+# you can skip this step. Otherwise, rename them:
+#
+# df.rename(columns={
+#     'A': 'Date',
+#     'E': 'CC',
+#     'J': 'PO',
+#     'L': 'Voice',
+#     'M': 'Amount'  # or 'N' if your Amount is in col N
+# }, inplace=True)
+# ----------------------------------------------------------------------------
+
+# 2) Convert 'Voice' and 'PO' to strings so we can easily check if they're empty.
+df['Voice'] = df['Voice'].fillna('').astype(str)
+df['PO'] = df['PO'].fillna('').astype(str)
+
+# 3) Define the logic for each row: 'TaxType' = 'WithoutTax' or 'WithTax'
+#    - If Voice is empty => 'WithoutTax'
+#    - Else if Voice not empty and PO not empty => 'WithoutTax'
+#    - Else => 'WithTax'
+def determine_tax_type(row):
+    voice_str = row['Voice'].strip()
+    po_str = row['PO'].strip()
+    if voice_str == '':
+        # No voice => Without Tax
+        return 'WithoutTax'
+    else:
+        # We do have a Voice
+        if po_str != '':
+            # PO is present => Without Tax
+            return 'WithoutTax'
+        else:
+            # PO is empty => With Tax
+            return 'WithTax'
+
+df['TaxType'] = df.apply(determine_tax_type, axis=1)
+
+# 4) Group by (Date, CC, Voice, TaxType) and sum the amounts
+grouped = (
+    df
+    .groupby(['Date', 'CC', 'Voice', 'TaxType'], dropna=False)['Amount']
+    .sum()
+    .reset_index()
+)
+
+# 5) Pivot so we get columns "WithoutTaxAmount" and "WithTaxAmount" for each (Date, CC, Voice)
+pivoted = grouped.pivot_table(
+    index=['Date', 'CC', 'Voice'],
+    columns='TaxType',
+    values='Amount',
+    fill_value=0
+).reset_index()
+
+# Rename the pivoted columns
+pivoted.columns.name = None  # remove the axis name
+if 'WithoutTax' not in pivoted.columns:
+    pivoted['WithoutTax'] = 0
+if 'WithTax' not in pivoted.columns:
+    pivoted['WithTax'] = 0
+
+pivoted.rename(columns={
+    'WithoutTax': 'WithoutTaxAmount',
+    'WithTax': 'WithTaxAmount'
+}, inplace=True)
+
+# 6) Write to a new sheet "Check"
+#    (mode="a" = append, "if_sheet_exists='replace'" = overwrite existing "Check" sheet)
+with pd.ExcelWriter(file_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+    pivoted.to_excel(writer, sheet_name="Check", index=False)
+
+print("Done! Created/overwrote the 'Check' sheet with With/Without Tax totals.")

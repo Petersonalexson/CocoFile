@@ -387,15 +387,15 @@ Public Function BuildBottomUpParentQuery(rangeName As String, dimensionName As S
     mCode = mCode & "            current_index = current_row[RowIndex]," & vbCrLf
     mCode = mCode & "            " & vbCrLf
     mCode = mCode & "            // Find potential parents (rows BELOW current row with LESS indentation)" & vbCrLf
-    mCode = mCode & "            potential_parents = Table.SelectRows(buffered_table, each " & vbCrLf
-    mCode = mCode & "                [RowIndex] > current_index and " & vbCrLf  // Look at rows BELOW
-    mCode = mCode & "                [Indentation] < current_indent" & vbCrLf    // With LESS indentation
+    mCode = mCode & "            potential_parents = Table.SelectRows(buffered_table, each" & vbCrLf
+    mCode = mCode & "                [RowIndex] > current_index and" & vbCrLf
+    mCode = mCode & "                [Indentation] < current_indent" & vbCrLf
     mCode = mCode & "            )," & vbCrLf
     mCode = mCode & "            " & vbCrLf
     mCode = mCode & "            // Sort potential parents by indentation (descending) and then by index (ascending)" & vbCrLf
     mCode = mCode & "            sorted_parents = Table.Sort(potential_parents, {" & vbCrLf
-    mCode = mCode & "                {""Indentation"", Order.Descending}," & vbCrLf  // Find highest indentation level below current
-    mCode = mCode & "                {""RowIndex"", Order.Ascending}" & vbCrLf       // Find closest parent below
+    mCode = mCode & "                {""Indentation"", Order.Descending}," & vbCrLf
+    mCode = mCode & "                {""RowIndex"", Order.Ascending}" & vbCrLf
     mCode = mCode & "            })," & vbCrLf
     mCode = mCode & "            " & vbCrLf
     mCode = mCode & "            // Get parent, or blank if no parent found" & vbCrLf
@@ -404,14 +404,8 @@ Public Function BuildBottomUpParentQuery(rangeName As String, dimensionName As S
     mCode = mCode & "            parent_value" & vbCrLf
     mCode = mCode & "    )," & vbCrLf
     mCode = mCode & "    " & vbCrLf
-    mCode = mCode & "    // Add dimension column" & vbCrLf
-    mCode = mCode & "    with_dimension = Table.AddColumn(with_parent, ""Dimension"", each """ & dimensionName & """, type text)," & vbCrLf
-    mCode = mCode & "    " & vbCrLf
-    mCode = mCode & "    // Add description column (assuming no description for now)" & vbCrLf
-    mCode = mCode & "    with_description = Table.AddColumn(with_dimension, ""Description"", each """", type text)," & vbCrLf
-    mCode = mCode & "    " & vbCrLf
-    mCode = mCode & "    // Select and reorder columns for final output" & vbCrLf
-    mCode = mCode & "    final_table = Table.SelectColumns(with_description, {""Dimension"", ""Value"", ""Parent"", ""Description""})" & vbCrLf
+    mCode = mCode & "    // Final result with only Value and Parent columns" & vbCrLf
+    mCode = mCode & "    final_table = Table.SelectColumns(with_parent, {""Value"", ""Parent""})" & vbCrLf
     mCode = mCode & "in" & vbCrLf
     mCode = mCode & "    final_table"
     

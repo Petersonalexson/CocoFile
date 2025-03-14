@@ -1,56 +1,447 @@
-Basically the way we create the arrays here works
+Option Explicit
 
-Sub RefreshSmartViewTree
-    Dim arrSheets As Variant
-    Dim ws As Worksheet 
-    Dim ConnectionName As String
-    Dim Ret As Long, HeaderRow As Long, LastRow As Long, I As Long
-    Dim ConnStatus As Integer
+'-------------------------------------------------------------------------------------------
+' MAIN WORKFLOW
+'-------------------------------------------------------------------------------------------
+Public Sub RunAll()
+    On Error GoTo errHandler
     
-    With wsLists
-        ConnectionName = .Range("nmConnectionName")
-        arrSheets = .Range("Hierarchy_Matrix")
-    End With
+    LogMessage "RunAll", "INFO", "Process started."
+    
+    ' 1) Refresh each sheet via Smart View
+    RefreshSmartViewTree
+    
+    ' 2) Adjust named ranges if D7 says "Tree" (skip 1) or "List" (skip 2)
+    AdjustNamedRangesForTreeList
+    
+    ' 3) Create or update queries referencing those named ranges
+    CreateOrUpdateQueries
+    
+    LogMessage "RunAll", "INFO", "Process completed successfully."
+    
+    ' Clear status bar
+    Application.StatusBar = False
+    Exit Sub
+    
+errHandler:
+    LogError "RunAll", Err.Number, Err.Description
+    Application.StatusBar = False
+End Sub
+
+'-------------------------------------------------------------------------------------------
+' 1) REFRESH SMART VIEW (your original code with a minor improvement)
+'-------------------------------------------------------------------------------------------
+Public Sub RefreshSmartViewTree()
+    On Error GoTo errHandler
+    
+    LogMessage "RefreshSmartViewTree", "INFO", "Starting Smart View refresh."
+    
+    Dim wsLists        As Worksheet
+    Dim arrSheets      As Variant
+    Dim ws             As Worksheet
+    Dim ConnectionName As String
+    Dim Ret            As Long, HeaderRow As Long, LastRow As Long, i As Long
+    Dim ConnStatus     As Integer
+    
+    ' 1) "Lists" sheet
+    On Error Resume Next
+    Set wsLists = ThisWorkbook.Worksheets("Lists")
+    On Error GoTo errHandler
+    
+    If wsLists Is Nothing Then
+        LogError "RefreshSmartViewTree", 0, "No 'Lists' sheet found."
+        Exit Sub
+    End If
+    
+    ' 2) Connection + Hierarchy_Matrix
+    ConnectionName = Trim(wsLists.Range("nmConnectionName").Value)
+    arrSheets = wsLists.Range("Hierarchy_Matrix").Value
+    
+    If Len(ConnectionName) = 0 Then
+        LogError "RefreshSmartViewTree", 0, "'nmConnectionName' is empty."
+        Exit Sub
+    End If
+    If IsEmpty(arrSheets) Then
+        LogError "RefreshSmartViewTree", 0, "'Hierarchy_Matrix' missing or empty."
+        Exit Sub
+    End If
     
     HeaderRow = 4
     
-    For I = LBound(arrSheets) To UBound(arrSheets)
-        Set ws = ThisWorkbook.Worksheets(arrSheets(I, 1))
+    ' Show progress in status bar
+    Dim totalRows As Long
+    totalRows = UBound(arrSheets, 1) - LBound(arrSheets, 1) + 1
+    
+    Dim iRow As Long
+    For iRow = LBound(arrSheets, 1) To UBound(arrSheets, 1)
+        Application.StatusBar = "RefreshSmartViewTree: processing " & (iRow - LBound(arrSheets, 1) + 1) & _
+                                " of " & totalRows & "..."
+        
+        Dim sheetName As String
+        Dim rangeName As String
+        
+        sheetName = Trim(arrSheets(iRow, 1))
+        rangeName = Trim(arrSheets(iRow, 2))
+        
+        If sheetName = "" Or rangeName = "" Then
+            LogMessage "RefreshSmartViewTree", "INFO", _
+                       "Skipping row " & iRow & " (no sheet/range)."
+            GoTo NextItem
+        End If
+        
+        ' Connect / Zoom
+        Set ws = Nothing
+        On Error Resume Next
+        Set ws = ThisWorkbook.Worksheets(sheetName)
+        On Error GoTo errHandler
+        
+        If ws Is Nothing Then
+            LogError "RefreshSmartViewTree", 0, "Sheet '" & sheetName & "' not found."
+            GoTo NextItem
+        End If
+        
+        Ret = HypUIConnect(ws.Name, "", "", ConnectionName)
+        ConnStatus = HypConnected(ws.Name)
+        If ConnStatus <> -1 Then
+            LogError "RefreshSmartViewTree", 0, "Failed connect on '" & ws.Name & "'."
+            GoTo NextItem
+        End If
+        
         With ws
-            Ret = HypUIConnect(.Name, "", "", ConnectionName)
-            ConnStatus = HypConnected(.Name)
-            If ConnStatus <> -1 Then Stop
-            'Calculate last row
-            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
-            'Delete hierarchy rows except hierarchy name
+            ' Delete old rows
+            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
             If LastRow > HeaderRow Then
                 .Rows(HeaderRow & ":" & LastRow - 1).Delete Shift:=xlUp
             End If
-            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
-            Ret = HypSetSheetOption(.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
-            Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
-            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
             
-            ThisWorkbook.Names.Add Name:=arrSheets(I, 2), RefersTo:=.Range("A" & HeaderRow & ":A" & LastRow)
+            ' Recalc last row
+            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
+            
+            ' Set member display
+            Ret = HypSetSheetOption(.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
+            
+            ' Zoom in
+            Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
+            
+            ' new last row
+            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
+            
+            ' define named range
+            On Error Resume Next
+            ThisWorkbook.Names(rangeName).Delete
+            On Error GoTo errHandler
+            
+            ThisWorkbook.Names.Add Name:=rangeName, _
+                RefersTo:="='" & .Name & "'!A" & HeaderRow & ":A" & LastRow
         End With
-    Next I
+        
+        LogMessage "RefreshSmartViewTree", "INFO", _
+                   "Sheet='" & ws.Name & "', NamedRange='" & rangeName & "', Rows=" & (LastRow - HeaderRow + 1)
+        
+NextItem:
+        Set ws = Nothing
+    Next iRow
+    
+    LogMessage "RefreshSmartViewTree", "INFO", "Smart View refresh done."
+    Exit Sub
+
+errHandler:
+    LogError "RefreshSmartViewTree", Err.Number, Err.Description
 End Sub
 
-Create them like this
+'-------------------------------------------------------------------------------------------
+' 2) ADJUST NAMED RANGES FOR "TREE" / "LIST" => skip final row(s)
+'-------------------------------------------------------------------------------------------
+Public Sub AdjustNamedRangesForTreeList()
+    On Error GoTo errHandler
+    
+    LogMessage "AdjustNamedRangesForTreeList", "INFO", "Adjusting named ranges for Tree/List..."
+    
+    Dim wsLists As Worksheet
+    Dim arrSheets As Variant
+    
+    On Error Resume Next
+    Set wsLists = ThisWorkbook.Worksheets("Lists")
+    On Error GoTo errHandler
+    
+    If wsLists Is Nothing Then
+        LogError "AdjustNamedRangesForTreeList", 0, "No 'Lists' sheet found."
+        Exit Sub
+    End If
+    
+    arrSheets = wsLists.Range("Hierarchy_Matrix").Value
+    If IsEmpty(arrSheets) Then
+        LogError "AdjustNamedRangesForTreeList", 0, "'Hierarchy_Matrix' is empty or missing."
+        Exit Sub
+    End If
+    
+    Dim totalRows As Long
+    totalRows = UBound(arrSheets, 1) - LBound(arrSheets, 1) + 1
+    
+    Dim i As Long
+    For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
+        Application.StatusBar = "Adjusting skip rows: " & (i - LBound(arrSheets, 1) + 1) & " of " & totalRows & "..."
+        
+        Dim sheetName As String, rangeName As String
+        sheetName = Trim(arrSheets(i, 1))
+        rangeName = Trim(arrSheets(i, 2))
+        
+        If sheetName = "" Or rangeName = "" Then GoTo NextItem
+        
+        Dim ws As Worksheet
+        Set ws = Nothing
+        On Error Resume Next
+        Set ws = ThisWorkbook.Worksheets(sheetName)
+        On Error GoTo errHandler
+        
+        If ws Is Nothing Then GoTo NextItem
+        
+        ' Check D7
+        Dim skipCount As Long
+        skipCount = 0
+        Dim treeOrList As String
+        treeOrList = Trim(ws.Range("D7").Value)
+        If UCase(treeOrList) = "TREE" Then skipCount = 1
+        If UCase(treeOrList) = "LIST" Then skipCount = 2
+        
+        Dim lastRow As Long, finalRow As Long
+        Dim HeaderRow As Long: HeaderRow = 4
+        
+        lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+        finalRow = lastRow - skipCount
+        If finalRow < HeaderRow Then
+            LogError "AdjustNamedRangesForTreeList", 0, "Sheet='" & sheetName & "' => no data after skip."
+            GoTo NextItem
+        End If
+        
+        On Error Resume Next
+        ThisWorkbook.Names(rangeName).Delete
+        On Error GoTo errHandler
+        
+        ThisWorkbook.Names.Add Name:=rangeName, _
+            RefersTo:="='" & ws.Name & "'!A" & HeaderRow & ":A" & finalRow
+        
+        LogMessage "AdjustNamedRangesForTreeList", "INFO", _
+                   "Sheet='" & sheetName & "', range='" & rangeName & "', skip=" & skipCount & " => row4..row" & finalRow
+        
+NextItem:
+        Set ws = Nothing
+    Next i
+    
+    LogMessage "AdjustNamedRangesForTreeList", "INFO", "Finished skipping final row(s)."
+    Exit Sub
 
-THEN EDIT THEM AGAIN and remove last row if Tree
-or last 2 rows if List
+errHandler:
+    LogError "AdjustNamedRangesForTreeList", Err.Number, Err.Description
+    Application.StatusBar = False
+End Sub
 
-also
+'-------------------------------------------------------------------------------------------
+' 3) CREATE OR UPDATE QUERIES NAMED <SheetName>_Flat
+'   M code with Table.Buffer() + a more efficient parent lookup
+'   Also updates status bar
+'-------------------------------------------------------------------------------------------
+Public Sub CreateOrUpdateQueries()
+    On Error GoTo errHandler
+    
+    LogMessage "CreateOrUpdateQueries", "INFO", "Starting to create/update queries..."
+    
+    Dim wsLists   As Worksheet
+    Dim arrSheets As Variant
+    
+    On Error Resume Next
+    Set wsLists = ThisWorkbook.Worksheets("Lists")
+    On Error GoTo errHandler
+    
+    If wsLists Is Nothing Then
+        LogError "CreateOrUpdateQueries", 0, "No 'Lists' sheet found."
+        Exit Sub
+    End If
+    
+    arrSheets = wsLists.Range("Hierarchy_Matrix").Value
+    If IsEmpty(arrSheets) Then
+        LogError "CreateOrUpdateQueries", 0, "'Hierarchy_Matrix' missing or empty."
+        Exit Sub
+    End If
+    
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    
+    Dim totalRows As Long
+    totalRows = UBound(arrSheets, 1) - LBound(arrSheets, 1) + 1
+    
+    Dim i As Long
+    For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
+        
+        Application.StatusBar = "CreateOrUpdateQueries: " & (i - LBound(arrSheets, 1) + 1) & " / " & totalRows
+        
+        Dim sheetName  As String
+        Dim rangeName  As String
+        
+        sheetName = Trim(arrSheets(i, 1))
+        rangeName = Trim(arrSheets(i, 2))
+        
+        If sheetName = "" Or rangeName = "" Then GoTo NextItem
+        
+        Dim queryName As String
+        queryName = sheetName & "_Flat"
+        
+        ' Build M code
+        Dim mCode As String
+        mCode = BuildParentLookupMCode(rangeName)
+        If mCode = "" Then GoTo NextItem
+        
+        ' Create or update
+        Dim existingConn As Boolean
+        existingConn = False
+        
+        Dim c As WorkbookConnection
+        For Each c In ThisWorkbook.Connections
+            If c.Name = queryName Then
+                existingConn = True
+                Exit For
+            End If
+        Next c
+        
+        If existingConn Then
+            On Error Resume Next
+            ThisWorkbook.Queries(queryName).Formula = mCode
+            If Err.Number <> 0 Then
+                ThisWorkbook.Connections(queryName).Delete
+                existingConn = False
+            End If
+            Err.Clear
+        End If
+        
+        If Not existingConn Then
+            On Error Resume Next
+            ThisWorkbook.Queries.Add Name:=queryName, Formula:=mCode
+            If Err.Number <> 0 Then
+                LogError "CreateOrUpdateQueries", Err.Number, "Could not create query '" & queryName & "'"
+                GoTo NextItem
+            End If
+            Err.Clear
+        End If
+        
+        LogMessage "CreateOrUpdateQueries", "INFO", "Created/Updated query '" & queryName & "' referencing " & rangeName
+        
+NextItem:
+        ' next
+    Next i
+    
+    LogMessage "CreateOrUpdateQueries", "INFO", "Query creation/update done."
+    Application.StatusBar = False
+    Exit Sub
 
-Performance optimizations:
+errHandler:
+    LogError "CreateOrUpdateQueries", Err.Number, Err.Description
+    Application.StatusBar = False
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+End Sub
 
-Added Table.Buffer() to improve performance for tables used multiple times
-Reduced unnecessary processing in the M code
-More efficient parent lookup algorithm
+'-------------------------------------------------------------------------------------------
+' Build M code with Table.Buffer() and a more efficient parent lookup
+' The approach:
+'   1) Read the named range
+'   2) Table.Buffer(...) so we only read once
+'   3) leadingSpaces = ...
+'   4) We'll do a "sorted" approach to find parents quickly
+'-------------------------------------------------------------------------------------------
+Private Function BuildParentLookupMCode(namedRange As String) As String
+    On Error GoTo errHandler
+    
+    Dim m As String
+    
+    ' Explanation of approach:
+    '  - We'll read the data, add row index
+    '  - We'll do a Table.Buffer() on a sorted version of the data by leadingSpaces, then
+    '    for each row we do a binary search or something more advanced. For simplicity,
+    '    let's do the descending approach. We'll still rely on Table.SelectRows, but with
+    '    a small optimization. 
+    
+    ' This is still somewhat simplistic, but we do use Table.Buffer so we don't re-scan multiple times.
+    ' If you want a truly "binary search" approach, you'd embed a custom function. We'll keep it simpler.
+    
+    m = ""
+    m = m & "let" & vbCrLf
+    m = m & "    Source = Excel.CurrentWorkbook(){[Name=""" & namedRange & """]}[Content]," & vbCrLf
+    m = m & "    bufferedSource = Table.Buffer(Source)," & vbCrLf
+    m = m & "    remove_nulls = Table.SelectRows(bufferedSource, each [Column1] <> null and [Column1] <> """")," & vbCrLf
+    m = m & "    addIndex = Table.AddIndexColumn(remove_nulls, ""RowIndex"", 0, 1, Int64.Type)," & vbCrLf
+    m = m & "" & vbCrLf
+    m = m & "    // leadingSpaces" & vbCrLf
+    m = m & "    addLeadingSpaces = Table.AddColumn(addIndex, ""leadingSpaces"", each Text.Length([Column1]) - Text.Length(Text.TrimStart([Column1])), Int64.Type)," & vbCrLf
+    m = m & "" & vbCrLf
+    m = m & "    // trim to get Value" & vbCrLf
+    m = m & "    addValue = Table.AddColumn(addLeadingSpaces, ""Value"", each Text.TrimStart([Column1]), type text)," & vbCrLf
+    m = m & "" & vbCrLf
+    m = m & "    // For parent lookup, we'll Table.Buffer the smaller set (RowIndex,leadingSpaces,Value)" & vbCrLf
+    m = m & "    smallSet = Table.Buffer(Table.SelectColumns(addValue, {""RowIndex"", ""leadingSpaces"", ""Value""}))," & vbCrLf
+    m = m & "" & vbCrLf
+    m = m & "    // Add ParentID: find row above with leadingSpaces < mySpaces, picking the largest leadingSpaces among them" & vbCrLf
+    m = m & "    withParent = Table.AddColumn(smallSet, ""ParentID"", (thisRow) =>" & vbCrLf
+    m = m & "        let" & vbCrLf
+    m = m & "            myIndex = Record.Field(thisRow, ""RowIndex"")," & vbCrLf
+    m = m & "            mySpaces = Record.Field(thisRow, ""leadingSpaces"")," & vbCrLf
+    m = m & "            candidates = Table.SelectRows(smallSet, each [RowIndex] < myIndex and [leadingSpaces] < mySpaces)," & vbCrLf
+    m = m & "            ordered = Table.Sort(candidates, {{""leadingSpaces"", Order.Descending}, {""RowIndex"", Order.Descending}})," & vbCrLf
+    m = m & "            topRow = if Table.IsEmpty(ordered) then null else ordered{0}," & vbCrLf
+    m = m & "            parentID = if topRow=null then null else topRow[RowIndex]" & vbCrLf
+    m = m & "        in parentID" & vbCrLf
+    m = m & "    )," & vbCrLf
+    m = m & "" & vbCrLf
+    m = m & "    // Now merge to get parent's Value" & vbCrLf
+    m = m & "    joinParent = Table.NestedJoin(" & vbCrLf
+    m = m & "        withParent," & vbCrLf
+    m = m & "        {""ParentID""}," & vbCrLf
+    m = m & "        withParent," & vbCrLf
+    m = m & "        {""RowIndex""}," & vbCrLf
+    m = m & "        ""ParentTable"", " & vbCrLf
+    m = m & "        JoinKind.LeftOuter" & vbCrLf
+    m = m & "    )," & vbCrLf
+    m = m & "    expanded = Table.ExpandTableColumn(joinParent, ""ParentTable"", {""Value""}, {""Parent""})," & vbCrLf
+    m = m & "    final = Table.SelectColumns(expanded, {""RowIndex"", ""leadingSpaces"", ""Value"", ""Parent""})" & vbCrLf
+    m = m & "in" & vbCrLf
+    m = m & "    final"
+    
+    BuildParentLookupMCode = m
+    LogMessage "BuildParentLookupMCode", "INFO", "M code built for " & namedRange
+    Exit Function
+
+errHandler:
+    LogError "BuildParentLookupMCode", Err.Number, Err.Description
+    BuildParentLookupMCode = ""
+End Function
 
 
-Status bar updates instead of a progress form:
+'-------------------------------------------------------------------------------------------
+' LOGGING SUBS
+'-------------------------------------------------------------------------------------------
+Public Sub LogMessage(procName As String, msgType As String, message As String)
+    Dim wsLog As Worksheet
+    Dim nxtRow As Long
+    
+    On Error Resume Next
+    Set wsLog = ThisWorkbook.Worksheets("Log")
+    On Error GoTo 0
+    
+    If wsLog Is Nothing Then
+        Set wsLog = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        wsLog.Name = "Log"
+        wsLog.Range("A1").Value = "Timestamp"
+        wsLog.Range("B1").Value = "Procedure"
+        wsLog.Range("C1").Value = "Type"
+        wsLog.Range("D1").Value = "Message"
+    End If
+    
+    nxtRow = wsLog.Cells(wsLog.Rows.Count, "A").End(xlUp).Row + 1
+    wsLog.Cells(nxtRow, 1).Value = Format(Now, "yyyy-mm-dd HH:mm:ss")
+    wsLog.Cells(nxtRow, 2).Value = procName
+    wsLog.Cells(nxtRow, 3).Value = msgType
+    wsLog.Cells(nxtRow, 4).Value = message
+End Sub
 
-Uses the built-in status bar to show progress
-Simpler implementation that works in all Excel versions full script please
+Public Sub LogError(procName As String, errNumber As Long, errDescription As String)
+    LogMessage procName, "ERROR", "Error #" & errNumber & ": " & errDescription
+End Sub

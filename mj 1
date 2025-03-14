@@ -1,8 +1,5 @@
 Option Explicit
 
-' Constants for timeout handling
-Private Const QUERY_TIMEOUT_SECONDS As Long = 300  ' 5 minutes timeout per query
-
 '--------------------------------------------------------------------------------------------
 ' MAIN WRAPPER
 ' 1) Refresh each sheet via Smart View
@@ -12,333 +9,34 @@ Private Const QUERY_TIMEOUT_SECONDS As Long = 300  ' 5 minutes timeout per query
 Public Sub RefreshBuildArraysParentChild()
     On Error GoTo errHandler
     
-    ' Show progress form
-    ShowProgressBar "Starting process...", 0
-    
     LogMessage "RefreshBuildArraysParentChild", "INFO", "Process started."
+    Application.StatusBar = "Starting Smart View refresh..."
     
     ' 1) Smart View refresh
-    UpdateProgressBar "Refreshing Smart View hierarchies...", 10
     RefreshSmartViewHierarchies
     
     ' 2) Update the named ranges to skip final row(s)
-    UpdateProgressBar "Updating named ranges...", 40
+    Application.StatusBar = "Updating named ranges..."
     UpdateNamedRanges_SkipRows
     
     ' 3) Create or update queries referencing those named ranges
-    UpdateProgressBar "Creating flat table queries...", 70
+    Application.StatusBar = "Creating flat table queries..."
     CreateOrUpdateFlatTableQueries
     
-    UpdateProgressBar "Process completed successfully!", 100
+    Application.StatusBar = "Process completed successfully!"
     LogMessage "RefreshBuildArraysParentChild", "INFO", "Process completed successfully."
-    
-    ' Close progress form after a delay
-    Application.Wait Now + TimeSerial(0, 0, 2)
-    HideProgressBar
+    Application.StatusBar = False
     Exit Sub
 
 errHandler:
-    HideProgressBar
     LogError "RefreshBuildArraysParentChild", Err.Number, Err.Description
+    Application.StatusBar = False
     MsgBox "An error occurred: " & Err.Description, vbExclamation, "Process Error"
 End Sub
 
 
 '--------------------------------------------------------------------------------------------
-' STEP (1) REFRESH SMART VIEW
-'  - Connect, delete old rows except final one, zoom in
-'  - Recreate named range from row4..lastRow
-'--------------------------------------------------------------------------------------------
-Public Sub RefreshSmartViewHierarchies()
-    On Error GoTo errHandler
-    
-    Dim wsLists        As Worksheet
-    Dim arrSheets      As Variant
-    Dim ConnectionName As String
-    
-    Dim i              As Long
-    Dim Ret            As Long
-    Dim ConnStatus     As Long
-    Dim HeaderRow      As Long
-    Dim LastRow        As Long
-    
-    LogMessage "RefreshSmartViewHierarchies", "INFO", "Starting Smart View refresh..."
-    
-    On Error Resume Next
-    Set wsLists = ThisWorkbook.Worksheets("Lists")
-    On Error GoTo errHandler
-    
-    If wsLists Is Nothing Then
-        LogError "RefreshSmartViewHierarchies", 0, "No 'Lists' sheet found."
-        MsgBox "ERROR: No 'Lists' sheet found.", vbCritical
-        Exit Sub
-    End If
-    
-    ConnectionName = Trim(wsLists.Range("nmConnectionName").Value)
-    arrSheets = wsLists.Range("Hierarchy_Matrix").Value
-    
-    If Len(ConnectionName) = 0 Then
-        LogError "RefreshSmartViewHierarchies", 0, "'nmConnectionName' is empty."
-        MsgBox "ERROR: 'nmConnectionName' is empty.", vbCritical
-        Exit Sub
-    End If
-    If IsEmpty(arrSheets) Then
-        LogError "RefreshSmartViewHierarchies", 0, "'Hierarchy_Matrix' missing or empty."
-        MsgBox "ERROR: 'Hierarchy_Matrix' missing or empty.", vbCritical
-        Exit Sub
-    End If
-    
-    HeaderRow = 4
-    
-    Application.ScreenUpdating = False
-    Application.DisplayAlerts = False
-    Application.Calculation = xlCalculationManual
-    
-    Dim totalRows As Long
-    totalRows = UBound(arrSheets, 1) - LBound(arrSheets, 1) + 1
-    LogMessage "RefreshSmartViewHierarchies", "INFO", "Found " & totalRows & " row(s) in Hierarchy_Matrix."
-    
-    Dim sheetName As String, rangeName As String
-    Dim ws As Worksheet
-    
-    For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
-        ' Update progress
-        UpdateProgressBar "Refreshing: " & i & " of " & totalRows, 10 + (i / totalRows) * 30
-        
-        sheetName = Trim(arrSheets(i, 1))
-        rangeName = Trim(arrSheets(i, 2))
-        
-        If sheetName = "" Or rangeName = "" Then
-            LogMessage "RefreshSmartViewHierarchies", "INFO", _
-                       "Skipping row " & i & " - blank sheet or range name."
-            GoTo NextItem
-        End If
-        
-        ' Connect / Zoom
-        Set ws = Nothing
-        On Error Resume Next
-        Set ws = ThisWorkbook.Worksheets(sheetName)
-        On Error GoTo errHandler
-        
-        If ws Is Nothing Then
-            LogError "RefreshSmartViewHierarchies", 0, "Sheet '" & sheetName & "' not found."
-            GoTo NextItem
-        End If
-        
-        ' Check if Smart View functions are available
-        On Error Resume Next
-        Ret = HypCheckVersion(0)
-        If Err.Number <> 0 Then
-            LogError "RefreshSmartViewHierarchies", Err.Number, "Smart View functions not available."
-            MsgBox "Smart View functions not available. Please ensure Smart View is properly installed.", vbCritical
-            On Error GoTo errHandler
-            Exit Sub
-        End If
-        On Error GoTo errHandler
-        
-        Ret = HypUIConnect(ws.Name, "", "", ConnectionName)
-        ConnStatus = HypConnected(ws.Name)
-        If ConnStatus <> -1 Then
-            LogError "RefreshSmartViewHierarchies", 0, "Failed connecting on '" & ws.Name & "'."
-            GoTo NextItem
-        End If
-        
-        LogMessage "RefreshSmartViewHierarchies", "INFO", "Connected to Smart View on " & ws.Name
-        
-        With ws
-            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
-            If LastRow > HeaderRow Then
-                ' Only delete if there are rows to delete
-                .Rows(HeaderRow & ":" & (LastRow - 1)).Delete Shift:=xlUp
-            End If
-            
-            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
-            Ret = HypSetSheetOption(.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
-            Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
-            
-            ' Recalc last row after zoom
-            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
-            
-            ' Only create named range if rows exist
-            If LastRow >= HeaderRow Then
-                ' Recreate named range from row4..LastRow
-                On Error Resume Next
-                ThisWorkbook.Names(rangeName).Delete
-                On Error GoTo errHandler
-                ThisWorkbook.Names.Add Name:=rangeName, RefersTo:="='" & .Name & "'!A" & HeaderRow & ":A" & LastRow
-                
-                LogMessage "RefreshSmartViewHierarchies", "INFO", _
-                       "Named range '" & rangeName & "' set on sheet '" & ws.Name & "'."
-            Else
-                LogError "RefreshSmartViewHierarchies", 0, "No data found in " & ws.Name & " after zoom in."
-            End If
-        End With
-        
-NextItem:
-        Set ws = Nothing
-        DoEvents  ' Allow UI to update
-    Next i
-    
-    Application.ScreenUpdating = True
-    Application.DisplayAlerts = True
-    Application.Calculation = xlCalculationAutomatic
-    
-    LogMessage "RefreshSmartViewHierarchies", "INFO", "Smart View refresh done."
-    Exit Sub
-
-errHandler:
-    LogError "RefreshSmartViewHierarchies", Err.Number, Err.Description
-    Application.ScreenUpdating = True
-    Application.DisplayAlerts = True
-    Application.Calculation = xlCalculationAutomatic
-    Application.StatusBar = False
-End Sub
-
-
-'--------------------------------------------------------------------------------------------
-' STEP (2) UPDATE NAMED RANGES BY SKIPPING FINAL ROW(S)
-'   If D7="Tree", skip 1
-'   If D7="List", skip 2
-'   Then redefine the named range from row 4..(LastRow - skipCount)
-'--------------------------------------------------------------------------------------------
-Public Sub UpdateNamedRanges_SkipRows()
-    On Error GoTo errHandler
-    
-    LogMessage "UpdateNamedRanges_SkipRows", "INFO", "Starting to skip final rows for each named range..."
-    
-    Dim wsLists As Worksheet
-    Dim arrSheets As Variant
-    
-    Dim i As Long
-    
-    On Error Resume Next
-    Set wsLists = ThisWorkbook.Worksheets("Lists")
-    On Error GoTo errHandler
-    
-    If wsLists Is Nothing Then
-        LogError "UpdateNamedRanges_SkipRows", 0, "No 'Lists' sheet found."
-        MsgBox "ERROR: No 'Lists' sheet found.", vbCritical
-        Exit Sub
-    End If
-    
-    arrSheets = wsLists.Range("Hierarchy_Matrix").Value
-    If IsEmpty(arrSheets) Then
-        LogError "UpdateNamedRanges_SkipRows", 0, "'Hierarchy_Matrix' missing or empty."
-        MsgBox "ERROR: 'Hierarchy_Matrix' missing or empty.", vbCritical
-        Exit Sub
-    End If
-    
-    Dim totalRows As Long
-    totalRows = UBound(arrSheets, 1) - LBound(arrSheets, 1) + 1
-    LogMessage "UpdateNamedRanges_SkipRows", "INFO", "Found " & totalRows & " row(s) in Hierarchy_Matrix."
-    
-    Application.ScreenUpdating = False
-    Application.DisplayAlerts = False
-    
-    Dim sheetName As String, rangeName As String
-    Dim ws As Worksheet
-    Dim skipCount As Long
-    Dim lastRow As Long, finalRow As Long
-    Dim treeOrList As String
-    Dim HeaderRow As Long
-    HeaderRow = 4
-    
-    For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
-        ' Update progress
-        UpdateProgressBar "Updating named ranges: " & i & " of " & totalRows, 40 + (i / totalRows) * 30
-        
-        sheetName = Trim(arrSheets(i, 1))
-        rangeName = Trim(arrSheets(i, 2))
-        
-        If sheetName = "" Or rangeName = "" Then
-            LogMessage "UpdateNamedRanges_SkipRows", "INFO", _
-                       "Skipping row " & i & " - blank sheet or range name."
-            GoTo NextItem
-        End If
-        
-        Set ws = Nothing
-        On Error Resume Next
-        Set ws = ThisWorkbook.Worksheets(sheetName)
-        On Error GoTo errHandler
-        
-        If ws Is Nothing Then
-            LogError "UpdateNamedRanges_SkipRows", 0, "Cannot find sheet '" & sheetName & "'."
-            GoTo NextItem
-        End If
-        
-        ' Check D7 to see if "Tree" or "List"
-        On Error Resume Next
-        treeOrList = Trim(ws.Range("D7").Value)
-        If Err.Number <> 0 Then
-            LogError "UpdateNamedRanges_SkipRows", Err.Number, "Error reading D7 cell in sheet '" & sheetName & "'."
-            treeOrList = ""
-        End If
-        On Error GoTo errHandler
-        
-        skipCount = 0
-        If UCase(treeOrList) = "TREE" Then
-            skipCount = 1
-        ElseIf UCase(treeOrList) = "LIST" Then
-            skipCount = 2
-        End If
-        
-        On Error Resume Next
-        lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
-        If Err.Number <> 0 Then
-            LogError "UpdateNamedRanges_SkipRows", Err.Number, "Error finding last row in sheet '" & sheetName & "'."
-            GoTo NextItem
-        End If
-        On Error GoTo errHandler
-        
-        finalRow = lastRow - skipCount
-        If finalRow < HeaderRow Then
-            LogError "UpdateNamedRanges_SkipRows", 0, _
-                     "After skipping, no data left on sheet='" & sheetName & "'."
-            GoTo NextItem
-        End If
-        
-        ' Redefine the named range
-        On Error Resume Next
-        ThisWorkbook.Names(rangeName).Delete
-        If Err.Number <> 0 Then
-            LogMessage "UpdateNamedRanges_SkipRows", "INFO", "Named range '" & rangeName & "' doesn't exist yet."
-        End If
-        On Error GoTo errHandler
-        
-        On Error Resume Next
-        ThisWorkbook.Names.Add Name:=rangeName, _
-           RefersTo:="='" & ws.Name & "'!A" & HeaderRow & ":A" & finalRow
-        If Err.Number <> 0 Then
-            LogError "UpdateNamedRanges_SkipRows", Err.Number, "Error creating named range '" & rangeName & "'."
-            GoTo NextItem
-        End If
-        On Error GoTo errHandler
-        
-        LogMessage "UpdateNamedRanges_SkipRows", "INFO", _
-                   "Sheet='" & sheetName & "' skip=" & skipCount & ". NamedRange='" & rangeName & _
-                   "' => A" & HeaderRow & ":A" & finalRow
-        
-NextItem:
-        Set ws = Nothing
-        DoEvents  ' Allow UI to update
-    Next i
-    
-    Application.ScreenUpdating = True
-    Application.DisplayAlerts = True
-    
-    LogMessage "UpdateNamedRanges_SkipRows", "INFO", "Finished skipping final rows in named ranges."
-    Exit Sub
-
-errHandler:
-    LogError "UpdateNamedRanges_SkipRows", Err.Number, Err.Description
-    Application.ScreenUpdating = True
-    Application.DisplayAlerts = True
-    Application.StatusBar = False
-End Sub
-
-
-'--------------------------------------------------------------------------------------------
-' STEP (3) CREATE OR UPDATE QUERIES NAMED "<SheetName>_FlatTable"
+' CREATE OR UPDATE QUERIES NAMED "<SheetName>_FlatTable"
 '   - M code references that named range, uses indentation-based parent detection
 '--------------------------------------------------------------------------------------------
 Public Sub CreateOrUpdateFlatTableQueries()
@@ -382,9 +80,6 @@ Public Sub CreateOrUpdateFlatTableQueries()
     Dim c As WorkbookConnection
     
     For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
-        ' Update progress
-        UpdateProgressBar "Creating query " & i & " of " & totalRows, 70 + (i / totalRows) * 30
-        
         sheetName = Trim(arrSheets(i, 1))
         rangeName = Trim(arrSheets(i, 2))
         
@@ -414,7 +109,7 @@ Public Sub CreateOrUpdateFlatTableQueries()
         Application.StatusBar = "Processing query: " & finalQueryName & " (" & i & " of " & totalRows & ")"
         
         ' Build M code referencing "rangeName"
-        queryText = BuildOptimizedParentChildQueryText(rangeName)
+        queryText = BuildImprovedQueryText(rangeName)
         If queryText = "" Then
             LogError "CreateOrUpdateFlatTableQueries", 0, _
                      "M code generation failed for " & rangeName
@@ -478,232 +173,99 @@ End Sub
 
 
 '--------------------------------------------------------------------------------------------
-' OPTIMIZED M CODE: "BuildOptimizedParentChildQueryText" for Indentation-Based Parent
-' - Uses buffering for performance
-' - Simplified and more efficient logic
+' IMPROVED M CODE: For better performance with indentation detection
 '--------------------------------------------------------------------------------------------
-Public Function BuildOptimizedParentChildQueryText(namedRange As String) As String
+Public Function BuildImprovedQueryText(namedRange As String) As String
     On Error GoTo errHandler
     
-    LogMessage "BuildOptimizedParentChildQueryText", "INFO", "Building M code for range: " & namedRange
+    LogMessage "BuildImprovedQueryText", "INFO", "Building M code for range: " & namedRange
     
     Dim mCode As String
     
     mCode = mCode & "let" & vbCrLf
     mCode = mCode & "    Source = Excel.CurrentWorkbook(){[Name=""" & namedRange & """]}[Content]," & vbCrLf
-    mCode = mCode & "    // Remove empty rows and buffer for performance" & vbCrLf
+    mCode = mCode & "    // Filter out null rows and empty strings" & vbCrLf
     mCode = mCode & "    filtered_source = Table.SelectRows(Source, each [Column1] <> null and [Column1] <> """")," & vbCrLf
-    mCode = mCode & "    buffered_source = Table.Buffer(filtered_source)," & vbCrLf
-    mCode = mCode & "    #""Add RowIndex"" = Table.AddIndexColumn(buffered_source, ""RowIndex"", 0, 1, Int64.Type)," & vbCrLf
+    mCode = mCode & "    // Add row index for tracking position" & vbCrLf
+    mCode = mCode & "    #""Add RowIndex"" = Table.AddIndexColumn(filtered_source, ""RowIndex"", 0, 1, Int64.Type)," & vbCrLf
     mCode = mCode & "" & vbCrLf
-    mCode = mCode & "    // Calculate leadingSpaces more efficiently" & vbCrLf
-    mCode = mCode & "    #""Added leadingSpaces"" = Table.AddColumn(#""Add RowIndex"", ""leadingSpaces"", each " & vbCrLf
-    mCode = mCode & "        Text.Length([Column1]) - Text.Length(Text.TrimStart([Column1]))" & vbCrLf
+    mCode = mCode & "    // Calculate indentation (leading spaces)" & vbCrLf
+    mCode = mCode & "    #""Added Indentation"" = Table.AddColumn(#""Add RowIndex"", ""Indentation"", each " & vbCrLf
+    mCode = mCode & "        let" & vbCrLf
+    mCode = mCode & "            text = [Column1]," & vbCrLf
+    mCode = mCode & "            trimmed = Text.TrimStart(text)," & vbCrLf
+    mCode = mCode & "            leadingSpaces = Text.Length(text) - Text.Length(trimmed)" & vbCrLf
+    mCode = mCode & "        in" & vbCrLf
+    mCode = mCode & "            leadingSpaces" & vbCrLf
     mCode = mCode & "    , Int64.Type)," & vbCrLf
     mCode = mCode & "" & vbCrLf
-    mCode = mCode & "    // Calculate Value column and buffer the result" & vbCrLf
-    mCode = mCode & "    #""Added Value"" = Table.AddColumn(#""Added leadingSpaces"", ""Value"", each Text.Trim([Column1]), type text)," & vbCrLf
-    mCode = mCode & "    #""Prep for parent"" = Table.SelectColumns(#""Added Value"", {""RowIndex"", ""leadingSpaces"", ""Value""})," & vbCrLf
-    mCode = mCode & "    buffered_prep = Table.Buffer(#""Prep for parent"")," & vbCrLf
+    mCode = mCode & "    // Extract the actual value by trimming" & vbCrLf
+    mCode = mCode & "    #""Added Value"" = Table.AddColumn(#""Added Indentation"", ""Value"", each Text.Trim([Column1]), type text)," & vbCrLf
     mCode = mCode & "" & vbCrLf
-    mCode = mCode & "    // Optimize parent lookup by sorting once and buffering" & vbCrLf
-    mCode = mCode & "    sorted_by_spaces = Table.Sort(buffered_prep, {{""leadingSpaces"", Order.Ascending}, {""RowIndex"", Order.Ascending}})," & vbCrLf
-    mCode = mCode & "    buffered_sorted = Table.Buffer(sorted_by_spaces)," & vbCrLf
+    mCode = mCode & "    // Create working table with essential columns only" & vbCrLf
+    mCode = mCode & "    working_table = Table.SelectColumns(#""Added Value"", {""RowIndex"", ""Indentation"", ""Value""})," & vbCrLf
     mCode = mCode & "" & vbCrLf
-    mCode = mCode & "    // More efficient parent lookup" & vbCrLf
-    mCode = mCode & "    #""Add ParentID"" = Table.AddColumn(buffered_prep, ""ParentID"", (thisRow) =>" & vbCrLf
+    mCode = mCode & "    // For performance, buffer the table" & vbCrLf
+    mCode = mCode & "    buffered_table = Table.Buffer(working_table)," & vbCrLf
+    mCode = mCode & "" & vbCrLf
+    mCode = mCode & "    // Find parent based on indentation" & vbCrLf
+    mCode = mCode & "    #""With ParentID"" = Table.AddColumn(buffered_table, ""ParentID"", (row) =>" & vbCrLf
     mCode = mCode & "        let" & vbCrLf
-    mCode = mCode & "            myIndex = thisRow[RowIndex]," & vbCrLf
-    mCode = mCode & "            mySpaces = thisRow[leadingSpaces]," & vbCrLf
-    mCode = mCode & "            candidates = Table.SelectRows(" & vbCrLf
-    mCode = mCode & "                buffered_sorted, " & vbCrLf
-    mCode = mCode & "                each [RowIndex] < myIndex and [leadingSpaces] < mySpaces" & vbCrLf
+    mCode = mCode & "            // Current row details" & vbCrLf
+    mCode = mCode & "            currentIndent = row[Indentation]," & vbCrLf
+    mCode = mCode & "            currentIndex = row[RowIndex]," & vbCrLf
+    mCode = mCode & "            " & vbCrLf
+    mCode = mCode & "            // Find candidate parents (rows above with less indentation)" & vbCrLf
+    mCode = mCode & "            candidateParents = Table.SelectRows(" & vbCrLf
+    mCode = mCode & "                buffered_table, " & vbCrLf
+    mCode = mCode & "                each [RowIndex] < currentIndex and [Indentation] < currentIndent" & vbCrLf
     mCode = mCode & "            )," & vbCrLf
-    mCode = mCode & "            filtered_candidates = Table.SelectRows(" & vbCrLf
-    mCode = mCode & "                candidates," & vbCrLf
-    mCode = mCode & "                each [leadingSpaces] = List.Max(candidates[leadingSpaces])" & vbCrLf
+    mCode = mCode & "            " & vbCrLf
+    mCode = mCode & "            // Sort candidates by indentation (descending) and then by index (descending)" & vbCrLf
+    mCode = mCode & "            sortedCandidates = Table.Sort(" & vbCrLf
+    mCode = mCode & "                candidateParents, " & vbCrLf
+    mCode = mCode & "                {{""Indentation"", Order.Descending}, {""RowIndex"", Order.Descending}}" & vbCrLf
     mCode = mCode & "            )," & vbCrLf
-    mCode = mCode & "            sorted_candidates = Table.Sort(filtered_candidates, {{""RowIndex"", Order.Descending}})," & vbCrLf
-    mCode = mCode & "            firstRow = if Table.IsEmpty(sorted_candidates) then null else sorted_candidates{0}," & vbCrLf
-    mCode = mCode & "            parentID = if firstRow = null then null else firstRow[RowIndex]" & vbCrLf
+    mCode = mCode & "            " & vbCrLf
+    mCode = mCode & "            // Get closest parent" & vbCrLf
+    mCode = mCode & "            parentRow = if Table.IsEmpty(sortedCandidates) then null else sortedCandidates{0}," & vbCrLf
+    mCode = mCode & "            parentID = if parentRow = null then null else parentRow[RowIndex]" & vbCrLf
     mCode = mCode & "        in" & vbCrLf
     mCode = mCode & "            parentID" & vbCrLf
     mCode = mCode & "    , Int64.Type)," & vbCrLf
     mCode = mCode & "" & vbCrLf
-    mCode = mCode & "    // Buffer before join for performance" & vbCrLf
-    mCode = mCode & "    buffered_with_parent = Table.Buffer(#""Add ParentID"")," & vbCrLf
-    mCode = mCode & "" & vbCrLf
-    mCode = mCode & "    // Join to get parent values" & vbCrLf
-    mCode = mCode & "    #""Join parent table"" = Table.NestedJoin(" & vbCrLf
-    mCode = mCode & "        buffered_with_parent, " & vbCrLf
+    mCode = mCode & "    // Join with parent to get parent values" & vbCrLf
+    mCode = mCode & "    #""Joined With Parent"" = Table.NestedJoin(" & vbCrLf
+    mCode = mCode & "        #""With ParentID"", " & vbCrLf
     mCode = mCode & "        {""ParentID""}, " & vbCrLf
-    mCode = mCode & "        buffered_with_parent, " & vbCrLf
+    mCode = mCode & "        #""With ParentID"", " & vbCrLf
     mCode = mCode & "        {""RowIndex""}, " & vbCrLf
     mCode = mCode & "        ""ParentTable"", " & vbCrLf
     mCode = mCode & "        JoinKind.LeftOuter" & vbCrLf
     mCode = mCode & "    )," & vbCrLf
     mCode = mCode & "" & vbCrLf
-    mCode = mCode & "    // Expand to get parent values" & vbCrLf
-    mCode = mCode & "    #""Expanded parent"" = Table.ExpandTableColumn(" & vbCrLf
-    mCode = mCode & "        #""Join parent table"", " & vbCrLf
+    mCode = mCode & "    // Expand parent value" & vbCrLf
+    mCode = mCode & "    #""Expanded Parent"" = Table.ExpandTableColumn(" & vbCrLf
+    mCode = mCode & "        #""Joined With Parent"", " & vbCrLf
     mCode = mCode & "        ""ParentTable"", " & vbCrLf
     mCode = mCode & "        {""Value""}, " & vbCrLf
     mCode = mCode & "        {""Parent""}" & vbCrLf
     mCode = mCode & "    )," & vbCrLf
     mCode = mCode & "" & vbCrLf
-    mCode = mCode & "    // Keep only necessary columns" & vbCrLf
-    mCode = mCode & "    #""Cleaned Columns"" = Table.SelectColumns(#""Expanded parent"", {""RowIndex"", ""leadingSpaces"", ""Value"", ""Parent""})" & vbCrLf
+    mCode = mCode & "    // Select only needed columns" & vbCrLf
+    mCode = mCode & "    #""Final Result"" = Table.SelectColumns(#""Expanded Parent"", {""RowIndex"", ""Indentation"", ""Value"", ""Parent""})" & vbCrLf
     mCode = mCode & "in" & vbCrLf
-    mCode = mCode & "    #""Cleaned Columns"""
+    mCode = mCode & "    #""Final Result"""
     
-    BuildOptimizedParentChildQueryText = mCode
+    BuildImprovedQueryText = mCode
     
-    LogMessage "BuildOptimizedParentChildQueryText", "INFO", "Optimized M code built for range: " & namedRange
+    LogMessage "BuildImprovedQueryText", "INFO", "M code built for range: " & namedRange
     Exit Function
 
 errHandler:
-    LogError "BuildOptimizedParentChildQueryText", Err.Number, Err.Description
-    BuildOptimizedParentChildQueryText = ""
+    LogError "BuildImprovedQueryText", Err.Number, Err.Description
+    BuildImprovedQueryText = ""
 End Function
-
-
-'--------------------------------------------------------------------------------------------
-' ORIGINAL M CODE (FOR REFERENCE)
-'--------------------------------------------------------------------------------------------
-Public Function BuildParentChildQueryText(namedRange As String) As String
-    On Error GoTo errHandler
-    
-    LogMessage "BuildParentChildQueryText", "INFO", "Building M code for range: " & namedRange
-    
-    Dim mCode As String
-    
-    mCode = mCode & "let" & vbCrLf
-    mCode = mCode & "    Source = Excel.CurrentWorkbook(){[Name=""" & namedRange & """]}[Content]," & vbCrLf
-    mCode = mCode & "    remove_nulls = Table.SelectRows(Source, each [Column1] <> null and [Column1] <> """")," & vbCrLf
-    mCode = mCode & "    #""Add RowIndex"" = Table.AddIndexColumn(remove_nulls, ""RowIndex"", 0, 1, Int64.Type)," & vbCrLf
-    mCode = mCode & "" & vbCrLf
-    mCode = mCode & "    // leadingSpaces = number of leading spaces" & vbCrLf
-    mCode = mCode & "    #""Added leadingSpaces"" = Table.AddColumn(#""Add RowIndex"", ""leadingSpaces"", each " & vbCrLf
-    mCode = mCode & "        Text.Length([Column1]) - Text.Length(Text.TrimStart([Column1]))" & vbCrLf
-    mCode = mCode & "    , Int64.Type)," & vbCrLf
-    mCode = mCode & "" & vbCrLf
-    mCode = mCode & "    // Value = trimmed text" & vbCrLf
-    mCode = mCode & "    #""Added Value"" = Table.AddColumn(#""Added leadingSpaces"", ""Value"", each Text.TrimStart([Column1]), type text)," & vbCrLf
-    mCode = mCode & "" & vbCrLf
-    mCode = mCode & "    #""Prep for parent"" = Table.SelectColumns(#""Added Value"", {""RowIndex"", ""leadingSpaces"", ""Value""})," & vbCrLf
-    mCode = mCode & "" & vbCrLf
-    mCode = mCode & "    #""Add ParentID"" = Table.AddColumn(#""Prep for parent"", ""ParentID"", (thisRow) =>" & vbCrLf
-    mCode = mCode & "        let" & vbCrLf
-    mCode = mCode & "            myIndex = thisRow[RowIndex]," & vbCrLf
-    mCode = mCode & "            mySpaces = thisRow[leadingSpaces]," & vbCrLf
-    mCode = mCode & "            candidates = Table.SelectRows(#""Prep for parent"", each [RowIndex] < myIndex and [leadingSpaces] < mySpaces)," & vbCrLf
-    mCode = mCode & "            ordered = Table.Sort(candidates, {{""leadingSpaces"", Order.Descending}, {""RowIndex"", Order.Descending}})," & vbCrLf
-    mCode = mCode & "            topRow = if Table.IsEmpty(ordered) then null else ordered{0}," & vbCrLf
-    mCode = mCode & "            parentID = if topRow=null then null else topRow[RowIndex]" & vbCrLf
-    mCode = mCode & "        in parentID" & vbCrLf
-    mCode = mCode & "    )," & vbCrLf
-    mCode = mCode & "" & vbCrLf
-    mCode = mCode & "    #""Join parent table"" = Table.NestedJoin(" & vbCrLf
-    mCode = mCode & "        #""Add ParentID"", " & vbCrLf
-    mCode = mCode & "        {""ParentID""}," & vbCrLf
-    mCode = mCode & "        #""Add ParentID"", " & vbCrLf
-    mCode = mCode & "        {""RowIndex""}," & vbCrLf
-    mCode = mCode & "        ""ParentTable""," & vbCrLf
-    mCode = mCode & "        JoinKind.LeftOuter" & vbCrLf
-    mCode = mCode & "    )," & vbCrLf
-    mCode = mCode & "    #""Expanded parent"" = Table.ExpandTableColumn(" & vbCrLf
-    mCode = mCode & "        #""Join parent table""," & vbCrLf
-    mCode = mCode & "        ""ParentTable"", " & vbCrLf
-    mCode = mCode & "        {""Value""}, " & vbCrLf
-    mCode = mCode & "        {""Parent""}" & vbCrLf
-    mCode = mCode & "    )," & vbCrLf
-    mCode = mCode & "    #""Cleaned Columns"" = Table.SelectColumns(#""Expanded parent"", {""RowIndex"", ""leadingSpaces"", ""Value"", ""Parent""})" & vbCrLf
-    mCode = mCode & "in" & vbCrLf
-    mCode = mCode & "    #""Cleaned Columns"""
-    
-    BuildParentChildQueryText = mCode
-    
-    LogMessage "BuildParentChildQueryText", "INFO", "M code built for range: " & namedRange
-    Exit Function
-
-errHandler:
-    LogError "BuildParentChildQueryText", Err.Number, Err.Description
-    BuildParentChildQueryText = ""
-End Function
-
-
-'--------------------------------------------------------------------------------------------
-' PROGRESS BAR FUNCTIONS
-'--------------------------------------------------------------------------------------------
-Private progressForm As Object
-Private progressLabel As Object
-Private progressBar As Object
-
-Public Sub ShowProgressBar(message As String, percentComplete As Integer)
-    If progressForm Is Nothing Then
-        ' Create form
-        Set progressForm = CreateObject("Forms.Form.1")
-        With progressForm
-            .Caption = "Processing Hierarchies"
-            .Width = 400
-            .Height = 100
-            .StartPosition = 1 ' CenterOwner
-            .ControlBox = False
-            .FormBorderStyle = 3 ' Fixed Dialog
-            .BackColor = RGB(240, 240, 240)
-        End With
-        
-        ' Create label
-        Set progressLabel = CreateObject("Forms.Label.1")
-        With progressLabel
-            .Left = 10
-            .Top = 10
-            .Width = 380
-            .Height = 20
-            .Parent = progressForm
-            .BackColor = RGB(240, 240, 240)
-        End With
-        
-        ' Create progress bar
-        Set progressBar = CreateObject("MSComctlLib.ProgressBar.2")
-        With progressBar
-            .Left = 10
-            .Top = 40
-            .Width = 380
-            .Height = 25
-            .Min = 0
-            .Max = 100
-            .Parent = progressForm
-        End With
-        
-        progressForm.Show vbModeless
-    End If
-    
-    ' Update progress
-    progressLabel.Caption = message
-    progressBar.Value = percentComplete
-    DoEvents
-End Sub
-
-Public Sub UpdateProgressBar(message As String, percentComplete As Integer)
-    If Not progressForm Is Nothing Then
-        progressLabel.Caption = message
-        progressBar.Value = percentComplete
-        DoEvents
-    Else
-        Application.StatusBar = message & " (" & percentComplete & "%)"
-    End If
-End Sub
-
-Public Sub HideProgressBar()
-    If Not progressForm Is Nothing Then
-        Unload progressForm
-        Set progressLabel = Nothing
-        Set progressBar = Nothing
-        Set progressForm = Nothing
-    End If
-    Application.StatusBar = False
-End Sub
 
 
 '--------------------------------------------------------------------------------------------

@@ -282,7 +282,7 @@ Public Sub CreateHierarchyQueries()
             On Error Resume Next
             ThisWorkbook.Queries(queryName).Formula = queryText
             If Err.Number <> 0 Then
-                LogError "CreateHierarchyQueries", Err.Number, "Error updating query formula: " & queryName
+                LogError "CreateHierarchyQueries", Err.Number, "Error updating query formula: " & queryName & " - " & Err.Description
                 ' Delete old connection and recreate
                 ThisWorkbook.Connections(queryName).Delete
                 existingConn = False
@@ -297,7 +297,7 @@ Public Sub CreateHierarchyQueries()
             On Error Resume Next
             ThisWorkbook.Queries.Add Name:=queryName, Formula:=queryText
             If Err.Number <> 0 Then
-                LogError "CreateHierarchyQueries", Err.Number, "Error creating query: " & queryName
+                LogError "CreateHierarchyQueries", Err.Number, "Error creating query: " & queryName & " - " & Err.Description
                 GoTo NextQuery
             End If
             Err.Clear
@@ -411,7 +411,7 @@ Public Function BuildBottomUpParentQuery(rangeName As String, dimensionName As S
     mCode = mCode & "    with_description = Table.AddColumn(with_dimension, ""Description"", each """", type text)," & vbCrLf
     mCode = mCode & "    " & vbCrLf
     mCode = mCode & "    // Select and reorder columns for final output" & vbCrLf
-    mCode = mCode & "    final_table = Table.SelectColumns(with_description, {""Dimension"", ""Value"", ""Parent"", ""Description"", ""Indentation"", ""RowIndex""})" & vbCrLf
+    mCode = mCode & "    final_table = Table.SelectColumns(with_description, {""Dimension"", ""Value"", ""Parent"", ""Description""})" & vbCrLf
     mCode = mCode & "in" & vbCrLf
     mCode = mCode & "    final_table"
     

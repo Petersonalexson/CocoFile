@@ -1,0 +1,56 @@
+Basically the way we create the arrays here works
+
+Sub RefreshSmartViewTree
+    Dim arrSheets As Variant
+    Dim ws As Worksheet 
+    Dim ConnectionName As String
+    Dim Ret As Long, HeaderRow As Long, LastRow As Long, I As Long
+    Dim ConnStatus As Integer
+    
+    With wsLists
+        ConnectionName = .Range("nmConnectionName")
+        arrSheets = .Range("Hierarchy_Matrix")
+    End With
+    
+    HeaderRow = 4
+    
+    For I = LBound(arrSheets) To UBound(arrSheets)
+        Set ws = ThisWorkbook.Worksheets(arrSheets(I, 1))
+        With ws
+            Ret = HypUIConnect(.Name, "", "", ConnectionName)
+            ConnStatus = HypConnected(.Name)
+            If ConnStatus <> -1 Then Stop
+            'Calculate last row
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            'Delete hierarchy rows except hierarchy name
+            If LastRow > HeaderRow Then
+                .Rows(HeaderRow & ":" & LastRow - 1).Delete Shift:=xlUp
+            End If
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            Ret = HypSetSheetOption(.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
+            Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            
+            ThisWorkbook.Names.Add Name:=arrSheets(I, 2), RefersTo:=.Range("A" & HeaderRow & ":A" & LastRow)
+        End With
+    Next I
+End Sub
+
+Create them like this
+
+THEN EDIT THEM AGAIN and remove last row if Tree
+or last 2 rows if List
+
+also
+
+Performance optimizations:
+
+Added Table.Buffer() to improve performance for tables used multiple times
+Reduced unnecessary processing in the M code
+More efficient parent lookup algorithm
+
+
+Status bar updates instead of a progress form:
+
+Uses the built-in status bar to show progress
+Simpler implementation that works in all Excel versions full script please

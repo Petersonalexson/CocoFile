@@ -386,17 +386,9 @@ Public Function BuildBottomUpParentQuery(rangeName As String, dimensionName As S
     mCode = mCode & "            current_indent = current_row[Indentation]," & vbCrLf
     mCode = mCode & "            current_index = current_row[RowIndex]," & vbCrLf
     mCode = mCode & "            " & vbCrLf
-    mCode = mCode & "            // Find potential parents (rows BELOW current row with LESS indentation)" & vbCrLf
-    mCode = mCode & "            potential_parents = Table.SelectRows(buffered_table, each" & vbCrLf
-    mCode = mCode & "                [RowIndex] > current_index and" & vbCrLf
-    mCode = mCode & "                [Indentation] < current_indent" & vbCrLf
-    mCode = mCode & "            )," & vbCrLf
+    mCode = mCode & "            potential_parents = Table.SelectRows(buffered_table, each [RowIndex] > current_index and [Indentation] < current_indent)," & vbCrLf
     mCode = mCode & "            " & vbCrLf
-    mCode = mCode & "            // Sort potential parents by indentation (descending) and then by index (ascending)" & vbCrLf
-    mCode = mCode & "            sorted_parents = Table.Sort(potential_parents, {" & vbCrLf
-    mCode = mCode & "                {""Indentation"", Order.Descending}," & vbCrLf
-    mCode = mCode & "                {""RowIndex"", Order.Ascending}" & vbCrLf
-    mCode = mCode & "            })," & vbCrLf
+    mCode = mCode & "            sorted_parents = Table.Sort(potential_parents, {{""Indentation"", Order.Descending}, {""RowIndex"", Order.Ascending}})," & vbCrLf
     mCode = mCode & "            " & vbCrLf
     mCode = mCode & "            // Get parent, or blank if no parent found" & vbCrLf
     mCode = mCode & "            parent_value = if Table.IsEmpty(sorted_parents) then """" else sorted_parents{0}[Value]" & vbCrLf

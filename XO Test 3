@@ -1,0 +1,75 @@
+import pandas as pd
+import numpy as np
+
+# 1) Read your Excel file (sheet "XAV File")
+file_path = "your_file.xlsx"
+df = pd.read_excel(file_path, sheet_name="XAV File")
+
+# ----------------------------------------------------------------------------
+# If your columns do not literally match these names, rename them accordingly:
+# df.rename(columns={
+#     'A': 'Date',
+#     'E': 'CC',
+#     'J': 'PO',
+#     'L': 'Voice',
+#     'M': 'Amount'  # or 'N' if that's where your amount is
+# }, inplace=True)
+# ----------------------------------------------------------------------------
+
+# 2) Convert 'Voice' and 'PO' to strings (to handle NaN => "")
+df['Voice'] = df['Voice'].fillna('').astype(str)
+df['PO'] = df['PO'].fillna('').astype(str)
+
+# 3) Define the logic for 'TaxType'
+def determine_tax_type(row):
+    voice_str = row['Voice'].strip()
+    po_str = row['PO'].strip()
+    if voice_str == '':
+        # No voice => Without Tax
+        return 'WithoutTax'
+    else:
+        # We do have a Voice
+        if po_str != '':
+            # PO is present => Without Tax
+            return 'WithoutTax'
+        else:
+            # PO is empty => With Tax
+            return 'WithTax'
+
+df['TaxType'] = df.apply(determine_tax_type, axis=1)
+
+# 4) Group by (CC, PO, TaxType) and sum the amounts
+grouped = (
+    df
+    .groupby(['CC', 'PO', 'TaxType'], dropna=False)['Amount']
+    .sum()
+    .reset_index()
+)
+
+# 5) Pivot so we get columns "WithoutTaxAmount" and "WithTaxAmount" for each (CC, PO)
+pivoted = grouped.pivot_table(
+    index=['CC', 'PO'],
+    columns='TaxType',
+    values='Amount',
+    fill_value=0
+).reset_index()
+
+pivoted.columns.name = None
+
+# If those columns don't exist, create them
+if 'WithoutTax' not in pivoted.columns:
+    pivoted['WithoutTax'] = 0
+if 'WithTax' not in pivoted.columns:
+    pivoted['WithTax'] = 0
+
+# Rename columns for clarity
+pivoted.rename(columns={
+    'WithoutTax': 'WithoutTaxAmount',
+    'WithTax': 'WithTaxAmount'
+}, inplace=True)
+
+# 6) Write to "Check" sheet in the same Excel
+with pd.ExcelWriter(file_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+    pivoted.to_excel(writer, sheet_name="Check", index=False)
+
+print("Done! Created/overwrote the 'Check' sheet grouped by (CC, PO).")

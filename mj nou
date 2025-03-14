@@ -4,177 +4,69 @@ Option Explicit
 ' MAIN: Refresh Smart View hierarchies, then build queries
 '==========================================================
 Public Sub RefreshHierarchiesAndCreateQueries()
-    On Error GoTo ErrorHandler
-    
-    ' Setup
-    LogMessage "RefreshHierarchiesAndCreateQueries", "INFO", "Process started."
-    Application.StatusBar = "Starting process..."
-    Application.ScreenUpdating = False
-    Application.DisplayAlerts = False
-    Application.Calculation = xlCalculationManual
-    
-    ' 1) Refresh Smart View hierarchies
-    Application.StatusBar = "Refreshing Smart View hierarchies..."
-    RefreshSmartViewHierarchies
-    
-    ' 2) Create or update queries from the hierarchies
-    Application.StatusBar = "Creating queries..."
+    RefreshSmartViewTree
     CreateHierarchyQueries
-    
-    ' Cleanup
-    Application.StatusBar = "Process completed successfully!"
-    LogMessage "RefreshHierarchiesAndCreateQueries", "INFO", "Process completed successfully!"
-    
-CleanExit:
-    ' Restore Excel settings
-    Application.ScreenUpdating = True
-    Application.DisplayAlerts = True
-    Application.Calculation = xlCalculationAutomatic
-    Application.StatusBar = False
-    Exit Sub
-    
-ErrorHandler:
-    LogError "RefreshHierarchiesAndCreateQueries", Err.Number, Err.Description
-    MsgBox "An error occurred: " & Err.Description, vbCritical, "Error " & Err.Number
-    Resume CleanExit
 End Sub
-
 
 '==========================================================
 ' REFRESH SMART VIEW HIERARCHIES
-' Deletes old rows, zooms in, creates named ranges with ALL rows
+' Simple version that matches your working example
 '==========================================================
-Public Sub RefreshSmartViewHierarchies()
-    Dim wsLists           As Worksheet
-    Dim arrSheets         As Variant
-    Dim ws                As Worksheet
-    Dim ConnectionName    As String
-    Dim Ret               As Long
-    Dim HeaderRow         As Long
-    Dim LastRow           As Long
-    Dim i                 As Long
-    Dim ConnStatus        As Long
-    Dim sheetName         As String
-    Dim rangeName         As String
+Public Sub RefreshSmartViewTree()
+    Dim arrSheets As Variant
+    Dim ws As Worksheet
+    Dim wsLists As Worksheet
+    Dim ConnectionName As String
+    Dim Ret As Long, HeaderRow As Long, LastRow As Long, I As Long
+    Dim ConnStatus As Integer
     
-    On Error GoTo ErrorHandler
-    
-    LogMessage "RefreshSmartViewHierarchies", "INFO", "Starting Smart View refresh..."
-    
-    ' Get the Lists sheet with connection info
-    On Error Resume Next
+    ' Get Lists sheet
     Set wsLists = ThisWorkbook.Worksheets("Lists")
-    On Error GoTo ErrorHandler
     
-    If wsLists Is Nothing Then
-        LogError "RefreshSmartViewHierarchies", 0, "Cannot find a sheet named 'Lists'."
-        MsgBox "ERROR: Cannot find a sheet named 'Lists'. Check the sheet name.", vbCritical
-        Exit Sub
-    End If
-    
-    ' Get connection name and hierarchy matrix
     With wsLists
         ConnectionName = .Range("nmConnectionName").Value
         arrSheets = .Range("Hierarchy_Matrix").Value
     End With
     
-    If Len(ConnectionName) = 0 Then
-        LogError "RefreshSmartViewHierarchies", 0, "'nmConnectionName' is empty."
-        MsgBox "ERROR: 'nmConnectionName' is empty.", vbCritical
-        Exit Sub
-    End If
+    HeaderRow = 4
     
-    If IsEmpty(arrSheets) Then
-        LogError "RefreshSmartViewHierarchies", 0, "'Hierarchy_Matrix' is empty."
-        MsgBox "ERROR: 'Hierarchy_Matrix' is empty.", vbCritical
-        Exit Sub
-    End If
-    
-    ' Common settings
-    HeaderRow = 4  ' Standard header row
-    
-    ' Process each sheet in the matrix
-    For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
-        Application.StatusBar = "Refreshing sheet " & i & " of " & UBound(arrSheets, 1)
-        
-        sheetName = Trim(arrSheets(i, 1))
-        rangeName = Trim(arrSheets(i, 2))
-        
-        ' Skip if sheet or range name is empty
-        If Len(sheetName) = 0 Or Len(rangeName) = 0 Then
-            LogMessage "RefreshSmartViewHierarchies", "INFO", "Skipping row " & i & " - empty sheet or range name."
+    For I = LBound(arrSheets) To UBound(arrSheets)
+        ' Skip if empty sheet name or range name
+        If Trim(arrSheets(I, 1)) = "" Or Trim(arrSheets(I, 2)) = "" Then
             GoTo NextSheet
         End If
         
-        ' Get the worksheet
-        On Error Resume Next
-        Set ws = ThisWorkbook.Worksheets(sheetName)
-        On Error GoTo ErrorHandler
-        
-        If ws Is Nothing Then
-            LogError "RefreshSmartViewHierarchies", 0, "Sheet '" & sheetName & "' not found."
-            GoTo NextSheet
-        End If
-        
-        LogMessage "RefreshSmartViewHierarchies", "INFO", "Processing sheet: " & sheetName
-        
-        ' Connect to Smart View
-        On Error Resume Next
-        Ret = HypUIConnect(ws.Name, "", "", ConnectionName)
-        ConnStatus = HypConnected(ws.Name)
-        On Error GoTo ErrorHandler
-        
-        If ConnStatus <> -1 Then
-            LogError "RefreshSmartViewHierarchies", 0, "Could not connect Smart View on sheet '" & ws.Name & "'."
-            GoTo NextSheet
-        End If
-        
-        ' Process the sheet
+        Set ws = ThisWorkbook.Worksheets(arrSheets(I, 1))
         With ws
-            ' Calculate current last row
-            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
-            
-            ' Delete existing hierarchy rows, preserving the header row
-            If LastRow > HeaderRow Then
-                .Rows(HeaderRow & ":" & (LastRow - 1)).Delete Shift:=xlUp
+            Ret = HypUIConnect(.Name, "", "", ConnectionName)
+            ConnStatus = HypConnected(.Name)
+            If ConnStatus <> -1 Then
+                MsgBox "Connection failed for " & .Name, vbExclamation
+                GoTo NextSheet
             End If
             
-            ' Calculate new last row after deletion
-            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
-            
-            ' Set display options and perform zoom
+            ' Calculate last row
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
+            ' Delete hierarchy rows except hierarchy name
+            If LastRow > HeaderRow Then
+                .Rows(HeaderRow & ":" & LastRow - 1).Delete Shift:=xlUp
+            End If
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
             Ret = HypSetSheetOption(.Name, HYP_SVC_OPTIONS_INDEX.HSV_MEMBER_DISPLAY, 1)
             Ret = HypZoomIn(.Name, .Range("A" & LastRow), 1, False)
+            LastRow = .Range("A" & .Rows.Count).End(xlUp).Row
             
-            ' Calculate final row after zoom
-            LastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
-            
-            ' Create named range with ALL rows (including Tree/List indicator rows)
+            ' Delete existing named range if it exists
             On Error Resume Next
-            ThisWorkbook.Names(rangeName).Delete
-            On Error GoTo ErrorHandler
+            ThisWorkbook.Names(arrSheets(I, 2)).Delete
+            On Error GoTo 0
             
-            ThisWorkbook.Names.Add _
-                Name:=rangeName, _
-                RefersTo:="='" & .Name & "'!A" & HeaderRow & ":A" & LastRow
-            
-            LogMessage "RefreshSmartViewHierarchies", "INFO", _
-                      "Created named range '" & rangeName & "' on sheet '" & .Name & _
-                      "' (rows " & HeaderRow & "-" & LastRow & ")."
+            ' Create named range
+            ThisWorkbook.Names.Add Name:=arrSheets(I, 2), RefersTo:=.Range("A" & HeaderRow & ":A" & LastRow)
         End With
-        
 NextSheet:
-        Set ws = Nothing
-        DoEvents  ' Allow UI updates
-    Next i
-    
-    LogMessage "RefreshSmartViewHierarchies", "INFO", "Smart View refresh completed."
-    Exit Sub
-    
-ErrorHandler:
-    LogError "RefreshSmartViewHierarchies", Err.Number, Err.Description
+    Next I
 End Sub
-
 
 '==========================================================
 ' CREATE HIERARCHY QUERIES
@@ -193,78 +85,33 @@ Public Sub CreateHierarchyQueries()
     Dim existingConn     As Boolean
     Dim treeOrList       As String
     
-    On Error GoTo ErrorHandler
-    
-    LogMessage "CreateHierarchyQueries", "INFO", "Starting to create hierarchy queries..."
-    
     ' Get the Lists sheet
-    On Error Resume Next
     Set wsLists = ThisWorkbook.Worksheets("Lists")
-    On Error GoTo ErrorHandler
-    
-    If wsLists Is Nothing Then
-        LogError "CreateHierarchyQueries", 0, "Cannot find a sheet named 'Lists'."
-        MsgBox "ERROR: Cannot find a sheet named 'Lists'. Check the sheet name.", vbCritical
-        Exit Sub
-    End If
     
     ' Get the hierarchy matrix
     arrSheets = wsLists.Range("Hierarchy_Matrix").Value
-    If IsEmpty(arrSheets) Then
-        LogError "CreateHierarchyQueries", 0, "'Hierarchy_Matrix' is empty."
-        MsgBox "ERROR: 'Hierarchy_Matrix' is empty.", vbCritical
-        Exit Sub
-    End If
     
     ' Process each sheet in the matrix
-    For i = LBound(arrSheets, 1) To UBound(arrSheets, 1)
-        Application.StatusBar = "Creating query " & i & " of " & UBound(arrSheets, 1)
-        
+    For i = LBound(arrSheets) To UBound(arrSheets)
         sheetName = Trim(arrSheets(i, 1))
         rangeName = Trim(arrSheets(i, 2))
         
         ' Skip if sheet or range name is empty
-        If Len(sheetName) = 0 Or Len(rangeName) = 0 Then
-            LogMessage "CreateHierarchyQueries", "INFO", "Skipping row " & i & " - empty sheet or range name."
-            GoTo NextQuery
-        End If
-        
-        ' Check if sheet exists
-        On Error Resume Next
-        Set ws = ThisWorkbook.Worksheets(sheetName)
-        On Error GoTo ErrorHandler
-        
-        If ws Is Nothing Then
-            LogError "CreateHierarchyQueries", 0, "Sheet '" & sheetName & "' not found."
-            GoTo NextQuery
-        End If
-        
-        ' Get Tree/List designation
-        treeOrList = UCase(Trim(ws.Range("D7").Value))
-        
-        ' Check if the named range exists
-        Dim rangeExists As Boolean
-        rangeExists = False
-        On Error Resume Next
-        If Not ThisWorkbook.Names(rangeName) Is Nothing Then
-            rangeExists = True
-        End If
-        On Error GoTo ErrorHandler
-        
-        If Not rangeExists Then
-            LogError "CreateHierarchyQueries", 0, "Named range '" & rangeName & "' doesn't exist."
+        If sheetName = "" Or rangeName = "" Then
             GoTo NextQuery
         End If
         
         ' Set the query name to SheetName_FlatTable
         queryName = sheetName & "_FlatTable"
         
+        ' Get the worksheet
+        Set ws = ThisWorkbook.Worksheets(sheetName)
+        
+        ' Get Tree/List designation
+        treeOrList = UCase(Trim(ws.Range("D7").Value))
+        
         ' Build M code passing the Tree/List type
-        queryText = BuildBottomUpParentQuery(rangeName, sheetName, treeOrList)
-        If queryText = "" Then
-            LogError "CreateHierarchyQueries", 0, "Query code generation failed for " & rangeName
-            GoTo NextQuery
-        End If
+        queryText = BuildBottomUpParentQuery(rangeName, treeOrList)
         
         ' Check if a connection with this name already exists
         existingConn = False
@@ -277,56 +124,20 @@ Public Sub CreateHierarchyQueries()
         
         ' Update existing query or create new one
         If existingConn Then
-            LogMessage "CreateHierarchyQueries", "INFO", "Updating existing query: " & queryName
-            
-            On Error Resume Next
             ThisWorkbook.Queries(queryName).Formula = queryText
-            If Err.Number <> 0 Then
-                LogError "CreateHierarchyQueries", Err.Number, "Error updating query formula: " & queryName & " - " & Err.Description
-                ' Delete old connection and recreate
-                ThisWorkbook.Connections(queryName).Delete
-                existingConn = False
-            End If
-            Err.Clear
-            On Error GoTo ErrorHandler
-        End If
-        
-        If Not existingConn Then
-            LogMessage "CreateHierarchyQueries", "INFO", "Creating new query: " & queryName
-            
-            On Error Resume Next
+        Else
             ThisWorkbook.Queries.Add Name:=queryName, Formula:=queryText
-            If Err.Number <> 0 Then
-                LogError "CreateHierarchyQueries", Err.Number, "Error creating query: " & queryName & " - " & Err.Description
-                GoTo NextQuery
-            End If
-            Err.Clear
-            On Error GoTo ErrorHandler
         End If
-        
-        LogMessage "CreateHierarchyQueries", "INFO", "Successfully processed query: " & queryName
         
 NextQuery:
-        DoEvents  ' Allow UI updates
     Next i
-    
-    LogMessage "CreateHierarchyQueries", "INFO", "Hierarchy queries created successfully."
-    Exit Sub
-    
-ErrorHandler:
-    LogError "CreateHierarchyQueries", Err.Number, Err.Description
 End Sub
-
 
 '==========================================================
 ' BUILD BOTTOM-UP INDENT PARENT QUERY
 ' Creates M code that handles parent at bottom indentation and Tree/List
 '==========================================================
-Public Function BuildBottomUpParentQuery(rangeName As String, dimensionName As String, treeOrList As String) As String
-    On Error GoTo ErrorHandler
-    
-    LogMessage "BuildBottomUpParentQuery", "INFO", "Building query for range: " & rangeName & ", type: " & treeOrList
-    
+Public Function BuildBottomUpParentQuery(rangeName As String, treeOrList As String) As String
     Dim skipRows As String
     
     ' Determine skipRows based on Tree/List designation
@@ -342,116 +153,33 @@ Public Function BuildBottomUpParentQuery(rangeName As String, dimensionName As S
     
     mCode = ""
     mCode = mCode & "let" & vbCrLf
-    mCode = mCode & "    // Get data from named range" & vbCrLf
     mCode = mCode & "    Source = Excel.CurrentWorkbook(){[Name=""" & rangeName & """]}[Content]," & vbCrLf
-    mCode = mCode & "    " & vbCrLf
     
     ' Add conditional code to remove Tree/List rows
     If skipRows <> "0" Then
-        mCode = mCode & "    // Handle Tree/List - remove last " & skipRows & " row(s)" & vbCrLf
         mCode = mCode & "    row_count = Table.RowCount(Source)," & vbCrLf
-        mCode = mCode & "    data_rows = if row_count > " & skipRows & " then" & vbCrLf
-        mCode = mCode & "        Table.FirstN(Source, row_count - " & skipRows & ")" & vbCrLf
-        mCode = mCode & "    else" & vbCrLf
-        mCode = mCode & "        Source," & vbCrLf
+        mCode = mCode & "    data_rows = if row_count > " & skipRows & " then Table.FirstN(Source, row_count - " & skipRows & ") else Source," & vbCrLf
     Else
-        mCode = mCode & "    // No special Tree/List handling needed" & vbCrLf
         mCode = mCode & "    data_rows = Source," & vbCrLf
     End If
     
-    mCode = mCode & "    " & vbCrLf
-    mCode = mCode & "    // Filter out null or empty rows" & vbCrLf
     mCode = mCode & "    filtered_rows = Table.SelectRows(data_rows, each [Column1] <> null and [Column1] <> """")," & vbCrLf
-    mCode = mCode & "    " & vbCrLf
-    mCode = mCode & "    // Add row index for processing order" & vbCrLf
     mCode = mCode & "    indexed_rows = Table.AddIndexColumn(filtered_rows, ""RowIndex"", 0, 1, Int64.Type)," & vbCrLf
-    mCode = mCode & "    " & vbCrLf
-    mCode = mCode & "    // Add indentation level calculation" & vbCrLf
-    mCode = mCode & "    with_indent = Table.AddColumn(indexed_rows, ""Indentation"", each" & vbCrLf
-    mCode = mCode & "        Text.Length([Column1]) - Text.Length(Text.TrimStart([Column1]))," & vbCrLf
-    mCode = mCode & "        Int64.Type)," & vbCrLf
-    mCode = mCode & "    " & vbCrLf
-    mCode = mCode & "    // Extract actual value by trimming" & vbCrLf
+    mCode = mCode & "    with_indent = Table.AddColumn(indexed_rows, ""Indentation"", each Text.Length([Column1]) - Text.Length(Text.TrimStart([Column1])), Int64.Type)," & vbCrLf
     mCode = mCode & "    with_value = Table.AddColumn(with_indent, ""Value"", each Text.Trim([Column1]), type text)," & vbCrLf
-    mCode = mCode & "    " & vbCrLf
-    mCode = mCode & "    // Create table with just the columns we need" & vbCrLf
     mCode = mCode & "    clean_table = Table.SelectColumns(with_value, {""RowIndex"", ""Indentation"", ""Value""})," & vbCrLf
-    mCode = mCode & "    " & vbCrLf
-    mCode = mCode & "    // Buffer the table for performance" & vbCrLf
     mCode = mCode & "    buffered_table = Table.Buffer(clean_table)," & vbCrLf
-    mCode = mCode & "    " & vbCrLf
-    mCode = mCode & "    // Find parent looking BELOW current row (bottom-up approach)" & vbCrLf
-    mCode = mCode & "    with_parent = Table.AddColumn(buffered_table, ""Parent"", (current_row) =>" & vbCrLf
-    mCode = mCode & "        let" & vbCrLf
-    mCode = mCode & "            current_indent = current_row[Indentation]," & vbCrLf
-    mCode = mCode & "            current_index = current_row[RowIndex]," & vbCrLf
-    mCode = mCode & "            " & vbCrLf
-    mCode = mCode & "            potential_parents = Table.SelectRows(buffered_table, each [RowIndex] > current_index and [Indentation] < current_indent)," & vbCrLf
-    mCode = mCode & "            " & vbCrLf
-    mCode = mCode & "            sorted_parents = Table.Sort(potential_parents, {{""Indentation"", Order.Descending}, {""RowIndex"", Order.Ascending}})," & vbCrLf
-    mCode = mCode & "            " & vbCrLf
-    mCode = mCode & "            // Get parent, or blank if no parent found" & vbCrLf
-    mCode = mCode & "            parent_value = if Table.IsEmpty(sorted_parents) then """" else sorted_parents{0}[Value]" & vbCrLf
-    mCode = mCode & "        in" & vbCrLf
-    mCode = mCode & "            parent_value" & vbCrLf
-    mCode = mCode & "    )," & vbCrLf
-    mCode = mCode & "    " & vbCrLf
-    mCode = mCode & "    // Final result with only Value and Parent columns" & vbCrLf
+    mCode = mCode & "    with_parent = Table.AddColumn(buffered_table, ""Parent"", (current_row) => let" & vbCrLf
+    mCode = mCode & "        current_indent = current_row[Indentation]," & vbCrLf
+    mCode = mCode & "        current_index = current_row[RowIndex]," & vbCrLf
+    mCode = mCode & "        potential_parents = Table.SelectRows(buffered_table, each [RowIndex] > current_index and [Indentation] < current_indent)," & vbCrLf
+    mCode = mCode & "        sorted_parents = Table.Sort(potential_parents, {{""Indentation"", Order.Descending}, {""RowIndex"", Order.Ascending}})," & vbCrLf
+    mCode = mCode & "        parent_value = if Table.IsEmpty(sorted_parents) then """" else sorted_parents{0}[Value]" & vbCrLf
+    mCode = mCode & "    in" & vbCrLf
+    mCode = mCode & "        parent_value)," & vbCrLf
     mCode = mCode & "    final_table = Table.SelectColumns(with_parent, {""Value"", ""Parent""})" & vbCrLf
     mCode = mCode & "in" & vbCrLf
     mCode = mCode & "    final_table"
     
     BuildBottomUpParentQuery = mCode
-    
-    LogMessage "BuildBottomUpParentQuery", "INFO", "Query built successfully for range: " & rangeName
-    Exit Function
-    
-ErrorHandler:
-    LogError "BuildBottomUpParentQuery", Err.Number, Err.Description
-    BuildBottomUpParentQuery = ""
 End Function
-
-
-'==========================================================
-' LOGGING FUNCTIONS
-'==========================================================
-Public Sub LogMessage(procName As String, msgType As String, message As String)
-    Dim wsLog As Worksheet
-    Dim nxtRow As Long
-    
-    ' Create or get the log sheet
-    On Error Resume Next
-    Set wsLog = ThisWorkbook.Worksheets("Log")
-    If wsLog Is Nothing Then
-        Set wsLog = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
-        wsLog.Name = "Log"
-        ' Create headers
-        wsLog.Range("A1").Value = "Timestamp"
-        wsLog.Range("B1").Value = "Procedure"
-        wsLog.Range("C1").Value = "Type"
-        wsLog.Range("D1").Value = "Message"
-        wsLog.Range("A1:D1").Font.Bold = True
-    End If
-    On Error GoTo 0
-    
-    ' Find the next empty row
-    nxtRow = wsLog.Cells(wsLog.Rows.Count, "A").End(xlUp).Row + 1
-    
-    ' Log the message
-    wsLog.Cells(nxtRow, 1).Value = Format(Now, "yyyy-mm-dd HH:mm:ss")
-    wsLog.Cells(nxtRow, 2).Value = procName
-    wsLog.Cells(nxtRow, 3).Value = msgType
-    wsLog.Cells(nxtRow, 4).Value = message
-    
-    ' Format error rows
-    If UCase(msgType) = "ERROR" Then
-        wsLog.Range("A" & nxtRow & ":D" & nxtRow).Interior.Color = RGB(255, 200, 200)
-    End If
-    
-    ' Format the sheet
-    wsLog.Columns("A:D").AutoFit
-End Sub
-
-Public Sub LogError(procName As String, errorNumber As Long, errorDescription As String)
-    LogMessage procName, "ERROR", "Error #" & errorNumber & ": " & errorDescription
-End Sub

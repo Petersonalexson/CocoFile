@@ -174,6 +174,39 @@ p2 = df2.pivot_table(
 
 p2.to_excel("output_accrual_reversal.xlsx", index=False)
 
+# part 6
+
+import pandas as pd
+
+df = pd.read_excel("your_file.xlsx")
+mx = df["XO"].isna()
+md = df["VOICE DATE"].isna()
+mn = df["VOICE NUM"].isna()
+am = mx & md & mn
+t = (df["JN Writing"].fillna("") + " " + df["JL Description"].fillna("")).str.lower()
+r = t.str.contains("accrual|accural|reversal|reversals", case=False, regex=True)
+k = (~am) | (am & r)
+f = df[k]
+p = f.pivot_table(
+    index=["CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description"],
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
+
+def highlight_acc_r(row):
+    jn = str(row["JN Writing"]).lower()
+    jl = str(row["JL Description"]).lower()
+    if any(x in jn for x in ["accrual","accural","reversal","reversals"]) \
+       or any(x in jl for x in ["accrual","accural","reversal","reversals"]):
+        return ["background-color: yellow"] * len(row)
+    return ["" for _ in row]
+
+styled = p.style.apply(highlight_acc_r, axis=1)
+styled.to_excel("output.xlsx", index=False)
+
+
 
 
 

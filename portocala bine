@@ -315,6 +315,209 @@ melted = melted[final_cols]
 # Write out
 melted.to_excel("output.xlsx", index=False)
 
+# part 7
+
+import pandas as pd
+
+df = pd.read_excel("your_file.xlsx")
+
+for c in ["CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description","Period","Amount"]:
+    if c not in df.columns:
+        df[c] = ""
+df[["CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description","Amount"]] = df[["CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description","Amount"]].fillna("")
+
+df["combined"] = (df["JN Writing"].astype(str) + " " + df["JL Description"].astype(str)).str.lower()
+
+mask_accrual_rev = df["combined"].str.contains("accrual|accural|reversal|reversals", case=False, regex=True)
+df_accrual_rev = df[mask_accrual_rev].copy()
+
+p1 = df_accrual_rev.pivot_table(
+    index=["JN Writing","JL Description","CC","XO","VOICE DATE","VOICE NUM"],
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
+p1["Section"] = "Accrual/Reversal"
+
+df_voice_date = df[df["VOICE DATE"] != ""].copy()
+
+p2 = df_voice_date.pivot_table(
+    index=["JN Writing","JL Description","CC","XO","VOICE DATE","VOICE NUM"],
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
+p2["Section"] = "Voice Date"
+
+final = pd.concat([p1, p2], ignore_index=True)
+
+cols = ["Section","JN Writing","JL Description","CC","XO","VOICE DATE","VOICE NUM"]
+remaining = [c for c in final.columns if c not in cols]
+final = final[cols + remaining]
+
+final.to_excel("output.xlsx", index=False)
+
+# part 7
+
+import pandas as pd
+from difflib import SequenceMatcher
+
+def similarity(a, b):
+    """Return a float in [0,1] measuring how similar strings a and b are."""
+    return SequenceMatcher(None, a, b).ratio()
+
+def best_fuzzy_match(text_to_match, df2_names, min_ratio=0.7):
+    """
+    Given a single string `text_to_match` and a Series `df2_names` of possible names,
+    find the best match (highest ratio). If best ratio < min_ratio, return None.
+    Returns (best_index_in_df2, best_ratio) or (None, 0).
+    """
+    best_idx = None
+    best_ratio = 0.0
+    for idx, candidate in df2_names.items():
+        r = similarity(text_to_match, candidate)
+        if r > best_ratio:
+            best_ratio = r
+            best_idx = idx
+    if best_ratio >= min_ratio:
+        return best_idx, best_ratio
+    else:
+        return None, 0
+
+# ----------------------------------------------------------------
+# 1) Read Sheet1, filter rows, pivot so Period is multiple columns
+# ----------------------------------------------------------------
+df1 = pd.read_excel("your_file.xlsx", sheet_name="Sheet1")
+
+# Make sure columns exist
+need1 = ["Period","CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description","Amount"]
+for c in need1:
+    if c not in df1.columns:
+        df1[c] = ""
+df1[need1] = df1[need1].fillna("")
+
+# Detect accrual/reversal text
+df1["combined"] = (
+    df1["JN Writing"].astype(str).str.lower() 
+    + " " 
+    + df1["JL Description"].astype(str).str.lower()
+)
+mask_accrual_rev = df1["combined"].str.contains("accrual|accural|reversal|reversals", case=False, regex=True)
+
+# Keep rows if XO, VOICE DATE, or VOICE NUM present, OR (all missing but text has accrual/reversal)
+mx = df1["XO"].eq("")
+md = df1["VOICE DATE"].eq("")
+mn = df1["VOICE NUM"].eq("")
+all_missing = mx & md & mn
+keep_mask = (~all_missing) | (all_missing & mask_accrual_rev)
+df_filtered = df1[keep_mask].copy()
+
+# Pivot on (CC, XO, VOICE DATE, VOICE NUM, JN Writing, JL Description), summing Amount by Period
+pvt = df_filtered.pivot_table(
+    index=["CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description"],
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
+
+# Now we "melt" the pivot so that we get a single row per [CC,XO,VOICE...,Period],
+# since we want to do fuzzy matching per line.
+df_long = pvt.melt(
+    id_vars=["CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description"],
+    var_name="Period",
+    value_name="Amount"
+)
+
+# Create a lowercased text for matching with names
+df_long["combined_jn_jl"] = (
+    df_long["JN Writing"].fillna("").str.lower().str.strip() + " " +
+    df_long["JL Description"].fillna("").str.lower().str.strip()
+)
+
+# ----------------------------------------------------------------
+# 2) Read Sheet2 (Name in col B, PO in col O, CC in col P)
+# ----------------------------------------------------------------
+df2 = pd.read_excel("your_file.xlsx", sheet_name="Sheet2")
+
+# Make sure the columns are there
+need2 = ["Name","PO","CC"]
+col_map = {"B":"Name","O":"PO","P":"CC"}  # we expect B1=Name, O1=PO, P1=CC in your actual file
+for old_col, new_col in col_map.items():
+    if old_col not in df2.columns:
+        df2[old_col] = ""
+    df2.rename(columns={old_col: new_col}, inplace=True)
+
+df2[need2] = df2[need2].fillna("")
+
+# Also create a lowercased version for matching
+df2["NameLower"] = df2["Name"].str.lower().str.strip()
+
+# ----------------------------------------------------------------
+# 3) For each row in df_long, find best fuzzy match in df2["NameLower"]
+#    Keep all unmatched rows from df_long, with blank name/po/cc.
+# ----------------------------------------------------------------
+df2_names = df2["NameLower"]
+
+# Prepare columns to hold our matched info
+df_long["MatchedName"] = ""
+df_long["MatchedPO"] = ""
+df_long["MatchedCC"] = ""
+df_long["MatchRatio"] = 0.0
+
+for i, row in df_long.iterrows():
+    # combined_jn_jl is the text we compare
+    text = row["combined_jn_jl"]
+    if not text.strip():
+        # If there's literally no text, skip matching
+        continue
+
+    best_idx, ratio = best_fuzzy_match(text, df2_names, min_ratio=0.70)
+    if best_idx is not None:
+        # We found a match above threshold
+        df_long.at[i, "MatchedName"] = df2.at[best_idx, "Name"]
+        df_long.at[i, "MatchedPO"]   = df2.at[best_idx, "PO"]
+        df_long.at[i, "MatchedCC"]   = df2.at[best_idx, "CC"]
+        df_long.at[i, "MatchRatio"]  = ratio
+    # else leave them blank => "unmatched"
+
+# ----------------------------------------------------------------
+
+# ----------------------------------------------------------------
+final = df_long.pivot_table(
+    index=[
+        "CC","XO","VOICE DATE","VOICE NUM",
+        "JN Writing","JL Description",
+        "MatchedName","MatchedPO","MatchedCC"
+    ],
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
+
+# ----------------------------------------------------------------
+# 5) Write to Excel
+# ----------------------------------------------------------------
+with pd.ExcelWriter("output.xlsx", engine="openpyxl") as writer:
+    # "LongFormat" sheet: one row per Period
+    df_long.to_excel(writer, sheet_name="LongFormat_WithFuzzy", index=False)
+
+    # "FinalPivot" sheet: wide by Period
+    final.to_excel(writer, sheet_name="FinalPivot", index=False)
+
+
+
+
+
+
+
+
+
+
+
 
 
 

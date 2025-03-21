@@ -206,6 +206,51 @@ def highlight_acc_r(row):
 styled = p.style.apply(highlight_acc_r, axis=1)
 styled.to_excel("output.xlsx", index=False)
 
+# part 7
+
+import pandas as pd
+
+df = pd.read_excel("your_file.xlsx")
+
+for c in ["CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description","Period","Amount"]:
+    if c not in df.columns:
+        df[c] = ""
+df[["CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description","Amount"]] = df[["CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description","Amount"]].fillna("")
+
+df["combined"] = (df["JN Writing"].astype(str) + " " + df["JL Description"].astype(str)).str.lower()
+
+mask_accrual_rev = df["combined"].str.contains("accrual|accural|reversal|reversals", case=False, regex=True)
+df_accrual_rev = df[mask_accrual_rev].copy()
+
+p1 = df_accrual_rev.pivot_table(
+    index=["JN Writing","JL Description","CC","XO","VOICE DATE","VOICE NUM"],
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
+p1["Section"] = "Accrual/Reversal"
+
+df_voice_date = df[df["VOICE DATE"] != ""].copy()
+
+p2 = df_voice_date.pivot_table(
+    index=["JN Writing","JL Description","CC","XO","VOICE DATE","VOICE NUM"],
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
+p2["Section"] = "Voice Date"
+
+final = pd.concat([p1, p2], ignore_index=True)
+
+cols = ["Section","JN Writing","JL Description","CC","XO","VOICE DATE","VOICE NUM"]
+remaining = [c for c in final.columns if c not in cols]
+final = final[cols + remaining]
+
+final.to_excel("output.xlsx", index=False)
+
+
 
 
 

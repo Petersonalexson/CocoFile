@@ -27,23 +27,23 @@ def categorize_row(description, min_threshold=3):
         else:
             return "Reversal"
 
-# 1) Read Excel file
+# part 2
+
+import pandas as pd
+
 df = pd.read_excel("your_file.xlsx")
 
-# 2) Apply the classification function
-df["Category"] = df["JL Description"].apply(categorize_row, min_threshold=3)
-
 df_pivot = df.pivot_table(
-    index=["CC", "XO", "VOICE DATE", "Category"],
+    index=["CC", "XO", "VOICE DATE", "JL Description"], 
     columns="Period",
     values="Amount",
-    aggfunc="sum",   # or 'count' if you just want a frequency
+    aggfunc="sum",
     fill_value=0
-)
+).reset_index()
 
-# 4) Flatten the pivot's multi-index so it becomes normal columns:
-df_pivot = df_pivot.reset_index()
+df_pivot = df_pivot.sort_values(by="XO", ascending=True)
 
-# 5) Inspect and export
 print(df_pivot)
 df_pivot.to_excel("output.xlsx", index=False)
+
+

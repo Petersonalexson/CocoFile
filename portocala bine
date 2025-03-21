@@ -508,6 +508,136 @@ with pd.ExcelWriter("output.xlsx", engine="openpyxl") as writer:
     # "FinalPivot" sheet: wide by Period
     final.to_excel(writer, sheet_name="FinalPivot", index=False)
 
+# part 8
+
+import pandas as pd
+from difflib import SequenceMatcher
+
+def similarity(a, b):
+    """Return a float in [0,1], measuring how similar two strings are."""
+    return SequenceMatcher(None, a, b).ratio()
+
+def find_best_fuzzy_match(text_to_match, df2_names, min_ratio=0.70):
+    """
+    Given a single string `text_to_match` (already lowercased)
+    and a Series `df2_names` (also lowercased),
+    return (best_index, best_ratio) if there's a match >= min_ratio, else (None, 0.0).
+    """
+    best_idx = None
+    best_ratio = 0.0
+    for idx, candidate in df2_names.items():
+        r = similarity(text_to_match, candidate)
+        if r > best_ratio:
+            best_ratio = r
+            best_idx = idx
+    if best_ratio >= min_ratio:
+        return best_idx, best_ratio
+    else:
+        return None, 0.0
+
+# ----------------------------------------------------------------
+# 1) Read Sheet1, filter rows
+# ----------------------------------------------------------------
+df1 = pd.read_excel("your_file.xlsx", sheet_name="Sheet1")
+
+# Ensure columns exist; fill missing
+need1 = ["Period","CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description","Amount"]
+for c in need1:
+    if c not in df1.columns:
+        df1[c] = ""
+df1[need1] = df1[need1].fillna("")
+
+# Detect accrual/reversal text
+df1["combined"] = (
+    df1["JN Writing"].astype(str).str.lower() 
+    + " " 
+    + df1["JL Description"].astype(str).str.lower()
+)
+mask_accrual_rev = df1["combined"].str.contains("accrual|accural|reversal|reversals", case=False, regex=True)
+
+# Keep rows if XO, VOICE DATE, or VOICE NUM present, OR (all missing but text has accrual/reversal)
+mx = df1["XO"].eq("")
+md = df1["VOICE DATE"].eq("")
+mn = df1["VOICE NUM"].eq("")
+all_missing = mx & md & mn
+keep_mask = (~all_missing) | (all_missing & mask_accrual_rev)
+df_filtered = df1[keep_mask].copy()
+
+# We'll match by looking at phrases in df_filtered["JL Description"].
+# Create a lowercased column for matching.
+df_filtered["JL_desc_lower"] = df_filtered["JL Description"].fillna("").str.lower().str.strip()
+
+# ----------------------------------------------------------------
+# 2) Read Sheet2 (which already has columns: Name, PO, CC)
+# ----------------------------------------------------------------
+df2 = pd.read_excel("your_file.xlsx", sheet_name="Sheet2")
+
+need2 = ["Name","PO","CC"]
+for c in need2:
+    if c not in df2.columns:
+        df2[c] = ""
+df2[need2] = df2[need2].fillna("")
+
+# Create a lowercased column for Name
+df2["NameLower"] = df2["Name"].str.lower().str.strip()
+
+# ----------------------------------------------------------------
+# 3) Two-step matching: 
+#    A) Check if Name is a SUBSTRING of JL Description (case-insensitive)
+#    B) If no substring match, do fuzzy
+# ----------------------------------------------------------------
+df_filtered["MatchedName"] = ""
+df_filtered["MatchedPO"]   = ""
+df_filtered["MatchedCC"]   = ""
+df_filtered["MatchMethod"] = ""    # "substring" or "fuzzy"
+df_filtered["MatchRatio"]  = 0.0
+
+for i, row in df_filtered.iterrows():
+    desc_text = row["JL_desc_lower"]
+    if not desc_text:
+        # If there's no text at all, skip
+        continue
+
+    # ---- Step A: Substring check ----
+    # We'll scan each name in df2["NameLower"].
+    matched = False
+    for idx, name_l in df2["NameLower"].items():
+        if name_l and (name_l in desc_text):
+            # Found a substring match
+            df_filtered.at[i, "MatchedName"] = df2.at[idx, "Name"]
+            df_filtered.at[i, "MatchedPO"]   = df2.at[idx, "PO"]
+            df_filtered.at[i, "MatchedCC"]   = df2.at[idx, "CC"]
+            df_filtered.at[i, "MatchMethod"] = "substring"
+            df_filtered.at[i, "MatchRatio"]  = 1.0
+            matched = True
+            break  # stop at the first substring match we find
+
+    if matched:
+        continue  # No fuzzy needed
+
+    # ---- Step B: Fuzzy match if no substring match was found ----
+    best_idx, best_ratio = find_best_fuzzy_match(desc_text, df2["NameLower"], min_ratio=0.70)
+    if best_idx is not None:
+        df_filtered.at[i, "MatchedName"] = df2.at[best_idx, "Name"]
+        df_filtered.at[i, "MatchedPO"]   = df2.at[best_idx, "PO"]
+        df_filtered.at[i, "MatchedCC"]   = df2.at[best_idx, "CC"]
+        df_filtered.at[i, "MatchMethod"] = "fuzzy"
+        df_filtered.at[i, "MatchRatio"]  = best_ratio
+    # else remain blank => unmatched
+
+# ----------------------------------------------------------------
+# 4) Write out to Excel - single sheet with "names next to amount"
+# ----------------------------------------------------------------
+output_cols = [
+    "Period","CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description","Amount",
+    "MatchedName","MatchedPO","MatchedCC","MatchMethod","MatchRatio"
+]
+df_output = df_filtered[output_cols].copy()
+
+with pd.ExcelWriter("output.xlsx", engine="openpyxl") as writer:
+    df_output.to_excel(writer, sheet_name="FinalWithNames", index=False)
+
+
 
 
 

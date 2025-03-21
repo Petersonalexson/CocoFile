@@ -250,6 +250,72 @@ final = final[cols + remaining]
 
 final.to_excel("output.xlsx", index=False)
 
+# part 8
+
+import pandas as pd
+
+df = pd.read_excel("your_file.xlsx")
+
+# Make sure these columns exist; if missing, create them as blank
+needed_cols = ["Period","CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description","Amount"]
+for c in needed_cols:
+    if c not in df.columns:
+        df[c] = ""
+df[needed_cols] = df[needed_cols].fillna("")
+
+# Combine JN + JL for searching
+df["combined"] = (df["JN Writing"].astype(str) + " " + df["JL Description"].astype(str)).str.lower()
+
+# PART 1: Accrual/Reversal detection
+mask_accrual_rev = df["combined"].str.contains("accrual|accural|reversal|reversals", case=False, regex=True)
+df_accrual_rev = df[mask_accrual_rev].copy()
+
+p1 = df_accrual_rev.pivot_table(
+    index=["JN Writing","JL Description","CC","XO","VOICE DATE","VOICE NUM"],
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
+
+p1["Section"] = "Accrual/Reversal"
+
+# PART 2: Voice Date present
+df_voice_date = df[df["VOICE DATE"] != ""].copy()
+
+p2 = df_voice_date.pivot_table(
+    index=["JN Writing","JL Description","CC","XO","VOICE DATE","VOICE NUM"],
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
+
+p2["Section"] = "Voice Date"
+
+# Combine both pivot results
+final_pivot = pd.concat([p1, p2], ignore_index=True)
+
+# Now "Period" is currently across columns. We want to "separate amounts by Period"
+# by melting so that each (row + period) is a separate row.
+# After the melt, we'll have columns: 
+# [JN Writing, JL Description, CC, XO, VOICE DATE, VOICE NUM, Section, Period, Amount]
+
+id_vars = ["JN Writing","JL Description","CC","XO","VOICE DATE","VOICE NUM","Section"]
+melted = final_pivot.melt(
+    id_vars=id_vars,
+    var_name="PeriodHeaderA1",  # rename the pivoted column
+    value_name="Amount"
+)
+
+# Reorder columns if desired
+final_cols = ["Section","JN Writing","JL Description","CC","XO","VOICE DATE","VOICE NUM","PeriodHeaderA1","Amount"]
+melted = melted[final_cols]
+
+# Write out
+melted.to_excel("output.xlsx", index=False)
+
+
 
 
 

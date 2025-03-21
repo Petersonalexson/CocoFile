@@ -116,6 +116,27 @@ df_pivot = df_pivot.sort_values(by="XO", ascending=True)
 print(df_pivot)
 df_pivot.to_excel("output.xlsx", index=False)
 
+# part 4
+
+import pandas as pd
+
+df = pd.read_excel("your_file.xlsx")
+mx = df["XO"].isna()
+md = df["VOICE DATE"].isna()
+mn = df["VOICE NUM"].isna()
+am = mx & md & mn
+t = (df["JN Writing"].fillna("") + " " + df["JL Description"].fillna("")).str.lower()
+r = t.str.contains("accrual|accural|reversal|reversals", case=False, regex=True)
+k = (~am) | (am & r)
+f = df[k]
+p = f.pivot_table(index=["CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Description"],
+                  columns="Period",
+                  values="Amount",
+                  aggfunc="sum",
+                  fill_value=0).reset_index()
+p.to_excel("output.xlsx", index=False)
+
+
 
 
 

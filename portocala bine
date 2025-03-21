@@ -136,6 +136,45 @@ p = f.pivot_table(index=["CC","XO","VOICE DATE","VOICE NUM","JN Writing","JL Des
                   fill_value=0).reset_index()
 p.to_excel("output.xlsx", index=False)
 
+# part 5
+
+import pandas as pd
+
+df = pd.read_excel("your_file.xlsx")
+
+# Part 1: Original aggregation with whatever columns exist
+possible_index_cols = ["CC","JN Writing","JL Description","XO","VOICE DATE","VOICE NUM"]
+index_cols = [c for c in possible_index_cols if c in df.columns]
+
+p1 = df.pivot_table(
+    index=index_cols,
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
+
+p1.to_excel("output_original.xlsx", index=False)
+
+# Part 2: Filter rows that contain "accrual"/"accural"/"reversal"/"reversals" in either JN or JL
+if ("JN Writing" in df.columns) and ("JL Description" in df.columns):
+    combined = (df["JN Writing"].fillna("") + " " + df["JL Description"].fillna("")).str.lower()
+    mask = combined.str.contains("accrual|accural|reversal|reversals", case=False, regex=True)
+    df2 = df[mask]
+else:
+    df2 = df.iloc[0:0]  # empty if those columns don't exist
+
+p2 = df2.pivot_table(
+    index=index_cols,
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
+
+p2.to_excel("output_accrual_reversal.xlsx", index=False)
+
+
 
 
 

@@ -76,5 +76,46 @@ df_pivot = df_pivot.sort_values(by="XO", ascending=True)
 print(df_pivot)
 df_pivot.to_excel("output.xlsx", index=False)
 
+# part 4
+
+import pandas as pd
+
+df = pd.read_excel("your_file.xlsx")
+
+missing_xo = df["XO"].isna()
+missing_voice_date = df["VOICE DATE"].isna()
+missing_voice_num = df["VOICE NUM"].isna()
+
+all_missing = missing_xo & missing_voice_date & missing_voice_num
+
+combined_text = (
+    df["JN Writing"].fillna("").astype(str) + " " +
+    df["JL Description"].fillna("").astype(str)
+).str.lower()
+
+has_acc_or_rev = combined_text.str.contains("accrual") | combined_text.str.contains("reversal")
+
+rows_to_keep = (~all_missing) | (all_missing & has_acc_or_rev)
+
+df_filtered = df[rows_to_keep].copy()
+
+pivot_index = ["CC", "XO", "VOICE DATE", "VOICE NUM", "JN Writing", "JL Description"]
+
+df_pivot = df_filtered.pivot_table(
+    index=pivot_index,
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",
+    fill_value=0
+)
+
+df_pivot = df_pivot.reset_index()
+
+df_pivot = df_pivot.sort_values(by="XO", ascending=True)
+
+print(df_pivot)
+df_pivot.to_excel("output.xlsx", index=False)
+
+
 
 

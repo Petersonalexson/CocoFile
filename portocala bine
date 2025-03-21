@@ -1,0 +1,49 @@
+import pandas as pd
+import numpy as np
+
+def categorize_row(description, min_threshold=3):
+
+    if not isinstance(description, str):
+
+        return "No Description"
+
+    desc_lower = description.lower()
+
+
+    acc_count = desc_lower.count("accural")   
+    rev_count = desc_lower.count("reversal")
+
+    total = acc_count + rev_count
+
+    if total < min_threshold:
+
+        return description
+    else:
+        # We have enough hits; figure out which category
+        if acc_count > 0 and rev_count > 0:
+            return "Accural + Reversal"
+        elif acc_count > 0:
+            return "Accural"
+        else:
+            return "Reversal"
+
+# 1) Read Excel file
+df = pd.read_excel("your_file.xlsx")
+
+# 2) Apply the classification function
+df["Category"] = df["JL Description"].apply(categorize_row, min_threshold=3)
+
+df_pivot = df.pivot_table(
+    index=["CC", "XO", "VOICE DATE", "Category"],
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",   # or 'count' if you just want a frequency
+    fill_value=0
+)
+
+# 4) Flatten the pivot's multi-index so it becomes normal columns:
+df_pivot = df_pivot.reset_index()
+
+# 5) Inspect and export
+print(df_pivot)
+df_pivot.to_excel("output.xlsx", index=False)

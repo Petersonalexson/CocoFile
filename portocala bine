@@ -637,6 +637,156 @@ df_output = df_filtered[output_cols].copy()
 with pd.ExcelWriter("output.xlsx", engine="openpyxl") as writer:
     df_output.to_excel(writer, sheet_name="FinalWithNames", index=False)
 
+# 10
+
+import pandas as pd
+import numpy as np
+from difflib import SequenceMatcher
+
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+def find_all_fuzzy_matches(
+    text: str, 
+    df2_surnames: pd.Series, 
+    df2_names: pd.Series, 
+    min_ratio: float = 0.7
+):
+    matched_indices = []
+    for i in df2_surnames.index:
+        s_surname = df2_surnames[i]
+        s_name    = df2_names[i]
+        full_str = (s_surname + " " + s_name).strip()
+        if not full_str:
+            continue
+        ratio = similarity(text, full_str)
+        if ratio >= min_ratio:
+            matched_indices.append(i)
+    return matched_indices
+
+file_path = "your_file.xlsx"
+df1 = pd.read_excel(file_path, sheet_name="Sheet1")
+
+need_sheet1 = [
+    "Period", "CC", "XO", "VOICE DATE", "VOICE NUM", 
+    "JN Writing", "JL Description", "Amount"
+]
+for col in need_sheet1:
+    if col not in df1.columns:
+        df1[col] = ""
+df1[need_sheet1] = df1[need_sheet1].fillna("")
+df1["Amount"] = pd.to_numeric(df1["Amount"], errors="coerce").fillna(0)
+df1["match_text"] = (
+    df1["JL Description"].astype(str).str.lower().str.strip()
+    + " "
+    + df1["JN Writing"].astype(str).str.lower().str.strip()
+)
+
+df2 = pd.read_excel(file_path, sheet_name="Sheet2")
+need_sheet2 = ["Surname", "Name", "CC", "XO"]
+for col in need_sheet2:
+    if col not in df2.columns:
+        df2[col] = ""
+df2[need_sheet2] = df2[need_sheet2].fillna("")
+df2["SurnameLower"] = df2["Surname"].str.lower().str.strip()
+df2["NameLower"]    = df2["Name"].str.lower().str.strip()
+
+rows_output = []
+df2_surnames = df2["SurnameLower"]
+df2_names    = df2["NameLower"]
+
+for idx1, row1 in df1.iterrows():
+    text = row1["match_text"]
+    if not text.strip():
+        out_row = {
+            "Period": row1["Period"],
+            "CC_Sheet1": row1["CC"],
+            "XO_Sheet1": row1["XO"],
+            "VOICE_DATE": row1["VOICE DATE"],
+            "VOICE_NUM": row1["VOICE NUM"],
+            "JN_Writing": row1["JN Writing"],
+            "JL_Description": row1["JL Description"],
+            "Amount": row1["Amount"],
+            "Matched_Surname": "",
+            "Matched_Name": "",
+            "Matched_CC": "",
+            "Matched_XO": "",
+            "MatchType": "NoText",
+            "MatchRatio": 0.0
+        }
+        rows_output.append(out_row)
+        continue
+
+    matched_indices = find_all_fuzzy_matches(text, df2_surnames, df2_names, min_ratio=0.70)
+    if not matched_indices:
+        out_row = {
+            "Period": row1["Period"],
+            "CC_Sheet1": row1["CC"],
+            "XO_Sheet1": row1["XO"],
+            "VOICE_DATE": row1["VOICE DATE"],
+            "VOICE_NUM": row1["VOICE NUM"],
+            "JN_Writing": row1["JN Writing"],
+            "JL_Description": row1["JL Description"],
+            "Amount": row1["Amount"],
+            "Matched_Surname": "",
+            "Matched_Name": "",
+            "Matched_CC": "",
+            "Matched_XO": "",
+            "MatchType": "NoMatch",
+            "MatchRatio": 0.0
+        }
+        rows_output.append(out_row)
+    else:
+        for i2 in matched_indices:
+            full_str = (df2_surnames[i2] + " " + df2_names[i2]).strip()
+            ratio = similarity(text, full_str)
+            out_row = {
+                "Period": row1["Period"],
+                "CC_Sheet1": row1["CC"],
+                "XO_Sheet1": row1["XO"],
+                "VOICE_DATE": row1["VOICE DATE"],
+                "VOICE_NUM": row1["VOICE NUM"],
+                "JN_Writing": row1["JN Writing"],
+                "JL_Description": row1["JL Description"],
+                "Amount": row1["Amount"],
+                "Matched_Surname": df2.at[i2, "Surname"],
+                "Matched_Name": df2.at[i2, "Name"],
+                "Matched_CC": df2.at[i2, "CC"],
+                "Matched_XO": df2.at[i2, "XO"],
+                "MatchType": "Fuzzy",
+                "MatchRatio": ratio
+            }
+            rows_output.append(out_row)
+
+df_matched = pd.DataFrame(rows_output)
+
+group_cols = [
+    "Matched_Surname", 
+    "Matched_Name",
+    "Matched_CC",
+    "Matched_XO",
+    "CC_Sheet1",
+    "XO_Sheet1",
+    "JN_Writing",
+    "JL_Description",
+]
+pivot_data = df_matched.pivot_table(
+    index=group_cols,
+    columns="Period",
+    values="Amount",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
+
+pivot_data["GrandTotal"] = pivot_data.select_dtypes(include=[np.number]).sum(axis=1)
+
+with pd.ExcelWriter(file_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+    df_matched.to_excel(writer, sheet_name="MatchedExpanded", index=False)
+    pivot_data.to_excel(writer, sheet_name="Check", index=False)
+
+print("Done! See 'MatchedExpanded' and 'Check' sheets in your_file.xlsx.")
+
+
 
 
 
